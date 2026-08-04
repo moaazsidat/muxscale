@@ -291,6 +291,27 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 		writeJSON(w, map[string]any{"events": events})
 	})
 
+	// GET /v1/sessions/screen?session=ID[&format=text]
+	mux.HandleFunc("/v1/sessions/screen", func(w http.ResponseWriter, r *http.Request) {
+		id := r.URL.Query().Get("session")
+		if r.URL.Query().Get("format") == "text" {
+			text, ok := d.mgr.ScreenText(id)
+			if !ok {
+				http.Error(w, "session has no screen (only wrapped sessions do)", http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			_, _ = w.Write([]byte(text))
+			return
+		}
+		snap, ok := d.mgr.Screen(id)
+		if !ok {
+			http.Error(w, "session has no screen (only wrapped sessions do)", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, snap)
+	})
+
 	// GET /v1/audit
 	mux.HandleFunc("/v1/audit", func(w http.ResponseWriter, r *http.Request) {
 		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))

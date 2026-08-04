@@ -13,6 +13,7 @@ import (
 	"github.com/muxscale/muxscale/go/internal/attach"
 	"github.com/muxscale/muxscale/go/internal/protocol"
 	"github.com/muxscale/muxscale/go/internal/store"
+	"github.com/muxscale/muxscale/go/internal/vt"
 )
 
 // Manager owns wrapped sessions and the discovery loop, and persists
@@ -23,8 +24,13 @@ type Manager struct {
 	log   *slog.Logger
 
 	mu      sync.RWMutex
-	wrapped map[string]*attach.Wrapped   // muxscale session id -> pty
+	wrapped map[string]*attach.Wrapped    // muxscale session id -> pty
 	tailers map[string]*claudecode.Tailer // muxscale session id -> transcript tailer
+	screens map[string]*vt.Emulator       // muxscale session id -> screen state
+
+	// screenMu guards emulator writes/reads separately from the map, so a
+	// client reading a snapshot never blocks the PTY drain loop for long.
+	screenMu sync.Mutex
 }
 
 // NewManager wires a registry to durable storage.
@@ -33,6 +39,7 @@ func NewManager(reg *Registry, st *store.Store, log *slog.Logger) *Manager {
 		reg: reg, store: st, log: log,
 		wrapped: map[string]*attach.Wrapped{},
 		tailers: map[string]*claudecode.Tailer{},
+		screens: map[string]*vt.Emulator{},
 	}
 	go m.persistLoop()
 	return m
@@ -161,15 +168,23 @@ func (m *Manager) Run(opt RunOptions) (*protocol.Session, error) {
 	return sess, nil
 }
 
-// superviseWrapped drains output and records the exit.
+// superviseWrapped feeds output into the VT emulator and records the exit.
 func (m *Manager) superviseWrapped(sessionID string, w *attach.Wrapped) {
-	// M0/M1: output is drained but not yet fed to a VT emulator. Draining is
-	// mandatory regardless -- an unread PTY fills its buffer and blocks the
-	// agent, which would look like a hang caused by muxscale.
+	// Draining is mandatory regardless of whether anyone is watching: an unread
+	// PTY fills its buffer and blocks the agent, which would look like a hang
+	// caused by muxscale.
+	em := vt.NewEmulator(int(w.Cols), int(w.Rows))
+	m.mu.Lock()
+	m.screens[sessionID] = em
+	m.mu.Unlock()
+
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := w.Read(buf)
 		if n > 0 {
+			m.screenMu.Lock()
+			_, _ = em.Write(buf[:n])
+			m.screenMu.Unlock()
 			m.reg.NoteOutput(sessionID, n)
 		}
 		if err != nil {
@@ -194,6 +209,32 @@ func (m *Manager) superviseWrapped(sessionID string, w *attach.Wrapped) {
 	delete(m.wrapped, sessionID)
 	m.mu.Unlock()
 	_ = m.store.Audit("agent", "session_exited", sessionID, reason)
+}
+
+// Screen returns a session's current screen snapshot, if it has one.
+func (m *Manager) Screen(sessionID string) (vt.Snapshot, bool) {
+	m.mu.RLock()
+	em := m.screens[sessionID]
+	m.mu.RUnlock()
+	if em == nil {
+		return vt.Snapshot{}, false
+	}
+	m.screenMu.Lock()
+	defer m.screenMu.Unlock()
+	return em.Grid().Snapshot(), true
+}
+
+// ScreenText returns the session's screen as plain text, for the CLI.
+func (m *Manager) ScreenText(sessionID string) (string, bool) {
+	m.mu.RLock()
+	em := m.screens[sessionID]
+	m.mu.RUnlock()
+	if em == nil {
+		return "", false
+	}
+	m.screenMu.Lock()
+	defer m.screenMu.Unlock()
+	return em.Grid().Text(), true
 }
 
 // SendInput delivers input to a session, honouring its fence.
