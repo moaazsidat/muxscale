@@ -7,33 +7,67 @@ requirement, a failing test. You're away from the keyboard and the work is stran
 an SSH session you can't comfortably reach. muxscale watches every agent session on your
 machines, notifies you the moment one blocks, and lets you unblock it with a sentence.
 
-**Status: M0.** Claude Code only, terminal only. No phone app, no cloud, no terminal
-streaming yet. See [the technical spec](docs/20260729-technical-spec.md) for the full design
-and [§13 Milestones](docs/20260729-technical-spec.md#13-milestones) for what lands when.
+**Status: M0 complete, M1 mostly complete.** Claude Code only, terminal only — no phone app
+and no cloud yet. See [the technical spec](docs/20260729-technical-spec.md) for the full
+design and [§13 Milestones](docs/20260729-technical-spec.md#13-milestones) for what lands
+when.
 
 ## What works today
 
-- Claude Code sessions are discovered and tracked through Claude Code's own HTTP hooks —
-  including sessions muxscale never launched.
-- Session state is **authoritative, not guessed**: `Stop` means the turn ended, and the
-  session is waiting on you. No prompt-regex heuristics.
-- **Remote approvals work end to end.** A `PermissionRequest` hook is held open while you're
+**Seeing your agents**
+
+- Every Claude Code session on the machine is discovered and tracked, **including ones
+  muxscale never launched and ones that started before it was installed** — via process
+  scan, tmux enumeration, and Claude Code's own session files.
+- Full structured transcripts: turns, tool calls, results, diffs, token usage, subagent
+  threads — parsed straight from Claude Code's JSONL, which is verbatim Messages API shape.
+- Free metadata: AI-generated session title, git branch, model, agent version.
+- Everything persists to SQLite and survives a daemon restart with stable session IDs.
+
+**Knowing when they block**
+
+- Session state is **authoritative, not guessed**, when hooks are installed: `Stop` means
+  the turn ended and the agent is waiting on you. Confidence 1.0, no regexes.
+- Without hooks, state is inferred from the transcript and capped at 0.7 confidence, with
+  the evidence recorded so `debug state` can explain itself.
+
+**Unblocking them**
+
+- **Remote approvals, end to end.** A `PermissionRequest` hook is held open while you're
   asked; your answer becomes the literal `{"behavior":"allow"|"deny"}` returned to Claude
   Code. Structured data, not simulated keystrokes.
-- Transcripts parse straight from Claude Code's JSONL into structured turns and tool calls.
+- Send new prompts to sessions muxscale owns (`muxscale run`) or has adopted from tmux.
+- **Input fencing**: a reply is bound to the exact turn that asked. If the agent moved on,
+  the input is refused with an explanation rather than answering the wrong question.
+
+**Watching them work**
+
+- A headless VT emulator maintains screen state for wrapped sessions, so clients get a
+  grid with row deltas rather than a raw ANSI stream. 18 MB/s throughput; 9µs row diffs.
 
 ## Quick start
 
 ```bash
 cd go && go build -o muxscale ./cmd/muxscale
 
-./muxscale doctor            # check your setup
-./muxscale hooks install     # shows the exact settings.json diff, then asks
-export MUXSCALE_HOOK_TOKEN=…  # printed by hooks install; add to your shell profile
 ./muxscale daemon            # in one terminal
-./muxscale ls                # in another; start a Claude Code session and watch
-./muxscale watch             # live event stream
-./muxscale approvals         # pending approvals; answer with `approvals allow|deny ID`
+./muxscale ls                # in another — your running agents appear immediately,
+                             #   with no hooks installed and nothing restarted
+```
+
+That much works with zero setup. For blocked-state accuracy and remote approvals, install
+the hooks:
+
+```bash
+./muxscale doctor             # check your setup
+./muxscale hooks install      # shows the exact settings.json diff, then asks
+export MUXSCALE_HOOK_TOKEN=…  # printed by hooks install; add to your shell profile
+
+./muxscale watch              # live event stream
+./muxscale approvals          # pending approvals; answer with `approvals allow|deny ID`
+./muxscale run -- claude      # launch a session muxscale owns, so it accepts new prompts
+./muxscale send ID "continue" # reply to a session
+./muxscale audit              # who did what, when
 ```
 
 `hooks install` writes a timestamped backup, preserves every existing hook, and is
@@ -65,8 +99,11 @@ These are constraints, not aspirations. Each has tests.
 ```
 proto/      wire protocol (source of truth; M2)
 go/         daemon + CLI
-  internal/adapter/claudecode/   hooks, transcript parser, version gate, installer
-  internal/daemon/               hook listener, session registry, state machine
+  internal/adapter/claudecode/   hooks, transcript parser + tailer, version gate, installer
+  internal/attach/               pty wrap, input encoding + fencing, discovery, tmux
+  internal/daemon/               hook listener, registry, manager, state machine
+  internal/store/                SQLite: sessions, transcripts, approvals, audit
+  internal/vt/                   headless VT emulator, grid diffing
   internal/protocol/             shared types
 rust/       client core: codec, crypto, grid model (M3)
 app/        Expo iOS/Android app (M3)
@@ -82,6 +119,13 @@ docs/       spec + docs site source
 cd go && go test -race ./...
 ```
 
-The parser is also validated against every real Claude Code transcript on the host machine —
-38 files, including a 143 MB / 5,372-event session, parsed in 1.4 s at 38 MB RSS with tool
-calls and results matching exactly.
+Beyond the unit tests, three things are validated against reality rather than fixtures:
+
+- The transcript parser runs against every real Claude Code session file on the host — 38
+  files including a 143 MB / 5,372-event one, parsed in 1.4 s at 38 MB RSS, with tool calls
+  and results matching exactly.
+- The VT emulator has a randomized property test: 400 rounds of arbitrary escape sequences,
+  asserting that applying deltas to a client replica always reproduces the daemon's grid.
+  It found a real wide-character bug on its first run.
+- tmux adoption is tested against a real tmux server on a private socket, so it never
+  touches your own sessions.
