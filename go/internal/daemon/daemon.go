@@ -17,6 +17,7 @@ import (
 	"github.com/muxscale/muxscale/go/internal/attach"
 	"github.com/muxscale/muxscale/go/internal/protocol"
 	"github.com/muxscale/muxscale/go/internal/store"
+	"github.com/muxscale/muxscale/go/internal/tsnode"
 )
 
 // Config configures the daemon.
@@ -29,6 +30,13 @@ type Config struct {
 	HoldTime    time.Duration
 	StateDir    string
 	Log         *slog.Logger
+
+	// Tailnet enables the Tailscale listener that phones connect to. Off by
+	// default: the daemon is fully usable locally with no Tailscale setup.
+	Tailnet         bool
+	TailnetHostname string
+	TailnetAuthKey  string
+	TailnetPort     int
 }
 
 // DefaultStateDir follows platform convention.
@@ -52,6 +60,8 @@ type Daemon struct {
 	reg   *Registry
 	mgr   *Manager
 	store *store.Store
+	node  *tsnode.Node
+	acl   *tsnode.ACL
 	log   *slog.Logger
 	srv   *http.Server
 	addr  string
@@ -148,6 +158,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 			errCh <- err
 		}
 	}()
+
+	// The tailnet listener is what a phone connects to. It is optional so the
+	// daemon is fully usable locally without any Tailscale setup at all.
+	if d.cfg.Tailnet {
+		if err := d.startTailnet(ctx, stateDir, mux); err != nil {
+			// A tailnet failure must not take down local monitoring, which is
+			// the part that works with no network at all.
+			d.log.Error("tailnet listener unavailable; local access still works", "err", err)
+		}
+	}
 
 	select {
 	case err := <-errCh:
@@ -310,6 +330,71 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 			return
 		}
 		writeJSON(w, snap)
+	})
+
+	// GET /v1/status
+	mux.HandleFunc("/v1/status", func(w http.ResponseWriter, r *http.Request) {
+		out := map[string]any{
+			"local_addr": d.addr,
+			"hold":       d.cfg.HoldTime.String(),
+			"sessions":   len(d.reg.List()),
+			"approvals":  len(d.reg.PendingApprovals()),
+			"db":         d.store.Path(),
+		}
+		if st, ok := d.TailnetStatus(r.Context()); ok {
+			out["tailnet"] = st
+		} else {
+			out["tailnet"] = nil
+		}
+		if d.acl != nil {
+			out["acl"] = d.acl.List()
+		}
+		writeJSON(w, out)
+	})
+
+	// GET  /v1/acl              list
+	// POST /v1/acl {"allow"|"deny": "user@example.com"}
+	//
+	// Deliberately local-only: the ACL is reachable through the loopback API,
+	// never through the tailnet listener it guards. A remote caller must never
+	// be able to grant itself access.
+	mux.HandleFunc("/v1/acl", func(w http.ResponseWriter, r *http.Request) {
+		if d.acl == nil {
+			http.Error(w, "tailnet is not enabled (start the daemon with --tailnet)", http.StatusNotFound)
+			return
+		}
+		if r.Method == http.MethodGet {
+			writeJSON(w, map[string]any{"allowed": d.acl.List()})
+			return
+		}
+		var body struct {
+			Allow string `json:"allow"`
+			Deny  string `json:"deny"`
+			Owner string `json:"owner"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		var err error
+		switch {
+		case body.Owner != "":
+			err = d.acl.SetOwner(body.Owner)
+			_ = d.store.Audit("cli", "acl_set_owner", "", body.Owner)
+		case body.Allow != "":
+			err = d.acl.Allow(body.Allow)
+			_ = d.store.Audit("cli", "acl_allow", "", body.Allow)
+		case body.Deny != "":
+			err = d.acl.Deny(body.Deny)
+			_ = d.store.Audit("cli", "acl_deny", "", body.Deny)
+		default:
+			err = fmt.Errorf("nothing to do: give allow, deny, or owner")
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, map[string]any{"allowed": d.acl.List()})
 	})
 
 	// GET /v1/audit

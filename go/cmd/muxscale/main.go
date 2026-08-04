@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -51,6 +52,10 @@ func main() {
 		err = cmdKill(os.Args[2:])
 	case "audit":
 		err = cmdAudit(os.Args[2:])
+	case "status":
+		err = cmdStatus(os.Args[2:])
+	case "acl":
+		err = cmdACL(os.Args[2:])
 	case "hooks":
 		err = cmdHooks(os.Args[2:])
 	case "doctor":
@@ -72,7 +77,9 @@ func usage() {
 	fmt.Print(`muxscale - monitor and unblock your coding agents
 
 Usage:
-  muxscale daemon              Run the daemon (hook listener + session registry)
+  muxscale daemon [--tailnet]  Run the daemon (hook listener + session registry)
+  muxscale status              Daemon, tailnet, and session summary
+  muxscale acl [allow|deny U]  Tailnet identities permitted to connect
   muxscale run -- CMD          Launch CMD as a managed session (enables replies)
   muxscale send ID "text"      Send input to a session
   muxscale kill ID             Terminate a wrapped session
@@ -96,8 +103,32 @@ Usage:
 func cmdDaemon(args []string) error {
 	addr := defaultAddr
 	hold := 120 * time.Second
+	var tailnet bool
+	var tsHostname, tsAuthKey string
+	tsPort := 4443
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
+		case "--tailnet":
+			tailnet = true
+		case "--tailnet-hostname":
+			if i+1 < len(args) {
+				i++
+				tsHostname = args[i]
+			}
+		case "--authkey":
+			if i+1 < len(args) {
+				i++
+				tsAuthKey = args[i]
+			}
+		case "--tailnet-port":
+			if i+1 < len(args) {
+				i++
+				p, err := strconv.Atoi(args[i])
+				if err != nil {
+					return fmt.Errorf("bad --tailnet-port: %w", err)
+				}
+				tsPort = p
+			}
 		case "--listen":
 			if i+1 < len(args) {
 				i++
@@ -121,8 +152,20 @@ func cmdDaemon(args []string) error {
 	}
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	// An auth key on the command line lands in shell history and `ps` output.
+	// Prefer the environment, and say so rather than silently accepting it.
+	if tsAuthKey == "" {
+		tsAuthKey = os.Getenv("MUXSCALE_TS_AUTHKEY")
+	} else {
+		fmt.Fprintln(os.Stderr,
+			"warning: --authkey is visible in shell history and `ps`; "+
+				"prefer MUXSCALE_TS_AUTHKEY in the environment")
+	}
+
 	d, err := daemon.New(daemon.Config{
 		ListenLocal: addr, HookToken: token, HoldTime: hold, Log: log,
+		Tailnet: tailnet, TailnetHostname: tsHostname,
+		TailnetAuthKey: tsAuthKey, TailnetPort: tsPort,
 	})
 	if err != nil {
 		return err
@@ -420,6 +463,111 @@ func cmdAudit(args []string) error {
 	return nil
 }
 
+// ---------- status / acl ----------
+
+func cmdStatus(args []string) error {
+	var out struct {
+		LocalAddr string   `json:"local_addr"`
+		Hold      string   `json:"hold"`
+		Sessions  int      `json:"sessions"`
+		Approvals int      `json:"approvals"`
+		DB        string   `json:"db"`
+		ACL       []string `json:"acl"`
+		Tailnet   *struct {
+			Hostname     string   `json:"hostname"`
+			DNSName      string   `json:"dns_name"`
+			TailnetIPs   []string `json:"tailnet_ips"`
+			BackendState string   `json:"backend_state"`
+			AuthURL      string   `json:"auth_url"`
+			Port         int      `json:"port"`
+		} `json:"tailnet"`
+	}
+	if err := apiGet("/v1/status", &out); err != nil {
+		return err
+	}
+	if hasFlag(args, "--json") {
+		return json.NewEncoder(os.Stdout).Encode(out)
+	}
+
+	fmt.Printf("daemon      %s  (approval hold %s)\n", out.LocalAddr, out.Hold)
+	fmt.Printf("sessions    %d  (%d pending approval)\n", out.Sessions, out.Approvals)
+	fmt.Printf("database    %s\n", out.DB)
+
+	if out.Tailnet == nil {
+		fmt.Printf("tailnet     not enabled  (start the daemon with --tailnet)\n")
+		return nil
+	}
+	t := out.Tailnet
+	fmt.Printf("tailnet     %s  [%s]\n", t.Hostname, t.BackendState)
+	if t.AuthURL != "" {
+		// This is the whole reason someone runs `status` on first launch.
+		fmt.Printf("\n  Log in to finish connecting:\n    %s\n\n", t.AuthURL)
+		return nil
+	}
+	if t.DNSName != "" {
+		fmt.Printf("            https://%s:%d\n", t.DNSName, t.Port)
+	}
+	for _, ip := range t.TailnetIPs {
+		fmt.Printf("            %s\n", ip)
+	}
+	if len(out.ACL) > 0 {
+		fmt.Printf("permitted   %s\n", strings.Join(out.ACL, ", "))
+	} else {
+		fmt.Printf("permitted   nobody yet - run `muxscale acl allow you@example.com`\n")
+	}
+	return nil
+}
+
+func cmdACL(args []string) error {
+	if len(args) == 0 {
+		var out struct {
+			Allowed []string `json:"allowed"`
+		}
+		if err := apiGet("/v1/acl", &out); err != nil {
+			return err
+		}
+		if len(out.Allowed) == 0 {
+			fmt.Println("Nobody is permitted to reach this daemon over the tailnet.")
+			fmt.Println("Add yourself with: muxscale acl allow you@example.com")
+			return nil
+		}
+		for _, a := range out.Allowed {
+			fmt.Println(a)
+		}
+		return nil
+	}
+	if len(args) < 2 {
+		return fmt.Errorf("usage: muxscale acl [allow|deny|owner] IDENTITY")
+	}
+	verb, who := args[0], args[1]
+	body := map[string]string{}
+	switch verb {
+	case "allow", "deny", "owner":
+		body[verb] = who
+	default:
+		return fmt.Errorf("unknown: acl %s (want allow, deny, or owner)", verb)
+	}
+	payload, _ := json.Marshal(body)
+	resp, err := http.Post(apiURL("/v1/acl"), "application/json", strings.NewReader(string(payload)))
+	if err != nil {
+		return daemonDown(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("%s", strings.TrimSpace(string(b)))
+	}
+	var out struct {
+		Allowed []string `json:"allowed"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	fmt.Printf("%s %s\n", verb, who)
+	for _, a := range out.Allowed {
+		fmt.Println("  " + a)
+	}
+	return nil
+}
+
 // ---------- hooks ----------
 
 func cmdHooks(args []string) error {
@@ -631,6 +779,16 @@ func apiGet(path string, out any) error {
 		return daemonDown(err)
 	}
 	defer resp.Body.Close()
+	// Error responses are plain text, so decoding them as JSON would surface a
+	// parser error instead of the message the daemon actually wrote.
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		msg := strings.TrimSpace(string(b))
+		if msg == "" {
+			msg = resp.Status
+		}
+		return fmt.Errorf("%s", msg)
+	}
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
