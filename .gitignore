@@ -1,0 +1,7 @@
+# build output
+/go/muxscale
+*.test
+# local state
+*.muxscale-backup-*
+*.muxscale-tmp
+.DS_Store
