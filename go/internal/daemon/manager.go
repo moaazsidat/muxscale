@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/muxscale/muxscale/go/internal/adapter/claudecode"
 	"github.com/muxscale/muxscale/go/internal/attach"
 	"github.com/muxscale/muxscale/go/internal/protocol"
 	"github.com/muxscale/muxscale/go/internal/store"
@@ -22,12 +23,17 @@ type Manager struct {
 	log   *slog.Logger
 
 	mu      sync.RWMutex
-	wrapped map[string]*attach.Wrapped // muxscale session id -> pty
+	wrapped map[string]*attach.Wrapped   // muxscale session id -> pty
+	tailers map[string]*claudecode.Tailer // muxscale session id -> transcript tailer
 }
 
 // NewManager wires a registry to durable storage.
 func NewManager(reg *Registry, st *store.Store, log *slog.Logger) *Manager {
-	m := &Manager{reg: reg, store: st, log: log, wrapped: map[string]*attach.Wrapped{}}
+	m := &Manager{
+		reg: reg, store: st, log: log,
+		wrapped: map[string]*attach.Wrapped{},
+		tailers: map[string]*claudecode.Tailer{},
+	}
 	go m.persistLoop()
 	return m
 }
@@ -295,6 +301,23 @@ func (m *Manager) scanOnce() {
 				s.CreatedAt = p.Started
 			}
 		})
+		// Discovered Claude Code sessions get their transcript followed, which
+		// is what turns a bare process listing into a readable session.
+		if agentID == "claude-code" {
+			if s, ok := m.reg.Get(sess.ID); ok {
+				path := s.TranscriptPath
+				if path == "" && p.Cwd != "" {
+					if files, err := claudecode.FindTranscripts(p.Cwd); err == nil && len(files) > 0 {
+						path = files[0]
+						m.reg.Upsert(agentID, natural, func(t *protocol.Session) {
+							t.TranscriptPath = path
+						})
+					}
+				}
+				m.EnsureTailer(sess.ID, path)
+			}
+		}
+
 		if s, ok := m.reg.Get(sess.ID); ok && s.State == protocol.StateStarting {
 			m.reg.SetState(sess.ID, protocol.StateGuess{
 				State: protocol.StateUnknown, Confidence: 0.5,
@@ -303,6 +326,99 @@ func (m *Manager) scanOnce() {
 			})
 		}
 	}
+}
+
+// EnsureTailer starts following a session's transcript file if it is not
+// already being followed. Idempotent, so the discovery loop can call it freely.
+func (m *Manager) EnsureTailer(sessionID, path string) {
+	if path == "" {
+		return
+	}
+	m.mu.Lock()
+	if _, running := m.tailers[sessionID]; running {
+		m.mu.Unlock()
+		return
+	}
+	tl := claudecode.NewTailer(path, 750*time.Millisecond)
+	m.tailers[sessionID] = tl
+	m.mu.Unlock()
+
+	// Resume from what the store already has rather than re-reading a file
+	// that can be hundreds of megabytes.
+	if maxSeq, err := m.store.MaxSeq(sessionID); err == nil && maxSeq > 0 {
+		if err := tl.SeekEnd(maxSeq); err != nil {
+			m.log.Debug("tailer seek failed", "session", sessionID, "err", err)
+		}
+	}
+	go m.tailLoop(sessionID, tl)
+}
+
+func (m *Manager) tailLoop(sessionID string, tl *claudecode.Tailer) {
+	t := time.NewTicker(tl.Interval())
+	defer t.Stop()
+	defer func() {
+		m.mu.Lock()
+		delete(m.tailers, sessionID)
+		m.mu.Unlock()
+	}()
+
+	var misses int
+	for range t.C {
+		if s, ok := m.reg.Get(sessionID); ok && s.State.Terminal() {
+			return
+		}
+		events, meta, err := tl.Poll()
+		if err != nil {
+			misses++
+			if misses > 20 { // file gone for ~15s; stop following it
+				return
+			}
+			continue
+		}
+		misses = 0
+		if len(events) == 0 {
+			continue
+		}
+
+		for i := range events {
+			events[i].SessionID = sessionID
+			m.reg.AppendEvent(events[i])
+		}
+
+		// Metadata recovered from the transcript is free enrichment: title,
+		// branch, and model without asking the agent anything.
+		m.reg.Upsert("claude-code", naturalOf(m.reg, sessionID), func(s *protocol.Session) {
+			if meta.Title != "" {
+				s.Title = meta.Title
+			}
+			if meta.GitBranch != "" {
+				s.GitBranch = meta.GitBranch
+			}
+			if meta.Model != "" {
+				s.Model = meta.Model
+			}
+			if meta.Version != "" {
+				s.AgentVer = meta.Version
+			}
+		})
+
+		// Only infer state for sessions with no authoritative hook source: a
+		// guess must never override what the agent told us directly.
+		if s, ok := m.reg.Get(sessionID); ok && s.Attachment != protocol.AttachNative {
+			if fi, err := os.Stat(tl.Path()); err == nil {
+				guess := claudecode.InferState(events, fi.ModTime(), 6*time.Second)
+				m.reg.SetState(sessionID, guess)
+			}
+		}
+	}
+}
+
+// naturalOf looks up a session's natural key so Upsert targets the right row.
+func naturalOf(reg *Registry, sessionID string) string {
+	if s, ok := reg.Get(sessionID); ok {
+		return s.NaturalKey
+	}
+	return sessionID
 }
 
 func (m *Manager) hasWrappedPid(pid int) bool {

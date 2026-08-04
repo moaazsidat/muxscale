@@ -26,10 +26,15 @@ import (
 // HookServer handles agent hook callbacks.
 type HookServer struct {
 	reg      *Registry
+	mgr      *Manager
 	token    string
 	log      *slog.Logger
 	holdTime time.Duration
 }
+
+// SetManager attaches the manager, enabling transcript tailing for
+// hook-driven sessions. Optional so the hook server stays testable alone.
+func (h *HookServer) SetManager(m *Manager) { h.mgr = m }
 
 // NewHookServer builds the handler. holdTime is how long a decision hook waits
 // for a human before giving up and falling through.
@@ -99,6 +104,12 @@ func (h *HookServer) applyHook(p *claudecode.HookPayload) *protocol.Session {
 		s.Attachment = protocol.AttachNative
 		s.Fidelity = protocol.FidelityNativeFull
 	})
+
+	// Every hook payload carries transcript_path, so a hook-driven session gets
+	// its full structured transcript with no path guessing at all.
+	if p.TranscriptPath != "" && h.mgr != nil {
+		h.mgr.EnsureTailer(sess.ID, p.TranscriptPath)
+	}
 
 	now := time.Now()
 	guess := func(st protocol.SessionState, reason string) protocol.StateGuess {

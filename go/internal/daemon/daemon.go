@@ -122,7 +122,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	go d.mgr.DiscoverLoop(stopScan, 3*time.Second)
 
 	mux := http.NewServeMux()
-	NewHookServer(d.reg, d.cfg.HookToken, d.cfg.HoldTime, d.log).Routes(mux)
+	hookSrv := NewHookServer(d.reg, d.cfg.HookToken, d.cfg.HoldTime, d.log)
+	hookSrv.SetManager(d.mgr)
+	hookSrv.Routes(mux)
 	d.routes(mux)
 
 	ln, lnErr := net.Listen("tcp", d.cfg.ListenLocal)

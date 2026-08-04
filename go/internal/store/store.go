@@ -317,9 +317,12 @@ func (s *Store) AuditLog(limit int) ([]AuditEntry, error) {
 	if limit <= 0 {
 		limit = 100
 	}
+	// Tiebreak on the autoincrement id: several audit rows routinely land in the
+	// same millisecond, and ordering by timestamp alone makes their order
+	// arbitrary -- which reads as a scrambled log to anyone auditing an incident.
 	rows, err := s.db.Query(`
 SELECT at, actor, action, COALESCE(session_id,''), COALESCE(detail,'')
-FROM audit ORDER BY at DESC LIMIT ?`, limit)
+FROM audit ORDER BY at DESC, id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
