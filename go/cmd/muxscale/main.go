@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -42,6 +43,14 @@ func main() {
 		err = cmdWatch(os.Args[2:])
 	case "approvals":
 		err = cmdApprovals(os.Args[2:])
+	case "run":
+		err = cmdRun(os.Args[2:])
+	case "send":
+		err = cmdSend(os.Args[2:])
+	case "kill":
+		err = cmdKill(os.Args[2:])
+	case "audit":
+		err = cmdAudit(os.Args[2:])
 	case "hooks":
 		err = cmdHooks(os.Args[2:])
 	case "doctor":
@@ -64,6 +73,9 @@ func usage() {
 
 Usage:
   muxscale daemon              Run the daemon (hook listener + session registry)
+  muxscale run -- CMD          Launch CMD as a managed session (enables replies)
+  muxscale send ID "text"      Send input to a session
+  muxscale kill ID             Terminate a wrapped session
   muxscale ls                  List sessions
   muxscale watch               Stream session events
   muxscale approvals           List pending approvals
@@ -73,6 +85,7 @@ Usage:
   muxscale hooks uninstall     Remove exactly muxscale's hook entries
   muxscale hooks status
   muxscale doctor              Diagnose the local setup
+  muxscale audit               Recent audit log
   muxscale transcript PATH     Parse a Claude Code JSONL transcript
 
 `)
@@ -244,6 +257,165 @@ func cmdApprovals(args []string) error {
 		if len(a.ToolInput) > 0 {
 			fmt.Printf("    %s\n", indent(daemon.FormatToolInput(a.ToolInput), "    "))
 		}
+	}
+	return nil
+}
+
+// ---------- run / send / kill ----------
+
+func cmdRun(args []string) error {
+	// Everything after `--` is the command; anything before is ours.
+	var name, dir string
+	var cmd []string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--":
+			cmd = args[i+1:]
+			i = len(args)
+		case "--name":
+			if i+1 < len(args) {
+				i++
+				name = args[i]
+			}
+		case "--dir":
+			if i+1 < len(args) {
+				i++
+				dir = args[i]
+			}
+		}
+	}
+	if len(cmd) == 0 {
+		return fmt.Errorf("usage: muxscale run [--name N] [--dir D] -- COMMAND [ARGS...]")
+	}
+	if dir == "" {
+		dir, _ = os.Getwd()
+	}
+
+	body, _ := json.Marshal(map[string]any{"command": cmd, "dir": dir, "name": name})
+	resp, err := http.Post(apiURL("/v1/sessions/run"), "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		return daemonDown(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("%s", strings.TrimSpace(string(b)))
+	}
+	var sess protocol.Session
+	if err := json.NewDecoder(resp.Body).Decode(&sess); err != nil {
+		return err
+	}
+	fmt.Printf("started %s (%s) in %s\n", sess.ID, sess.AgentID, sess.Cwd)
+	fmt.Printf("send input with: muxscale send %s \"your message\"\n", sess.ID)
+	return nil
+}
+
+func cmdSend(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf(`usage: muxscale send SESSION_ID "text" [--key enter] [--no-submit] [--fence-prompt ID]`)
+	}
+	sessionID := args[0]
+	var text, key, fencePrompt, fenceState string
+	submit := true
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "--key":
+			if i+1 < len(args) {
+				i++
+				key = args[i]
+			}
+		case "--no-submit":
+			submit = false
+		case "--fence-prompt":
+			if i+1 < len(args) {
+				i++
+				fencePrompt = args[i]
+			}
+		case "--fence-state":
+			if i+1 < len(args) {
+				i++
+				fenceState = args[i]
+			}
+		default:
+			if !strings.HasPrefix(args[i], "--") && text == "" {
+				text = args[i]
+			}
+		}
+	}
+	if text == "" && key == "" {
+		return fmt.Errorf("nothing to send: give text or --key")
+	}
+
+	body, _ := json.Marshal(map[string]any{
+		"session_id": sessionID, "text": text, "key": key, "submit": submit,
+		"fence": map[string]string{"prompt_id": fencePrompt, "state": fenceState},
+		"by":    "cli",
+	})
+	resp, err := http.Post(apiURL("/v1/sessions/input"), "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		return daemonDown(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusConflict {
+		var e struct {
+			Detail string `json:"detail"`
+			Want   string `json:"want"`
+			Got    string `json:"got"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&e)
+		// A stale fence is not an error to shout about; it is the safety
+		// mechanism doing its job. Explain and offer the override.
+		fmt.Fprintf(os.Stderr, "Not sent: the session moved on.\n  %s\n", e.Detail)
+		fmt.Fprintf(os.Stderr, "\nRe-check the session, then resend without --fence-prompt to force.\n")
+		os.Exit(3)
+	}
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("%s", strings.TrimSpace(string(b)))
+	}
+	fmt.Println("sent")
+	return nil
+}
+
+func cmdKill(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: muxscale kill SESSION_ID")
+	}
+	body, _ := json.Marshal(map[string]string{"session_id": args[0]})
+	resp, err := http.Post(apiURL("/v1/sessions/kill"), "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		return daemonDown(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("%s", strings.TrimSpace(string(b)))
+	}
+	fmt.Printf("killed %s\n", args[0])
+	return nil
+}
+
+func cmdAudit(args []string) error {
+	var out struct {
+		Entries []struct {
+			At        time.Time `json:"at"`
+			Actor     string    `json:"actor"`
+			Action    string    `json:"action"`
+			SessionID string    `json:"session_id"`
+			Detail    string    `json:"detail"`
+		} `json:"entries"`
+	}
+	if err := apiGet("/v1/audit?limit=50", &out); err != nil {
+		return err
+	}
+	if len(out.Entries) == 0 {
+		fmt.Println("No audit entries.")
+		return nil
+	}
+	for _, e := range out.Entries {
+		fmt.Printf("%s  %-8s %-26s %-17s %s\n",
+			e.At.Format("01-02 15:04:05"), e.Actor, e.Action, e.SessionID, e.Detail)
 	}
 	return nil
 }

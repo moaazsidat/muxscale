@@ -1,0 +1,368 @@
+// Package store persists sessions and transcripts to SQLite.
+//
+// modernc.org/sqlite is a pure-Go driver: no cgo, so `muxscale` still
+// cross-compiles to five targets from one machine. That constraint is worth
+// more than the marginal speed of the C driver -- this workload is a few
+// hundred writes per turn, not an OLTP benchmark.
+package store
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
+
+	_ "modernc.org/sqlite"
+
+	"github.com/muxscale/muxscale/go/internal/protocol"
+)
+
+// Store is the daemon's durable state.
+type Store struct {
+	db   *sql.DB
+	path string
+}
+
+const schema = `
+CREATE TABLE IF NOT EXISTS sessions (
+  id              TEXT PRIMARY KEY,
+  agent_id        TEXT NOT NULL,
+  natural_key     TEXT NOT NULL,
+  title           TEXT,
+  cwd             TEXT,
+  git_branch      TEXT,
+  model           TEXT,
+  agent_version   TEXT,
+  attachment      TEXT,
+  fidelity        TEXT,
+  state           TEXT NOT NULL,
+  state_since     INTEGER NOT NULL,
+  guess_json      TEXT,
+  prompt_id       TEXT,
+  transcript_path TEXT,
+  created_at      INTEGER NOT NULL,
+  last_event_at   INTEGER NOT NULL,
+  ended_at        INTEGER,
+  UNIQUE(agent_id, natural_key)
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_last_event ON sessions(last_event_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_state ON sessions(state);
+
+CREATE TABLE IF NOT EXISTS transcript (
+  session_id  TEXT NOT NULL,
+  seq         INTEGER NOT NULL,
+  event_id    TEXT,
+  parent_id   TEXT,
+  kind        TEXT NOT NULL,
+  at          INTEGER NOT NULL,
+  is_sidechain INTEGER NOT NULL DEFAULT 0,
+  payload     TEXT NOT NULL,
+  PRIMARY KEY (session_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_transcript_session_at ON transcript(session_id, at DESC);
+
+CREATE TABLE IF NOT EXISTS approvals (
+  id          TEXT PRIMARY KEY,
+  session_id  TEXT NOT NULL,
+  subject     TEXT,
+  payload     TEXT NOT NULL,
+  asked_at    INTEGER NOT NULL,
+  resolved_at INTEGER,
+  behavior    TEXT,
+  decided_by  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_approvals_session ON approvals(session_id, asked_at DESC);
+
+-- Append-only local audit. Every connection, lease, input, approval, and config
+-- change lands here. It is the record that makes remote input accountable.
+CREATE TABLE IF NOT EXISTS audit (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  at         INTEGER NOT NULL,
+  actor      TEXT NOT NULL,
+  action     TEXT NOT NULL,
+  session_id TEXT,
+  detail     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_audit_at ON audit(at DESC);
+
+CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+`
+
+// Open opens (and migrates) the store at dir/state.db.
+func Open(dir string) (*Store, error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	path := filepath.Join(dir, "state.db")
+	// WAL so a reader (the CLI) never blocks the daemon's writes; busy_timeout
+	// so concurrent access retries instead of failing outright.
+	dsn := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, err
+	}
+	if err := db.Ping(); err != nil {
+		return nil, fmt.Errorf("opening %s: %w", path, err)
+	}
+	if _, err := db.Exec(schema); err != nil {
+		return nil, fmt.Errorf("migrating %s: %w", path, err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return nil, err
+	}
+	return &Store{db: db, path: path}, nil
+}
+
+// Close releases the database.
+func (s *Store) Close() error { return s.db.Close() }
+
+// Path is the database file location.
+func (s *Store) Path() string { return s.path }
+
+// SaveSession upserts a session.
+func (s *Store) SaveSession(sess *protocol.Session) error {
+	guess, _ := json.Marshal(sess.Guess)
+	var endedAt any
+	if sess.State.Terminal() {
+		endedAt = sess.StateSince.UnixMilli()
+	}
+	_, err := s.db.Exec(`
+INSERT INTO sessions (id, agent_id, natural_key, title, cwd, git_branch, model,
+  agent_version, attachment, fidelity, state, state_since, guess_json, prompt_id,
+  transcript_path, created_at, last_event_at, ended_at)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(agent_id, natural_key) DO UPDATE SET
+  title=excluded.title, cwd=excluded.cwd, git_branch=excluded.git_branch,
+  model=excluded.model, agent_version=excluded.agent_version,
+  attachment=excluded.attachment, fidelity=excluded.fidelity,
+  state=excluded.state, state_since=excluded.state_since,
+  guess_json=excluded.guess_json, prompt_id=excluded.prompt_id,
+  transcript_path=excluded.transcript_path, last_event_at=excluded.last_event_at,
+  ended_at=excluded.ended_at`,
+		sess.ID, sess.AgentID, sess.NaturalKey, sess.Title, sess.Cwd, sess.GitBranch,
+		sess.Model, sess.AgentVer, string(sess.Attachment), string(sess.Fidelity),
+		string(sess.State), sess.StateSince.UnixMilli(), string(guess), sess.PromptID,
+		sess.TranscriptPath, sess.CreatedAt.UnixMilli(), sess.LastEventAt.UnixMilli(), endedAt)
+	return err
+}
+
+// LoadSessions returns persisted sessions, most recently active first.
+//
+// Sessions reloaded after a daemon restart cannot be assumed alive: the daemon
+// held their PTYs. Callers reconcile against reality (process scan, hook
+// traffic) and mark the rest DETACHED rather than showing a dead session as
+// live.
+func (s *Store) LoadSessions() ([]protocol.Session, error) {
+	rows, err := s.db.Query(`
+SELECT id, agent_id, natural_key, COALESCE(title,''), COALESCE(cwd,''),
+       COALESCE(git_branch,''), COALESCE(model,''), COALESCE(agent_version,''),
+       COALESCE(attachment,''), COALESCE(fidelity,''), state, state_since,
+       COALESCE(guess_json,''), COALESCE(prompt_id,''), COALESCE(transcript_path,''),
+       created_at, last_event_at
+FROM sessions ORDER BY last_event_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []protocol.Session
+	for rows.Next() {
+		var (
+			sess                     protocol.Session
+			attachment, fidelity, st string
+			stateSince, created, last int64
+			guessJSON                string
+		)
+		if err := rows.Scan(&sess.ID, &sess.AgentID, &sess.NaturalKey, &sess.Title,
+			&sess.Cwd, &sess.GitBranch, &sess.Model, &sess.AgentVer, &attachment,
+			&fidelity, &st, &stateSince, &guessJSON, &sess.PromptID,
+			&sess.TranscriptPath, &created, &last); err != nil {
+			return nil, err
+		}
+		sess.Attachment = protocol.Attachment(attachment)
+		sess.Fidelity = protocol.Fidelity(fidelity)
+		sess.State = protocol.SessionState(st)
+		sess.StateSince = time.UnixMilli(stateSince)
+		sess.CreatedAt = time.UnixMilli(created)
+		sess.LastEventAt = time.UnixMilli(last)
+		if guessJSON != "" {
+			_ = json.Unmarshal([]byte(guessJSON), &sess.Guess)
+		}
+		out = append(out, sess)
+	}
+	return out, rows.Err()
+}
+
+// AppendEvents writes transcript events in one transaction. Duplicate (session,
+// seq) pairs are ignored, which makes re-ingesting a transcript file after a
+// restart idempotent instead of an error.
+func (s *Store) AppendEvents(events []protocol.TranscriptEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare(`
+INSERT INTO transcript (session_id, seq, event_id, parent_id, kind, at, is_sidechain, payload)
+VALUES (?,?,?,?,?,?,?,?)
+ON CONFLICT(session_id, seq) DO NOTHING`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, e := range events {
+		payload, err := json.Marshal(e)
+		if err != nil {
+			return err
+		}
+		at := e.At
+		if at.IsZero() {
+			at = time.Now()
+		}
+		if _, err := stmt.Exec(e.SessionID, e.Seq, e.ID, e.ParentID, string(e.Kind),
+			at.UnixMilli(), boolToInt(e.IsSidechain), string(payload)); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// Transcript returns a session's events, oldest first, from the given seq.
+func (s *Store) Transcript(sessionID string, sinceSeq uint64, limit int) ([]protocol.TranscriptEvent, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	rows, err := s.db.Query(`
+SELECT payload FROM transcript
+WHERE session_id = ? AND seq > ?
+ORDER BY seq ASC LIMIT ?`, sessionID, sinceSeq, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []protocol.TranscriptEvent
+	for rows.Next() {
+		var payload string
+		if err := rows.Scan(&payload); err != nil {
+			return nil, err
+		}
+		var e protocol.TranscriptEvent
+		if err := json.Unmarshal([]byte(payload), &e); err != nil {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// MaxSeq returns the highest seq stored for a session, so an ingester can
+// resume where it left off rather than re-reading a 143 MB file.
+func (s *Store) MaxSeq(sessionID string) (uint64, error) {
+	var seq sql.NullInt64
+	err := s.db.QueryRow(`SELECT MAX(seq) FROM transcript WHERE session_id = ?`, sessionID).Scan(&seq)
+	if err != nil {
+		return 0, err
+	}
+	if !seq.Valid {
+		return 0, nil
+	}
+	return uint64(seq.Int64), nil
+}
+
+// RecordApproval stores an approval request.
+func (s *Store) RecordApproval(req *protocol.ApprovalRequest) error {
+	payload, _ := json.Marshal(req)
+	_, err := s.db.Exec(`
+INSERT INTO approvals (id, session_id, subject, payload, asked_at)
+VALUES (?,?,?,?,?) ON CONFLICT(id) DO NOTHING`,
+		req.ID, req.SessionID, req.Subject, string(payload), req.AskedAt.UnixMilli())
+	return err
+}
+
+// ResolveApproval records the answer.
+func (s *Store) ResolveApproval(id string, d protocol.ApprovalDecision) error {
+	_, err := s.db.Exec(`
+UPDATE approvals SET resolved_at = ?, behavior = ?, decided_by = ? WHERE id = ?`,
+		time.Now().UnixMilli(), d.Behavior, d.DecidedBy, id)
+	return err
+}
+
+// Audit appends an audit record.
+func (s *Store) Audit(actor, action, sessionID, detail string) error {
+	_, err := s.db.Exec(`
+INSERT INTO audit (at, actor, action, session_id, detail) VALUES (?,?,?,?,?)`,
+		time.Now().UnixMilli(), actor, action, sessionID, detail)
+	return err
+}
+
+// AuditEntry is one audit record.
+type AuditEntry struct {
+	At        time.Time `json:"at"`
+	Actor     string    `json:"actor"`
+	Action    string    `json:"action"`
+	SessionID string    `json:"session_id,omitempty"`
+	Detail    string    `json:"detail,omitempty"`
+}
+
+// AuditLog returns recent audit entries, newest first.
+func (s *Store) AuditLog(limit int) ([]AuditEntry, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.Query(`
+SELECT at, actor, action, COALESCE(session_id,''), COALESCE(detail,'')
+FROM audit ORDER BY at DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []AuditEntry
+	for rows.Next() {
+		var e AuditEntry
+		var at int64
+		if err := rows.Scan(&at, &e.Actor, &e.Action, &e.SessionID, &e.Detail); err != nil {
+			return nil, err
+		}
+		e.At = time.UnixMilli(at)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// Purge deletes sessions that ended before the cutoff, and their transcripts.
+func (s *Store) Purge(before time.Time) (int64, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	cutoff := before.UnixMilli()
+	if _, err := tx.Exec(`
+DELETE FROM transcript WHERE session_id IN
+  (SELECT id FROM sessions WHERE ended_at IS NOT NULL AND ended_at < ?)`, cutoff); err != nil {
+		return 0, err
+	}
+	res, err := tx.Exec(`DELETE FROM sessions WHERE ended_at IS NOT NULL AND ended_at < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, tx.Commit()
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}

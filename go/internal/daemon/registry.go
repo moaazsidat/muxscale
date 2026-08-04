@@ -127,6 +127,25 @@ func (r *Registry) Upsert(agentID, naturalKey string, mutate func(*protocol.Sess
 	return s
 }
 
+// Insert registers a session under its existing ID, for restoring from disk.
+//
+// Upsert cannot be used for this: it mints a fresh ID and keys the map by it,
+// so overwriting the ID afterwards would leave the map key and the session's
+// own ID disagreeing, and every later lookup by that ID would silently miss.
+func (r *Registry) Insert(s protocol.Session) *protocol.Session {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if s.ID == "" {
+		s.ID = newID()
+	}
+	cp := s
+	r.sessions[s.ID] = &cp
+	r.byNatural[s.AgentID+"/"+s.NaturalKey] = s.ID
+	out := cp
+	r.broadcast(Change{Kind: ChangeSessionUpsert, Session: &out})
+	return &cp
+}
+
 // SetState transitions a session, recording the guess that justified it.
 // Returns true if the state actually changed.
 func (r *Registry) SetState(sessionID string, g protocol.StateGuess) bool {
@@ -154,6 +173,17 @@ func (r *Registry) AppendEvent(ev protocol.TranscriptEvent) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.broadcast(Change{Kind: ChangeTranscript, Event: &ev})
+}
+
+// NoteOutput records that a session produced output, without retaining it.
+// Output activity is the quiescence signal that state inference uses for
+// agents with no hooks; the bytes themselves are not stored here.
+func (r *Registry) NoteOutput(sessionID string, n int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if s, ok := r.sessions[sessionID]; ok {
+		s.LastEventAt = time.Now()
+	}
 }
 
 // Get returns a copy of a session.

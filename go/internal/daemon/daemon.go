@@ -11,9 +11,12 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"time"
 
+	"github.com/muxscale/muxscale/go/internal/attach"
 	"github.com/muxscale/muxscale/go/internal/protocol"
+	"github.com/muxscale/muxscale/go/internal/store"
 )
 
 // Config configures the daemon.
@@ -45,11 +48,13 @@ func DefaultStateDir() (string, error) {
 
 // Daemon is the long-lived process.
 type Daemon struct {
-	cfg  Config
-	reg  *Registry
-	log  *slog.Logger
-	srv  *http.Server
-	addr string
+	cfg   Config
+	reg   *Registry
+	mgr   *Manager
+	store *store.Store
+	log   *slog.Logger
+	srv   *http.Server
+	addr  string
 }
 
 // New builds a daemon.
@@ -68,6 +73,9 @@ func New(cfg Config) (*Daemon, error) {
 	}
 	return &Daemon{cfg: cfg, reg: NewRegistry(), log: cfg.Log}, nil
 }
+
+// Manager exposes session management, valid after Run has started.
+func (d *Daemon) Manager() *Manager { return d.mgr }
 
 // validateLoopback refuses any non-loopback bind address.
 func validateLoopback(addr string) error {
@@ -88,13 +96,38 @@ func (d *Daemon) Registry() *Registry { return d.reg }
 
 // Run starts the daemon and blocks until ctx is cancelled.
 func (d *Daemon) Run(ctx context.Context) error {
+	stateDir := d.cfg.StateDir
+	if stateDir == "" {
+		var err error
+		if stateDir, err = DefaultStateDir(); err != nil {
+			return err
+		}
+	}
+	st, err := store.Open(stateDir)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	d.store = st
+	d.mgr = NewManager(d.reg, st, d.log)
+
+	if n, err := d.mgr.Restore(); err != nil {
+		d.log.Warn("restoring sessions failed", "err", err)
+	} else if n > 0 {
+		d.log.Info("restored sessions from disk", "count", n)
+	}
+
+	stopScan := make(chan struct{})
+	defer close(stopScan)
+	go d.mgr.DiscoverLoop(stopScan, 3*time.Second)
+
 	mux := http.NewServeMux()
 	NewHookServer(d.reg, d.cfg.HookToken, d.cfg.HoldTime, d.log).Routes(mux)
 	d.routes(mux)
 
-	ln, err := net.Listen("tcp", d.cfg.ListenLocal)
-	if err != nil {
-		return fmt.Errorf("listening on %s: %w", d.cfg.ListenLocal, err)
+	ln, lnErr := net.Listen("tcp", d.cfg.ListenLocal)
+	if lnErr != nil {
+		return fmt.Errorf("listening on %s: %w", d.cfg.ListenLocal, lnErr)
 	}
 	d.addr = ln.Addr().String()
 
@@ -120,6 +153,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	case <-ctx.Done():
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		d.mgr.Shutdown(3 * time.Second)
 		return d.srv.Shutdown(shutCtx)
 	}
 }
@@ -157,6 +191,113 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 			Behavior: body.Behavior, Reason: body.Reason, DecidedBy: body.By,
 		})
 		writeJSON(w, map[string]bool{"delivered": ok})
+	})
+
+	// POST /v1/sessions/run  {"command":[...], "dir":"...", "name":"..."}
+	mux.HandleFunc("/v1/sessions/run", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Command []string `json:"command"`
+			Dir     string   `json:"dir"`
+			Name    string   `json:"name"`
+			Cols    uint16   `json:"cols"`
+			Rows    uint16   `json:"rows"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.Command) == 0 {
+			http.Error(w, "bad request: command required", http.StatusBadRequest)
+			return
+		}
+		sess, err := d.mgr.Run(RunOptions{
+			Command: body.Command, Dir: body.Dir, Name: body.Name,
+			Cols: body.Cols, Rows: body.Rows,
+		})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, sess)
+	})
+
+	// POST /v1/sessions/input
+	mux.HandleFunc("/v1/sessions/input", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			SessionID string `json:"session_id"`
+			Text      string `json:"text"`
+			Key       string `json:"key"`
+			Submit    bool   `json:"submit"`
+			Fence     struct {
+				PromptID string `json:"prompt_id"`
+				State    string `json:"state"`
+			} `json:"fence"`
+			By string `json:"by"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		actor := body.By
+		if actor == "" {
+			actor = "cli"
+		}
+		err := d.mgr.SendInput(body.SessionID, body.Text, attach.NamedKey(body.Key),
+			body.Submit, attach.Fence{
+				ExpectPromptID: body.Fence.PromptID, ExpectState: body.Fence.State,
+			}, actor)
+		if err != nil {
+			// A failed fence is a normal, expected outcome, not a server fault:
+			// the client is meant to show the new context and ask the human.
+			var fe *attach.FenceError
+			if errors.As(err, &fe) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"error": "FENCE_STALE", "detail": fe.Error(),
+					"field": fe.Field, "want": fe.Want, "got": fe.Got,
+				})
+				return
+			}
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, map[string]bool{"delivered": true})
+	})
+
+	// POST /v1/sessions/kill {"session_id":"..."}
+	mux.HandleFunc("/v1/sessions/kill", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			SessionID string `json:"session_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if err := d.mgr.Kill(body.SessionID); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, map[string]bool{"killed": true})
+	})
+
+	// GET /v1/sessions/transcript?session=ID&since=N
+	mux.HandleFunc("/v1/sessions/transcript", func(w http.ResponseWriter, r *http.Request) {
+		id := r.URL.Query().Get("session")
+		since, _ := strconv.ParseUint(r.URL.Query().Get("since"), 10, 64)
+		events, err := d.store.Transcript(id, since, 500)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, map[string]any{"events": events})
+	})
+
+	// GET /v1/audit
+	mux.HandleFunc("/v1/audit", func(w http.ResponseWriter, r *http.Request) {
+		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+		entries, err := d.store.AuditLog(limit)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, map[string]any{"entries": entries})
 	})
 
 	// Server-sent events for `muxscale watch`.
