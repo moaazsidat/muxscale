@@ -17,14 +17,17 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/muxscale/muxscale/go/internal/adapter/claudecode"
+	"github.com/muxscale/muxscale/go/internal/attach"
 	"github.com/muxscale/muxscale/go/internal/daemon"
 	"github.com/muxscale/muxscale/go/internal/protocol"
+	"github.com/muxscale/muxscale/go/internal/setup"
 )
 
 const defaultAddr = "127.0.0.1:4455"
@@ -52,6 +55,10 @@ func main() {
 		err = cmdKill(os.Args[2:])
 	case "audit":
 		err = cmdAudit(os.Args[2:])
+	case "up":
+		err = cmdUp(os.Args[2:])
+	case "down":
+		err = cmdDown(os.Args[2:])
 	case "status":
 		err = cmdStatus(os.Args[2:])
 	case "acl":
@@ -77,7 +84,9 @@ func usage() {
 	fmt.Print(`muxscale - monitor and unblock your coding agents
 
 Usage:
-  muxscale daemon [--tailnet]  Run the daemon (hook listener + session registry)
+  muxscale up [--tailnet]      Set up: service, hooks, shims (each prompted)
+  muxscale down                Stop and remove the background service
+  muxscale daemon [--tailnet]  Run the daemon in the foreground
   muxscale status              Daemon, tailnet, and session summary
   muxscale acl [allow|deny U]  Tailnet identities permitted to connect
   muxscale run -- CMD          Launch CMD as a managed session (enables replies)
@@ -463,6 +472,140 @@ func cmdAudit(args []string) error {
 	return nil
 }
 
+// ---------- up / down ----------
+
+// cmdUp is the one command a new user runs. Every step that changes their
+// machine is shown first and asked about individually, so nobody ends up with
+// a modified shell profile they did not agree to.
+func cmdUp(args []string) error {
+	yes := hasFlag(args, "--yes")
+	tailnet := hasFlag(args, "--tailnet")
+
+	fmt.Println("Setting up muxscale.")
+	fmt.Println("Each step is optional and shown before it happens.")
+	fmt.Println()
+
+	// 1. Background service.
+	bin, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	plan, err := setup.BuildServicePlan(bin, tailnet)
+	if err != nil {
+		fmt.Printf("  service    skipped: %v\n", err)
+	} else {
+		fmt.Printf("1. Background service (%s)\n", plan.Kind)
+		fmt.Printf("   Writes %s\n", plan.Path)
+		fmt.Printf("   Starts muxscale at login and restarts it if it exits.\n")
+		if plan.Exists {
+			fmt.Printf("   (a unit is already installed; it will be replaced)\n")
+		}
+		if yes || confirm("   Install it?") {
+			if err := plan.Apply(); err != nil {
+				fmt.Printf("   failed: %v\n", err)
+			} else {
+				fmt.Printf("   installed.\n")
+				if hint := setup.LingerHint(); hint != "" {
+					fmt.Printf("   %s\n", hint)
+				}
+			}
+		}
+		fmt.Println()
+	}
+
+	// 2. Claude Code hooks.
+	fmt.Println("2. Claude Code hooks")
+	if v, err := claudecode.DetectVersion(); err != nil {
+		fmt.Printf("   skipped: %v\n", err)
+	} else if claudecode.Classify(v) == claudecode.SupportNone {
+		fmt.Printf("   %s\n", claudecode.SupportMessage(v, claudecode.SupportNone))
+	} else {
+		fmt.Printf("   Claude Code %s detected.\n", v)
+		fmt.Printf("   Hooks give exact blocked-state detection and remote approvals.\n")
+		fmt.Printf("   Existing hooks are preserved and a backup is written.\n")
+		if yes || confirm("   Install them?") {
+			if err := hooksInstall(true); err != nil {
+				fmt.Printf("   failed: %v\n", err)
+			}
+		}
+	}
+	fmt.Println()
+
+	// 3. PATH shims.
+	agents := make([]string, 0, len(attach.AgentBinaries))
+	for bin := range attach.AgentBinaries {
+		agents = append(agents, bin)
+	}
+	sort.Strings(agents)
+
+	shims, err := setup.BuildShimPlan(agents)
+	if err != nil {
+		return err
+	}
+	fmt.Println("3. PATH shims")
+	if len(shims.Agents) == 0 {
+		fmt.Println("   No supported agent binaries found on PATH; nothing to shim.")
+	} else {
+		found := make([]string, 0, len(shims.Agents))
+		for name := range shims.Agents {
+			found = append(found, name)
+		}
+		sort.Strings(found)
+		fmt.Printf("   Found: %s\n", strings.Join(found, ", "))
+		fmt.Printf("   Writes wrappers into %s so you keep typing `claude` as usual,\n", shims.Dir)
+		fmt.Printf("   but sessions become writable from your phone. Scripts and CI are untouched.\n")
+		if yes || confirm("   Install shims?") {
+			if err := shims.Apply(); err != nil {
+				fmt.Printf("   failed: %v\n", err)
+			} else {
+				fmt.Printf("   installed.\n")
+				if !shims.AlreadyOnPath {
+					// Never edited without consent: this is the user's shell config.
+					fmt.Printf("\n   Add this line to %s, then restart your shell:\n", shims.ProfilePath)
+					fmt.Printf("       %s\n", shims.PathHint)
+				}
+			}
+		}
+	}
+	fmt.Println()
+
+	// 4. Terminal remote control, for adopting sessions already running.
+	fmt.Println("4. Terminal remote control (optional)")
+	fmt.Println("   Lets muxscale reply to sessions that are already running,")
+	fmt.Println("   without restarting them.")
+	for _, c := range attach.DetectTerminals() {
+		switch {
+		case c.Enabled:
+			fmt.Printf("   %-8s enabled\n", c.Kind)
+		case c.Available:
+			fmt.Printf("   %-8s %s\n", c.Kind, c.Reason)
+			if c.HowToFix != "" {
+				fmt.Printf("            fix: %s\n", c.HowToFix)
+			}
+		}
+	}
+	fmt.Println()
+
+	fmt.Println("Done. Next:")
+	fmt.Println("    muxscale status     see the daemon and tailnet")
+	fmt.Println("    muxscale ls         see your agents")
+	if tailnet {
+		fmt.Println("    muxscale acl allow you@example.com   permit your phone")
+	}
+	return nil
+}
+
+func cmdDown(args []string) error {
+	path, err := setup.UninstallService()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("removed %s\n", path)
+	fmt.Println("Hooks and shims are untouched; remove them with")
+	fmt.Println("    muxscale hooks uninstall")
+	return nil
+}
+
 // ---------- status / acl ----------
 
 func cmdStatus(args []string) error {
@@ -723,6 +866,43 @@ func cmdDoctor(args []string) error {
 		check("hooks installed", true, path)
 	} else {
 		check("hooks installed", false, "run `muxscale hooks install`")
+	}
+
+	if svc, err := setup.ServiceStatus(); err == nil {
+		detail := "not installed - run `muxscale up`"
+		if svc.Installed && svc.Running {
+			detail = svc.Kind + ", running"
+		} else if svc.Installed {
+			detail = svc.Kind + ", installed but not running"
+		}
+		check("background service", svc.Installed && svc.Running, detail)
+	}
+
+	if shims, err := setup.InstalledShims(); err == nil {
+		if len(shims) == 0 {
+			check("path shims", false, "none - sessions you start will be read-only")
+		} else {
+			check("path shims", true, strings.Join(shims, ", "))
+		}
+	}
+
+	// Terminal remote control is the difference between adopting an
+	// already-running session and being able only to watch it.
+	var anyTerm bool
+	for _, c := range attach.DetectTerminals() {
+		if c.Enabled {
+			anyTerm = true
+			check("terminal control", true, string(c.Kind)+" remote control enabled")
+		}
+	}
+	if !anyTerm {
+		fmt.Printf("[ -- ] %-28s %s\n", "terminal control",
+			"no terminal remote control; already-running sessions are read-only")
+		for _, c := range attach.DetectTerminals() {
+			if c.Available && c.HowToFix != "" {
+				fmt.Printf("       %s: %s\n", c.Kind, c.HowToFix)
+			}
+		}
 	}
 
 	if !ok {
