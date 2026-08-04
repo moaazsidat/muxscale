@@ -21,17 +21,17 @@ import (
 
 // entry is one line of the JSONL.
 type entry struct {
-	Type       string          `json:"type"`
-	UUID       string          `json:"uuid"`
-	ParentUUID string          `json:"parentUuid"`
-	SessionID  string          `json:"sessionId"`
-	Timestamp  string          `json:"timestamp"`
-	Cwd        string          `json:"cwd"`
-	GitBranch  string          `json:"gitBranch"`
-	Version    string          `json:"version"`
-	IsSidechain bool           `json:"isSidechain"`
-	IsMeta     bool            `json:"isMeta"`
-	Message    json.RawMessage `json:"message"`
+	Type        string          `json:"type"`
+	UUID        string          `json:"uuid"`
+	ParentUUID  string          `json:"parentUuid"`
+	SessionID   string          `json:"sessionId"`
+	Timestamp   string          `json:"timestamp"`
+	Cwd         string          `json:"cwd"`
+	GitBranch   string          `json:"gitBranch"`
+	Version     string          `json:"version"`
+	IsSidechain bool            `json:"isSidechain"`
+	IsMeta      bool            `json:"isMeta"`
+	Message     json.RawMessage `json:"message"`
 
 	// Sidecar entry types that carry session metadata rather than conversation.
 	AITitle    string `json:"aiTitle"`
@@ -49,10 +49,10 @@ type message struct {
 }
 
 type apiUsage struct {
-	InputTokens         int `json:"input_tokens"`
-	OutputTokens        int `json:"output_tokens"`
-	CacheReadInput      int `json:"cache_read_input_tokens"`
-	CacheCreationInput  int `json:"cache_creation_input_tokens"`
+	InputTokens        int `json:"input_tokens"`
+	OutputTokens       int `json:"output_tokens"`
+	CacheReadInput     int `json:"cache_read_input_tokens"`
+	CacheCreationInput int `json:"cache_creation_input_tokens"`
 }
 
 type contentBlock struct {

@@ -49,18 +49,18 @@ var AgentBinaries = map[string]string{
 // terminalAncestors are processes that, if they own an agent, imply a
 // higher-fidelity attachment may be possible.
 var terminalAncestors = map[string]string{
-	"tmux":         "tmux",
-	"tmux:server":  "tmux",
-	"kitty":        "kitty",
-	"wezterm-gui":  "wezterm",
-	"wezterm":      "wezterm",
-	"iTerm2":       "iterm2",
-	"zellij":       "zellij",
-	"screen":       "screen",
-	"Terminal":     "apple-terminal",
-	"ghostty":      "ghostty",
-	"Code Helper":  "vscode",
-	"Code":         "vscode",
+	"tmux":        "tmux",
+	"tmux:server": "tmux",
+	"kitty":       "kitty",
+	"wezterm-gui": "wezterm",
+	"wezterm":     "wezterm",
+	"iTerm2":      "iterm2",
+	"zellij":      "zellij",
+	"screen":      "screen",
+	"Terminal":    "apple-terminal",
+	"ghostty":     "ghostty",
+	"Code Helper": "vscode",
+	"Code":        "vscode",
 }
 
 // Discover finds running agent processes.

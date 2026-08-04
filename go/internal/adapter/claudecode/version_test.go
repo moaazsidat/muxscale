@@ -41,10 +41,10 @@ func TestClassifyFloor(t *testing.T) {
 		version string
 		want    Support
 	}{
-		{"2.1.195", SupportNone},    // one below the floor
-		{"2.1.196", SupportFull},    // exactly the floor
+		{"2.1.195", SupportNone}, // one below the floor
+		{"2.1.196", SupportFull}, // exactly the floor
 		{"2.1.197", SupportFull},
-		{"2.1.220", SupportFull},    // newest known profile
+		{"2.1.220", SupportFull}, // newest known profile
 		{"2.1.221", SupportUntested},
 		{"3.0.0", SupportUntested},
 		{"2.0.999", SupportNone},

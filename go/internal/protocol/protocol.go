@@ -90,7 +90,7 @@ type Session struct {
 	// matches, so a reply composed offline cannot answer a later question.
 	PromptID string `json:"prompt_id,omitempty"`
 
-	TranscriptPath string `json:"transcript_path,omitempty"`
+	TranscriptPath string    `json:"transcript_path,omitempty"`
 	CreatedAt      time.Time `json:"created_at"`
 	LastEventAt    time.Time `json:"last_event_at"`
 

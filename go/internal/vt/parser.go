@@ -34,18 +34,18 @@ type Emulator struct {
 	osc    []byte
 	utf8   []byte
 
-	attr       Attr
-	savedX     int
-	savedY     int
-	savedAttr  Attr
-	scrollTop  int
-	scrollBot  int
+	attr        Attr
+	savedX      int
+	savedY      int
+	savedAttr   Attr
+	scrollTop   int
+	scrollBot   int
 	inAltScreen bool
 	wrapPending bool
 
 	// Scrollback holds lines that scrolled off the top.
-	scrollback  []string
-	maxScroll   int
+	scrollback []string
+	maxScroll  int
 
 	// Title is the last OSC 0/2 window title seen. Agents often set this to
 	// something useful, which is a free session label.

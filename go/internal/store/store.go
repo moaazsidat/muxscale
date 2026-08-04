@@ -170,10 +170,10 @@ FROM sessions ORDER BY last_event_at DESC`)
 	var out []protocol.Session
 	for rows.Next() {
 		var (
-			sess                     protocol.Session
-			attachment, fidelity, st string
+			sess                      protocol.Session
+			attachment, fidelity, st  string
 			stateSince, created, last int64
-			guessJSON                string
+			guessJSON                 string
 		)
 		if err := rows.Scan(&sess.ID, &sess.AgentID, &sess.NaturalKey, &sess.Title,
 			&sess.Cwd, &sess.GitBranch, &sess.Model, &sess.AgentVer, &attachment,

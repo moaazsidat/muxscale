@@ -14,9 +14,9 @@ import (
 // lands in M1. The interface is deliberately narrow so swapping the backing
 // store does not ripple into the hook handler.
 type Registry struct {
-	mu       sync.RWMutex
-	sessions map[string]*protocol.Session // by muxscale id
-	byNatural map[string]string           // agentID+"/"+naturalKey -> muxscale id
+	mu        sync.RWMutex
+	sessions  map[string]*protocol.Session // by muxscale id
+	byNatural map[string]string            // agentID+"/"+naturalKey -> muxscale id
 
 	// approvals are keyed by approval id and hold the channel a blocked hook
 	// handler is waiting on.
@@ -46,12 +46,12 @@ const (
 
 // Change is a registry event delivered to subscribers.
 type Change struct {
-	Kind     ChangeKind                 `json:"kind"`
-	Session  *protocol.Session          `json:"session,omitempty"`
-	Event    *protocol.TranscriptEvent  `json:"event,omitempty"`
-	Approval *protocol.ApprovalRequest  `json:"approval,omitempty"`
-	Prev     protocol.SessionState      `json:"prev,omitempty"`
-	At       time.Time                  `json:"at"`
+	Kind     ChangeKind                `json:"kind"`
+	Session  *protocol.Session         `json:"session,omitempty"`
+	Event    *protocol.TranscriptEvent `json:"event,omitempty"`
+	Approval *protocol.ApprovalRequest `json:"approval,omitempty"`
+	Prev     protocol.SessionState     `json:"prev,omitempty"`
+	At       time.Time                 `json:"at"`
 }
 
 // NewRegistry builds an empty registry.

@@ -28,6 +28,10 @@ type Manager struct {
 	tailers map[string]*claudecode.Tailer // muxscale session id -> transcript tailer
 	screens map[string]*vt.Emulator       // muxscale session id -> screen state
 
+	// tmuxTargets maps a session to an adopted tmux pane, which is how an
+	// already-running session becomes writable without changing anyone's habits.
+	tmuxTargets map[string]string
+
 	// screenMu guards emulator writes/reads separately from the map, so a
 	// client reading a snapshot never blocks the PTY drain loop for long.
 	screenMu sync.Mutex
@@ -37,9 +41,10 @@ type Manager struct {
 func NewManager(reg *Registry, st *store.Store, log *slog.Logger) *Manager {
 	m := &Manager{
 		reg: reg, store: st, log: log,
-		wrapped: map[string]*attach.Wrapped{},
-		tailers: map[string]*claudecode.Tailer{},
-		screens: map[string]*vt.Emulator{},
+		wrapped:     map[string]*attach.Wrapped{},
+		tailers:     map[string]*claudecode.Tailer{},
+		screens:     map[string]*vt.Emulator{},
+		tmuxTargets: map[string]string{},
 	}
 	go m.persistLoop()
 	return m
@@ -251,15 +256,6 @@ func (m *Manager) SendInput(sessionID string, text string, key attach.NamedKey, 
 		return err
 	}
 
-	m.mu.RLock()
-	w := m.wrapped[sessionID]
-	m.mu.RUnlock()
-	if w == nil {
-		return fmt.Errorf(
-			"session %s is read-only: muxscale does not own its terminal.\n"+
-				"Restart it under `muxscale run`, or move it into tmux, to enable replies", sessionID)
-	}
-
 	var payload []byte
 	if key != "" {
 		b, err := attach.EncodeKey(key)
@@ -271,8 +267,28 @@ func (m *Manager) SendInput(sessionID string, text string, key attach.NamedKey, 
 		payload = attach.EncodeText(text, submit)
 	}
 
-	if _, err := w.Write(payload); err != nil {
-		return err
+	m.mu.RLock()
+	w := m.wrapped[sessionID]
+	target := m.tmuxTargets[sessionID]
+	m.mu.RUnlock()
+
+	switch {
+	case w != nil:
+		if _, err := w.Write(payload); err != nil {
+			return err
+		}
+	case target != "":
+		if err := attach.SendKeys(target, payload); err != nil {
+			return err
+		}
+	default:
+		// Say exactly why and exactly how to fix it. A bare "read-only" tells
+		// the user nothing they can act on.
+		return fmt.Errorf(
+			"session %s is read-only: muxscale does not own its terminal.\n"+
+				"To enable replies, either restart it under `muxscale run`, "+
+				"run it inside tmux, or enable remote control in your terminal "+
+				"(kitty, WezTerm, or iTerm2)", sessionID)
 	}
 	// Record that input happened and how much, never the content by default.
 	_ = m.store.Audit(actor, "input_sent", sessionID,
@@ -311,6 +327,8 @@ func (m *Manager) DiscoverLoop(stop <-chan struct{}, interval time.Duration) {
 }
 
 func (m *Manager) scanOnce() {
+	m.scanTmux()
+
 	procs, err := attach.Discover()
 	if err != nil {
 		m.log.Debug("discovery failed", "err", err)
@@ -460,6 +478,52 @@ func naturalOf(reg *Registry, sessionID string) string {
 		return s.NaturalKey
 	}
 	return sessionID
+}
+
+// scanTmux adopts agent panes so already-running sessions accept input.
+func (m *Manager) scanTmux() {
+	if !attach.TmuxAvailable() {
+		return
+	}
+	panes, err := attach.FindAgentPanes()
+	if err != nil {
+		m.log.Debug("tmux scan failed", "err", err)
+		return
+	}
+	for _, p := range panes {
+		agentID := attach.AgentBinaries[p.Command]
+		if agentID == "" {
+			continue
+		}
+		// Key on pane_id (%N): it survives window renumbering, whereas
+		// session:window.pane does not.
+		natural := "tmux:" + p.PaneID
+		sess := m.reg.Upsert(agentID, natural, func(s *protocol.Session) {
+			s.Cwd = p.Path
+			s.Attachment = protocol.AttachTmux
+			s.Fidelity = protocol.FidelityFull
+		})
+
+		m.mu.Lock()
+		m.tmuxTargets[sess.ID] = p.PaneID
+		m.mu.Unlock()
+
+		if s, ok := m.reg.Get(sess.ID); ok && s.State == protocol.StateStarting {
+			m.reg.SetState(sess.ID, protocol.StateGuess{
+				State: protocol.StateUnknown, Confidence: 0.5,
+				Reason:   "adopted from tmux; no hook or transcript yet",
+				Evidence: "tmux:" + p.PaneID, At: time.Now(),
+			})
+		}
+		if agentID == "claude-code" && p.Path != "" {
+			if files, err := claudecode.FindTranscripts(p.Path); err == nil && len(files) > 0 {
+				m.reg.Upsert(agentID, natural, func(t *protocol.Session) {
+					t.TranscriptPath = files[0]
+				})
+				m.EnsureTailer(sess.ID, files[0])
+			}
+		}
+	}
 }
 
 func (m *Manager) hasWrappedPid(pid int) bool {

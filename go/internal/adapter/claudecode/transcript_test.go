@@ -48,9 +48,9 @@ func TestParseTranscriptEvents(t *testing.T) {
 		protocol.EventUserMessage:      1, // the tool_result-only user entries are results, not messages
 		protocol.EventAssistantMessage: 3, // a2, a4, a5; a1 is thinking-only
 
-		protocol.EventThinking:         1,
-		protocol.EventToolCall:         2,
-		protocol.EventToolResult:       2,
+		protocol.EventThinking:   1,
+		protocol.EventToolCall:   2,
+		protocol.EventToolResult: 2,
 	}
 	for k, w := range want {
 		if counts[k] != w {
@@ -84,8 +84,8 @@ func TestParseTranscriptSurvivesMalformedLine(t *testing.T) {
 
 func TestToolCallAndResultPairing(t *testing.T) {
 	events, _ := parseFixture(t)
-	calls := map[string]string{}  // tool_use_id -> name
-	results := map[string]bool{}  // tool_use_id -> seen
+	calls := map[string]string{} // tool_use_id -> name
+	results := map[string]bool{} // tool_use_id -> seen
 	for _, e := range events {
 		switch e.Kind {
 		case protocol.EventToolCall:
