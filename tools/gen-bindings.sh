@@ -19,9 +19,9 @@ LIB="target/release/libmuxscale_core.dylib"
 rm -rf "$OUT"
 mkdir -p "$OUT/swift" "$OUT/kotlin"
 
-cargo run --release --bin uniffi-bindgen -- generate \
+cargo run --release --features bindgen --bin uniffi-bindgen -- generate \
   --library "$LIB" --language swift --out-dir "$OUT/swift" --no-format
-cargo run --release --bin uniffi-bindgen -- generate \
+cargo run --release --features bindgen --bin uniffi-bindgen -- generate \
   --library "$LIB" --language kotlin --out-dir "$OUT/kotlin" --no-format
 
 echo "generated:"

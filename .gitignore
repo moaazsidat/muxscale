@@ -5,3 +5,4 @@
 *.muxscale-backup-*
 *.muxscale-tmp
 .DS_Store
+/sbom.cdx.json
