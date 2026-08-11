@@ -12,6 +12,12 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 status=0
 
+# `go install` and `cargo install` put binaries in these directories, which are
+# frequently not on PATH -- notably under CI and non-login shells. Looking there
+# avoids telling someone to install a tool they already have.
+PATH="$PATH:$(go env GOPATH 2>/dev/null || echo "$HOME/go")/bin:${CARGO_HOME:-$HOME/.cargo}/bin"
+export PATH
+
 echo "=== Go: govulncheck ==="
 if ! command -v govulncheck >/dev/null 2>&1; then
   echo "  govulncheck not installed:"
@@ -54,12 +60,19 @@ fi
 
 echo
 echo "=== Rust: clippy ==="
-if (cd rust && cargo clippy --all-targets -- -D warnings 2>&1 | tail -5); then
+# Output goes to a file rather than through `| tail`, because piping makes the
+# `if` test tail's exit status instead of clippy's -- which reported "clean"
+# unconditionally and would have let a -D warnings failure through unnoticed.
+clippy_log=$(mktemp)
+if (cd rust && cargo clippy --all-targets --all-features -- -D warnings) \
+     >"$clippy_log" 2>&1; then
   echo "  clean"
 else
-  echo "  clippy warnings"
+  echo "  CLIPPY FAILED:"
+  tail -30 "$clippy_log" | sed 's|^|    |'
   status=1
 fi
+rm -f "$clippy_log"
 
 echo
 echo "=== secrets: nothing credential-shaped in tracked files ==="
