@@ -6,3 +6,9 @@
 *.muxscale-tmp
 .DS_Store
 /sbom.cdx.json
+
+# Release artefacts from packaging/build-linux-packages.sh
+dist/
+
+# Rust build output
+rust/target/
