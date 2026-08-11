@@ -88,7 +88,9 @@ func TestHandshakeAndRoundTrip(t *testing.T) {
 func TestRelaySeesNoPlaintext(t *testing.T) {
 	_, _, _, pSess, _, _ := pair(t)
 
-	secret := "the deploy key is AKIAIOSFODNN7EXAMPLE"
+	// AWS's own documentation example key, used as a canary so the assertion
+	// below has something recognisable to look for.
+	secret := "the deploy key is AKIAIOSFODNN7EXAMPLE" // notasecret
 	hdr := RoutingHeader{Version: 1, HostKey: "hk_1", DeviceID: "dev_1", StreamID: 1}
 	env, err := Seal(pSess, hdr, []byte(secret))
 	if err != nil {
@@ -97,7 +99,7 @@ func TestRelaySeesNoPlaintext(t *testing.T) {
 
 	// Everything a relay can observe: the header and the ciphertext.
 	observable := string(env.Header.Encode()) + env.Ciphertext
-	for _, canary := range []string{"deploy key", "AKIAIOSFODNN7EXAMPLE", "the deploy"} {
+	for _, canary := range []string{"deploy key", "AKIAIOSFODNN7EXAMPLE", "the deploy"} { // notasecret
 		if strings.Contains(observable, canary) {
 			t.Errorf("plaintext %q is visible to the relay", canary)
 		}
