@@ -8,6 +8,7 @@ description = "Shared client core: protocol codec, grid model, and crypto for th
 [lib]
 # staticlib and cdylib are what the iOS XCFramework and Android .so need.
 crate-type = ["lib", "staticlib", "cdylib"]
+name = "muxscale_core"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -15,6 +16,14 @@ serde_json = "1"
 snow = "0.10"
 blake2 = "0.10"
 base64 = "0.22"
+uniffi = { version = "0.29", features = ["cli"] }
+thiserror = "2"
 
 [dev-dependencies]
 serde_json = "1"
+
+[[bin]]
+# The bindgen entry point, invoked by tools/gen-bindings.sh to emit Swift and
+# Kotlin. Not shipped in the app.
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"

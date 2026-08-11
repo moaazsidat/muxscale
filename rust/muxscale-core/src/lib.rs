@@ -9,7 +9,11 @@
 //! and crypto need one implementation that is tested once, not two hand-written
 //! ones that drift.
 
+// UniFFI scaffolding must be set up in the crate root, not a submodule.
+uniffi::setup_scaffolding!();
+
 pub mod e2e;
+pub mod ffi;
 pub mod grid;
 pub mod protocol;
 
