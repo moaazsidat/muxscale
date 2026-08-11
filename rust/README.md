@@ -29,6 +29,26 @@ cd go && MUXSCALE_UPDATE_FIXTURES=1 go test ./internal/vt -run CrossImpl
 cd rust && cargo test
 ```
 
+## Noise interop
+
+`tests/noise_interop.rs` spawns the Go daemon's handshake peer and performs a
+real Noise IK exchange against it, then compares the short authentication
+string both sides derived independently.
+
+This matters more than the usual cross-language test. Two implementations of a
+security protocol that only ever test against themselves will agree with
+themselves. A disagreement between them does not fail loudly -- it produces a
+pairing that appears to work while the SAS check silently compares two
+different phrases, so a legitimate pairing gets abandoned.
+
+```bash
+cd go && go build -o /tmp/noise-peer ./cmd/noise-peer
+cd rust && cargo test
+```
+
+The interop tests skip if the peer is not built, so `cargo test` alone still
+works.
+
 ## Build
 
 ```bash

@@ -15,7 +15,9 @@ package e2e
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 
@@ -207,25 +209,63 @@ func (h *Handshake) Session() (*Session, error) {
 	return &Session{send: h.send, recv: h.recv}, nil
 }
 
-// Seal encrypts a payload for the peer.
+// Seal encrypts a payload for the peer, binding it to a routing header.
 //
-// ad is additional authenticated data: the routing header. Binding it into the
-// tag means a relay cannot redirect a message to a different device without
-// the tampering being detected.
-func (s *Session) Seal(plaintext, ad []byte) ([]byte, error) {
-	return s.send.Encrypt(nil, ad, plaintext)
+// The header is prepended to the plaintext rather than passed as Noise
+// additional-authenticated-data. That is deliberate and was not the first
+// design: AD in transport messages is a flynn/noise extension, and the Noise
+// spec says transport messages carry no AD, so strict implementations -- snow,
+// which the Rust client uses -- cannot produce or verify it. Writing the second
+// implementation is what surfaced that, and a protocol only one library can
+// speak is not a protocol.
+//
+// The security property is unchanged: a relay that rewrites the outer routing
+// header produces a mismatch against this authenticated inner copy, and Open
+// rejects it. As a bonus the header is now confidential as well as
+// authenticated, so the relay learns nothing from it beyond what it must route
+// on.
+func (s *Session) Seal(plaintext, header []byte) ([]byte, error) {
+	if len(header) > maxHeaderBytes {
+		return nil, fmt.Errorf("routing header is %d bytes, over the %d limit",
+			len(header), maxHeaderBytes)
+	}
+	framed := make([]byte, 2+len(header)+len(plaintext))
+	binary.BigEndian.PutUint16(framed[:2], uint16(len(header)))
+	copy(framed[2:], header)
+	copy(framed[2+len(header):], plaintext)
+	return s.send.Encrypt(nil, nil, framed)
 }
 
-// Open decrypts a payload from the peer.
+// maxHeaderBytes bounds the framed routing header, so a malformed length
+// cannot make Open allocate wildly.
+const maxHeaderBytes = 4096
+
+// Open decrypts a payload and verifies it was addressed as received.
 //
-// Noise's nonce sequence is what provides replay protection: a repeated or
-// reordered message fails to decrypt rather than being accepted twice. That
-// matters here more than usual, because a replayed message could be an
-// approval.
-func (s *Session) Open(ciphertext, ad []byte) ([]byte, error) {
-	pt, err := s.recv.Decrypt(nil, ad, ciphertext)
+// wantHeader is the routing header the message actually arrived under. If the
+// authenticated copy inside disagrees, the message was redirected in transit
+// and is refused.
+//
+// Noise's nonce sequence provides replay protection: a repeated or reordered
+// message fails to decrypt rather than being accepted twice. That matters more
+// than usual here, because a replayed message could be an approval.
+func (s *Session) Open(ciphertext, wantHeader []byte) ([]byte, error) {
+	framed, err := s.recv.Decrypt(nil, nil, ciphertext)
 	if err != nil {
 		return nil, fmt.Errorf("decryption failed (tampered, replayed, or out of order): %w", err)
 	}
-	return pt, nil
+	if len(framed) < 2 {
+		return nil, errors.New("message is too short to carry a routing header")
+	}
+	n := int(binary.BigEndian.Uint16(framed[:2]))
+	if n > maxHeaderBytes || 2+n > len(framed) {
+		return nil, errors.New("routing header length is out of range")
+	}
+	gotHeader := framed[2 : 2+n]
+	if subtle.ConstantTimeCompare(gotHeader, wantHeader) != 1 {
+		return nil, fmt.Errorf(
+			"message was addressed to %q but delivered as %q; it was redirected in transit",
+			gotHeader, wantHeader)
+	}
+	return framed[2+n:], nil
 }

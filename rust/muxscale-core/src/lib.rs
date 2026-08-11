@@ -9,9 +9,11 @@
 //! and crypto need one implementation that is tested once, not two hand-written
 //! ones that drift.
 
+pub mod e2e;
 pub mod grid;
 pub mod protocol;
 
+pub use e2e::{Handshake, KeyPair, Role, Session as E2eSession};
 pub use grid::{Attr, Cell, Delta, Grid, RowRuns, Run, Snapshot};
 pub use protocol::{ApprovalRequest, EventKind, Session, SessionState, TranscriptEvent};
 
