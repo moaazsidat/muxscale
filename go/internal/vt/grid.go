@@ -8,6 +8,7 @@
 package vt
 
 import (
+	"encoding/base64"
 	"strings"
 	"unicode/utf8"
 )
@@ -398,3 +399,9 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+// b64 and unb64 support the cross-implementation fixtures, which carry raw
+// terminal bytes through JSON.
+func b64(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
+
+func unb64(s string) ([]byte, error) { return base64.StdEncoding.DecodeString(s) }

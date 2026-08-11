@@ -1,0 +1,16 @@
+[workspace]
+members = ["muxscale-core"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[profile.release]
+# The client core runs on a phone: size matters more than the last few percent
+# of speed, and panics must not unwind across the FFI boundary.
+opt-level = "z"
+lto = true
+panic = "abort"
+strip = true

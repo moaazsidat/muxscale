@@ -1,0 +1,17 @@
+[package]
+name = "muxscale-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared client core: protocol codec, grid model, and crypto for the muxscale apps"
+
+[lib]
+# staticlib and cdylib are what the iOS XCFramework and Android .so need.
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+serde_json = "1"
