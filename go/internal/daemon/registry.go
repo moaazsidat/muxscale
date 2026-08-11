@@ -146,6 +146,37 @@ func (r *Registry) Insert(s protocol.Session) *protocol.Session {
 	return &cp
 }
 
+// Remove deletes a session from the live registry.
+//
+// Used to reconcile duplicates: the same real agent session can be found twice,
+// once by process scan and once by its own hooks, because the two paths key on
+// different things. Whichever attachment is weaker gets dropped, so a phone
+// shows one row per agent rather than two.
+func (r *Registry) Remove(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.sessions[id]
+	if !ok {
+		return false
+	}
+	delete(r.sessions, id)
+	delete(r.byNatural, s.AgentID+"/"+s.NaturalKey)
+	return true
+}
+
+// FindByTranscript returns sessions following a given transcript file.
+func (r *Registry) FindByTranscript(path string) []protocol.Session {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var out []protocol.Session
+	for _, s := range r.sessions {
+		if s.TranscriptPath != "" && s.TranscriptPath == path {
+			out = append(out, *s)
+		}
+	}
+	return out
+}
+
 // SetState transitions a session, recording the guess that justified it.
 // Returns true if the state actually changed.
 func (r *Registry) SetState(sessionID string, g protocol.StateGuess) bool {

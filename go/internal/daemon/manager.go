@@ -387,12 +387,62 @@ func (m *Manager) scanOnce() {
 	}
 }
 
+// Reconcile drops weaker duplicates of a session.
+//
+// The same real agent session is found by two independent paths that key on
+// different things: process scan keys on pid, hooks key on the agent's own
+// session id. Both are correct, and without this they produce two rows for one
+// agent. The richer attachment wins, because it can do strictly more.
+func (m *Manager) Reconcile(keepID, transcriptPath string) {
+	if transcriptPath == "" {
+		return
+	}
+	keep, ok := m.reg.Get(keepID)
+	if !ok {
+		return
+	}
+	for _, other := range m.reg.FindByTranscript(transcriptPath) {
+		if other.ID == keepID {
+			continue
+		}
+		if fidelityRank(other.Fidelity) >= fidelityRank(keep.Fidelity) {
+			continue // the other one is at least as capable; leave it alone
+		}
+		m.log.Debug("dropping a duplicate session",
+			"kept", keepID, "dropped", other.ID, "transcript", transcriptPath)
+		m.reg.Remove(other.ID)
+
+		m.mu.Lock()
+		delete(m.tailers, other.ID)
+		m.mu.Unlock()
+	}
+}
+
+// fidelityRank orders attachments by capability, so reconciliation keeps the
+// one that can do more rather than whichever was seen first.
+func fidelityRank(f protocol.Fidelity) int {
+	switch f {
+	case protocol.FidelityNativeFull:
+		return 4
+	case protocol.FidelityFull:
+		return 3
+	case protocol.FidelityStructured:
+		return 2
+	case protocol.FidelityReadOnly:
+		return 1
+	}
+	return 0
+}
+
 // EnsureTailer starts following a session's transcript file if it is not
 // already being followed. Idempotent, so the discovery loop can call it freely.
 func (m *Manager) EnsureTailer(sessionID, path string) {
 	if path == "" {
 		return
 	}
+	// A hook-driven session and a scan-discovered one can both be following the
+	// same file. Collapse them before either starts streaming duplicates.
+	m.Reconcile(sessionID, path)
 	m.mu.Lock()
 	if _, running := m.tailers[sessionID]; running {
 		m.mu.Unlock()
