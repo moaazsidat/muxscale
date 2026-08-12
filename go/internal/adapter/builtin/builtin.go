@@ -11,6 +11,7 @@ import (
 	"github.com/muxscale/muxscale/go/internal/adapter"
 	"github.com/muxscale/muxscale/go/internal/adapter/claudecode"
 	"github.com/muxscale/muxscale/go/internal/adapter/codex"
+	"github.com/muxscale/muxscale/go/internal/adapter/generic"
 	"github.com/muxscale/muxscale/go/internal/adapter/hermes"
 	"github.com/muxscale/muxscale/go/internal/adapter/opencode"
 	"github.com/muxscale/muxscale/go/internal/adapter/pi"
@@ -42,5 +43,12 @@ func Registry(opt Options) *adapter.Registry {
 		opencode.New(opt.OpenCodeURL),
 		pi.New(),
 	)
+	// Detection-only agents. They are registered rather than left to the
+	// binary-name table so that everything muxscale knows how to recognise is
+	// described in one place, with its real capabilities attached -- the table
+	// could say "this is aider" but not "and there is no transcript for it".
+	for _, s := range generic.All() {
+		r.MustRegister(generic.New(s))
+	}
 	return r
 }

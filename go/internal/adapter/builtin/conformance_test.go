@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/muxscale/muxscale/go/internal/adapter"
+	"github.com/muxscale/muxscale/go/internal/attach"
 	"github.com/muxscale/muxscale/go/internal/protocol"
 )
 
@@ -25,6 +26,32 @@ import (
 func reg(t *testing.T) *adapter.Registry {
 	t.Helper()
 	return Registry(Options{})
+}
+
+// M4's exit criterion is conformance green for at least 8 agents. Asserting
+// the count here means the criterion is measured rather than remembered.
+func TestConformanceCoversTheMilestoneThreshold(t *testing.T) {
+	const required = 8
+	r := reg(t)
+	if r.Len() < required {
+		t.Errorf("%d adapters registered; M4 requires conformance across at least %d",
+			r.Len(), required)
+	}
+	t.Logf("%d adapters: %v", r.Len(), r.IDs())
+
+	// Of those, how many are more than detection. Tracked because ten
+	// detection-only adapters would satisfy the count while delivering none of
+	// the product -- the number worth watching is this one.
+	structured := 0
+	for _, a := range r.All() {
+		if a.Info().Signals.Transcript != adapter.SupportNone {
+			structured++
+		}
+	}
+	t.Logf("%d of %d produce a structured transcript", structured, r.Len())
+	if structured == 0 {
+		t.Error("no adapter produces a transcript; the count is meaningless")
+	}
 }
 
 func TestEveryAdapterDeclaresUsableInfo(t *testing.T) {
@@ -314,6 +341,38 @@ func TestDiscoveredSessionsAreIdentifiable(t *testing.T) {
 					"so it can only be found by the generic process scan",
 					a.Info().ID)
 			}
+		}
+	}
+}
+
+// The process scan filters on a binary-name table before any adapter is
+// consulted, because it must be cheap and runs against every process on the
+// machine. That makes it a second source of truth, and the failure mode is
+// quiet: an adapter whose binary is missing from the table never sees a single
+// process, and no test of that adapter would notice.
+func TestScanFilterAndRegistryAgree(t *testing.T) {
+	r := reg(t)
+
+	for binary, id := range attach.AgentBinaries {
+		if _, ok := r.Get(id); !ok {
+			t.Errorf("the scan table maps %q to adapter %q, which is not registered; "+
+				"processes matching it are found and then dropped", binary, id)
+			continue
+		}
+		// And the adapter must actually claim the binary the table promises.
+		got, err := r.Match(adapter.Process{PID: 1, Argv: []string{binary}})
+		if err != nil {
+			t.Errorf("%q: %v", binary, err)
+			continue
+		}
+		if got == nil {
+			t.Errorf("the scan table maps %q to %q, but no adapter's Detect "+
+				"claims that binary", binary, id)
+			continue
+		}
+		if got.Info().ID != id {
+			t.Errorf("the scan table maps %q to %q, but Detect claims it for %q",
+				binary, id, got.Info().ID)
 		}
 	}
 }
