@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/base32"
 	"encoding/base64"
+	"encoding/binary"
 	"fmt"
 	"net/url"
 	"strings"
@@ -265,9 +266,55 @@ type RoutingHeader struct {
 	StreamID uint32
 }
 
-// Encode renders the header for the wire.
+// headerDomain separates these bytes from any other authenticated string in
+// the protocol, so a header can never be confused with a payload that happens
+// to look like one.
+const headerDomain = "muxscale-hdr-v1\x00"
+
+// Encode renders the header into the bytes bound into the AEAD.
+//
+// Length-prefixed rather than delimited. The previous encoding was
+// fmt.Sprintf("v%d|%s|%s|%d", ...), which is ambiguous whenever an identifier
+// can contain the separator:
+//
+//	{HostKey: "hk_a|dev_b", DeviceID: "dev_c"}  -> "v1|hk_a|dev_b|dev_c|1"
+//	{HostKey: "hk_a",       DeviceID: "dev_b|dev_c"} -> "v1|hk_a|dev_b|dev_c|1"
+//
+// Two different (host, device) pairs producing identical authenticated bytes
+// means the AEAD binds the *string* rather than the *tuple*, so a message
+// sealed for one pair verifies as the other. Whether that is reachable depends
+// on whether an attacker can influence an identifier, which is not a property
+// worth depending on when the fix is this cheap.
+//
+// Rust takes the header as opaque bytes and frames it verbatim, so it needs no
+// matching change; the encoding exists only here.
 func (h RoutingHeader) Encode() []byte {
-	return []byte(fmt.Sprintf("v%d|%s|%s|%d", h.Version, h.HostKey, h.DeviceID, h.StreamID))
+	b := make([]byte, 0, len(headerDomain)+1+2+len(h.HostKey)+2+len(h.DeviceID)+4)
+	b = append(b, headerDomain...)
+	b = append(b, h.Version)
+	b = binary.BigEndian.AppendUint16(b, uint16(len(h.HostKey)))
+	b = append(b, h.HostKey...)
+	b = binary.BigEndian.AppendUint16(b, uint16(len(h.DeviceID)))
+	b = append(b, h.DeviceID...)
+	b = binary.BigEndian.AppendUint32(b, h.StreamID)
+	return b
+}
+
+// maxIdentifier bounds the fields whose length is written as a uint16. An
+// identifier longer than this would wrap the length prefix and reintroduce the
+// ambiguity this encoding exists to remove, so it is rejected at the boundary
+// instead.
+const maxIdentifier = 1 << 15
+
+// Valid reports whether the header can be encoded unambiguously.
+func (h RoutingHeader) Valid() error {
+	if len(h.HostKey) > maxIdentifier {
+		return fmt.Errorf("host key is %d bytes, over the %d limit", len(h.HostKey), maxIdentifier)
+	}
+	if len(h.DeviceID) > maxIdentifier {
+		return fmt.Errorf("device id is %d bytes, over the %d limit", len(h.DeviceID), maxIdentifier)
+	}
+	return nil
 }
 
 // SealedEnvelope is what crosses the relay.
@@ -278,6 +325,9 @@ type SealedEnvelope struct {
 
 // Seal encrypts a payload into an envelope bound to its routing header.
 func Seal(s *Session, h RoutingHeader, plaintext []byte) (SealedEnvelope, error) {
+	if err := h.Valid(); err != nil {
+		return SealedEnvelope{}, fmt.Errorf("routing header: %w", err)
+	}
 	ct, err := s.Seal(plaintext, h.Encode())
 	if err != nil {
 		return SealedEnvelope{}, err
