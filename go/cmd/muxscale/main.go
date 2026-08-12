@@ -153,6 +153,16 @@ func cmdDaemon(args []string) error {
 				}
 				hold = d
 			}
+		default:
+			// Unknown flags were silently ignored, which meant a typo like
+			// --addr for --listen started the daemon on the default port with
+			// no indication anything had been disregarded. For a flag whose
+			// whole purpose is to change where the daemon binds, quietly using
+			// a different value than the one asked for is the wrong failure.
+			return fmt.Errorf("unknown option %q for `muxscale daemon`\n"+
+				"valid: --listen ADDR, --hold DURATION, --tailnet, "+
+				"--tailnet-hostname NAME, --tailnet-port PORT, --authkey KEY",
+				args[i])
 		}
 	}
 
