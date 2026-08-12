@@ -590,6 +590,24 @@ func (c *Client) Send(cmd Command) error {
 	if err != nil {
 		return err
 	}
+	return c.writeLine(b)
+}
+
+// SendUIResponse answers an extension_ui_request.
+//
+// Separate from Send because a UIResponse is a top-level message in its own
+// right, not a Command: Command.MarshalJSON flattens Extra alongside id and
+// type, which would drop UIResponse's confirmed/value/cancelled fields and
+// send pi a well-formed message that answers nothing.
+func (c *Client) SendUIResponse(r UIResponse) error {
+	b, err := json.Marshal(r)
+	if err != nil {
+		return err
+	}
+	return c.writeLine(b)
+}
+
+func (c *Client) writeLine(b []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if _, err := c.stdin.Write(append(b, '\n')); err != nil {

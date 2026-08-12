@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -192,6 +193,31 @@ func BuildUninstall(settingsPath string) (*Plan, error) {
 	}
 	plan.After = after
 	return plan, nil
+}
+
+// Empty reports that settings.json already says what we would write.
+// Distinguished from a real change so `muxscale up` can say "already
+// configured" rather than showing a diff with nothing in it.
+func (p *Plan) Empty() bool { return len(p.Adding) == 0 && len(p.Removing) == 0 }
+
+// Describe renders the pending change for a human. Callers show this and get
+// confirmation before Apply; nothing here touches the disk.
+func (p *Plan) Describe() string {
+	if p.Empty() {
+		return fmt.Sprintf("%s is already configured; nothing to change.", p.SettingsPath)
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s\n", p.SettingsPath)
+	for _, h := range p.Adding {
+		fmt.Fprintf(&b, "  + %s\n", h)
+	}
+	for _, h := range p.Removing {
+		fmt.Fprintf(&b, "  - %s\n", h)
+	}
+	if p.Before != "" {
+		fmt.Fprintf(&b, "  the current file is backed up alongside it first\n")
+	}
+	return b.String()
 }
 
 // Apply writes the plan, backing up the original first.

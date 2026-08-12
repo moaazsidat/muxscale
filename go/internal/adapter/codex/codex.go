@@ -32,6 +32,12 @@ import (
 // MinVersion is the floor the adapter was verified against.
 const MinVersion = "0.100.0"
 
+// newestKnownProfile is the highest Codex version this build has fixtures for.
+// 0.130.0 is where the session_meta.source drift was observed and pinned (see
+// drift_test.go). Versions above it use this profile and are badged, never
+// rejected.
+const newestKnownProfile = "0.130.0"
+
 // record is one line of a rollout file.
 type record struct {
 	Type      string          `json:"type"`
