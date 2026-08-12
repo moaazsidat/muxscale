@@ -23,6 +23,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/muxscale/muxscale/go/internal/adapter/builtin"
 	"github.com/muxscale/muxscale/go/internal/adapter/claudecode"
 	"github.com/muxscale/muxscale/go/internal/attach"
 	"github.com/muxscale/muxscale/go/internal/daemon"
@@ -173,7 +174,8 @@ func cmdDaemon(args []string) error {
 
 	d, err := daemon.New(daemon.Config{
 		ListenLocal: addr, HookToken: token, HoldTime: hold, Log: log,
-		Tailnet: tailnet, TailnetHostname: tsHostname,
+		Adapters: builtin.Registry(builtin.Options{}),
+		Tailnet:  tailnet, TailnetHostname: tsHostname,
 		TailnetAuthKey: tsAuthKey, TailnetPort: tsPort,
 	})
 	if err != nil {

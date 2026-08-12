@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/muxscale/muxscale/go/internal/adapter"
 	"github.com/muxscale/muxscale/go/internal/adapter/claudecode"
 	"github.com/muxscale/muxscale/go/internal/attach"
 	"github.com/muxscale/muxscale/go/internal/protocol"
@@ -19,9 +20,10 @@ import (
 // Manager owns wrapped sessions and the discovery loop, and persists
 // everything the registry sees.
 type Manager struct {
-	reg   *Registry
-	store *store.Store
-	log   *slog.Logger
+	reg      *Registry
+	adapters *adapter.Registry
+	store    *store.Store
+	log      *slog.Logger
 
 	mu      sync.RWMutex
 	wrapped map[string]*attach.Wrapped    // muxscale session id -> pty
@@ -38,9 +40,13 @@ type Manager struct {
 }
 
 // NewManager wires a registry to durable storage.
-func NewManager(reg *Registry, st *store.Store, log *slog.Logger) *Manager {
+//
+// adapters may be nil, in which case agent identification falls back to the
+// binary-name table alone. Tests that do not care about adapter dispatch pass
+// nil rather than constructing the whole built-in set.
+func NewManager(reg *Registry, adapters *adapter.Registry, st *store.Store, log *slog.Logger) *Manager {
 	m := &Manager{
-		reg: reg, store: st, log: log,
+		reg: reg, adapters: adapters, store: st, log: log,
 		wrapped:     map[string]*attach.Wrapped{},
 		tailers:     map[string]*claudecode.Tailer{},
 		screens:     map[string]*vt.Emulator{},
@@ -138,7 +144,7 @@ func (m *Manager) Run(opt RunOptions) (*protocol.Session, error) {
 		opt.Dir, _ = os.Getwd()
 	}
 	if opt.AgentID == "" {
-		opt.AgentID = attach.AgentBinaries[filepath.Base(opt.Command[0])]
+		opt.AgentID = m.identify(filepath.Base(opt.Command[0]), opt.Command)
 		if opt.AgentID == "" {
 			opt.AgentID = "generic-tui"
 		}
@@ -335,7 +341,7 @@ func (m *Manager) scanOnce() {
 		return
 	}
 	for _, p := range procs {
-		agentID := attach.AgentBinaries[p.Command]
+		agentID := m.identify(p.Command, p.Args)
 		if agentID == "" {
 			continue
 		}
@@ -541,7 +547,7 @@ func (m *Manager) scanTmux() {
 		return
 	}
 	for _, p := range panes {
-		agentID := attach.AgentBinaries[p.Command]
+		agentID := m.identify(p.Command, nil)
 		if agentID == "" {
 			continue
 		}
@@ -598,4 +604,34 @@ func (m *Manager) Shutdown(grace time.Duration) {
 	for _, w := range ws {
 		_ = w.Close(grace)
 	}
+}
+
+// identify resolves which agent a process belongs to.
+//
+// The adapter registry is asked first, because an adapter's Detect knows things
+// the binary-name table cannot -- notably that a `node` process running
+// @anthropic-ai/claude-code is Claude Code. The table remains the fallback for
+// agents muxscale can see but has no adapter for yet (amp, cursor-agent, aider,
+// goose, gemini): per spec §4.3.7 the process scan alone still gives their
+// session list, and dropping them for lack of an adapter would be a regression.
+//
+// An ambiguous match is treated as no match. Two adapters claiming one process
+// means their detect rules overlap, and attributing the session to whichever
+// was checked first would be wrong intermittently and unreproducibly -- far
+// worse than the session appearing under the generic table or not at all.
+func (m *Manager) identify(command string, argv []string) string {
+	if m.adapters != nil {
+		if len(argv) == 0 {
+			// tmux reports pane_current_command with no argv.
+			argv = []string{command}
+		}
+		a, err := m.adapters.Match(adapter.Process{Argv: argv})
+		if err != nil {
+			m.log.Warn("ambiguous agent detection; falling back to the binary table",
+				"command", command, "err", err)
+		} else if a != nil {
+			return a.Info().ID
+		}
+	}
+	return attach.AgentBinaries[command]
 }

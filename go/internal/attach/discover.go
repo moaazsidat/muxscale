@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/muxscale/muxscale/go/internal/adapter"
 )
 
 // Process-scan discovery.
@@ -69,7 +71,16 @@ var terminalAncestors = map[string]string{
 // macOS and Linux. The cost is one exec every scan interval; at a 2s cadence
 // that is negligible next to correctness on both platforms.
 func Discover() ([]Process, error) {
-	out, err := exec.Command("ps", "-axo", "pid=,ppid=,lstart=,tty=,comm=").Output()
+	// args= rather than comm=, because comm is only argv[0] and an agent
+	// installed via npm runs as `node .../@anthropic-ai/claude-code/cli.js`.
+	// Under comm that process is indistinguishable from any other node
+	// process, so those installs were skipped entirely by the scan.
+	//
+	// The command name is recovered as base(argv[0]), which yields the same
+	// string comm did for every entry in AgentBinaries and terminalAncestors,
+	// including the two awkward ones: VS Code's helper resolves to
+	// "Code Helper" and tmux to "tmux".
+	out, err := exec.Command("ps", "-axo", "pid=,ppid=,lstart=,tty=,args=").Output()
 	if err != nil {
 		return nil, err
 	}
@@ -83,7 +94,7 @@ func Discover() ([]Process, error) {
 			continue
 		}
 		fields := strings.Fields(line)
-		// pid ppid <lstart: 5 fields> tty comm...
+		// pid ppid <lstart: 5 fields> tty args...
 		if len(fields) < 9 {
 			continue
 		}
@@ -94,22 +105,25 @@ func Discover() ([]Process, error) {
 		}
 		started, _ := time.Parse("Jan 2 15:04:05 2006", strings.Join(fields[2:7], " "))
 		tty := fields[7]
-		comm := strings.Join(fields[8:], " ")
-		all[pid] = procRow{pid: pid, ppid: ppid, comm: comm, tty: tty, started: started}
+		argv := fields[8:]
+		all[pid] = procRow{
+			pid: pid, ppid: ppid,
+			comm: filepath.Base(argv[0]), argv: argv,
+			tty: tty, started: started,
+		}
 		order = append(order, pid)
 	}
 
 	var found []Process
 	for _, pid := range order {
 		r := all[pid]
-		base := filepath.Base(r.comm)
-		if _, ok := AgentBinaries[base]; !ok {
+		if !isAgentProcess(r) {
 			continue
 		}
 		// Skip our own wrapped children: they are already attached at higher
 		// fidelity and would otherwise appear twice.
 		p := Process{
-			Pid: r.pid, PPid: r.ppid, Command: base,
+			Pid: r.pid, PPid: r.ppid, Command: r.comm, Args: r.argv,
 			TTY: r.tty, Started: r.started,
 		}
 		p.Cwd = processCwd(r.pid)
@@ -119,11 +133,72 @@ func Discover() ([]Process, error) {
 	return found, nil
 }
 
+// ForAdapter converts a discovered process into the form adapters match on.
+//
+// The conversion is narrowing on purpose: adapters get argv, cwd and ancestry
+// and deliberately not the pid as anything they could act on. Detection is a
+// pure question about a process, and an adapter that reaches out to poke at one
+// is doing something this seam should not make easy.
+func (p Process) ForAdapter() adapter.Process {
+	argv := p.Args
+	if len(argv) == 0 {
+		// tmux panes report a command with no argv. Detect only looks at
+		// argv[0] for the common case, so synthesising it keeps one detection
+		// path rather than adding a name-only variant that could disagree.
+		argv = []string{p.Command}
+	}
+	var ancestry []string
+	if p.Ancestor != "" {
+		ancestry = []string{p.Ancestor}
+	}
+	return adapter.Process{
+		PID: p.Pid, PPID: p.PPid,
+		Argv: argv, Cwd: p.Cwd, TTY: p.TTY,
+		Ancestry: ancestry,
+	}
+}
+
 // procRow is one line of ps output.
 type procRow struct {
 	pid, ppid int
 	comm, tty string
+	argv      []string
 	started   time.Time
+}
+
+// isAgentProcess decides whether a process is worth reporting.
+//
+// The binary-name table covers agents muxscale can see but has no adapter for
+// yet -- amp, cursor-agent, aider, goose, gemini. Per spec §4.3.7 the process
+// scan alone still yields their session list, liveness and project, so they
+// are kept here rather than dropped for lack of an adapter.
+//
+// The argv scan is what catches an agent whose argv[0] is its runtime rather
+// than itself, which the name table by construction cannot.
+func isAgentProcess(r procRow) bool {
+	if _, ok := AgentBinaries[r.comm]; ok {
+		return true
+	}
+	for _, a := range r.argv[1:] {
+		for _, marker := range argvMarkers {
+			if strings.Contains(a, marker) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// argvMarkers identify an agent launched through a runtime, where argv[0] is
+// `node` or `python` and tells us nothing.
+//
+// Deliberately package-path prefixes rather than bare names: matching "codex"
+// anywhere in argv would claim `grep -r codex`, and a session list containing
+// the user's grep is worse than one missing an unusual install.
+var argvMarkers = []string{
+	"@anthropic-ai/claude-code",
+	"@openai/codex",
+	"@earendil-works/pi-coding-agent",
 }
 
 // findAncestor walks up the process tree looking for a known terminal or

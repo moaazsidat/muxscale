@@ -19,7 +19,7 @@ func testManager(t *testing.T) (*Manager, *Registry, *store.Store) {
 	t.Cleanup(func() { st.Close() })
 	reg := NewRegistry()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return NewManager(reg, st, log), reg, st
+	return NewManager(reg, nil, st, log), reg, st
 }
 
 // Regression: Upsert mints a fresh ID, so restoring through it left the map key
@@ -41,7 +41,7 @@ func TestRestoreKeepsPersistedIDAndSetsState(t *testing.T) {
 
 	// Fresh manager over the same store, as after a daemon restart.
 	reg2 := NewRegistry()
-	m2 := NewManager(reg2, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	m2 := NewManager(reg2, nil, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	n, err := m2.Restore()
 	if err != nil {
 		t.Fatal(err)
@@ -83,7 +83,7 @@ func TestRestoreNativeSessionAwaitsHook(t *testing.T) {
 		t.Fatal(err)
 	}
 	reg := NewRegistry()
-	m := NewManager(reg, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	m := NewManager(reg, nil, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if _, err := m.Restore(); err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestRestoreSkipsTerminalSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 	reg := NewRegistry()
-	m := NewManager(reg, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	m := NewManager(reg, nil, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	n, err := m.Restore()
 	if err != nil {
 		t.Fatal(err)
@@ -127,7 +127,7 @@ func TestRestoreDropsPendingApprovals(t *testing.T) {
 		t.Fatal(err)
 	}
 	reg := NewRegistry()
-	m := NewManager(reg, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	m := NewManager(reg, nil, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if _, err := m.Restore(); err != nil {
 		t.Fatal(err)
 	}

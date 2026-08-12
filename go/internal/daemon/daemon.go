@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/muxscale/muxscale/go/internal/adapter"
 	"github.com/muxscale/muxscale/go/internal/attach"
 	"github.com/muxscale/muxscale/go/internal/protocol"
 	"github.com/muxscale/muxscale/go/internal/store"
@@ -30,6 +31,12 @@ type Config struct {
 	HoldTime    time.Duration
 	StateDir    string
 	Log         *slog.Logger
+
+	// Adapters is the set of agent integrations this daemon can identify and
+	// talk to. Injected rather than constructed here so tests can run with one
+	// adapter, or none, and so the built-in set is chosen in exactly one place.
+	// nil falls back to binary-name identification.
+	Adapters *adapter.Registry
 
 	// Tailnet enables the Tailscale listener that phones connect to. Off by
 	// default: the daemon is fully usable locally with no Tailscale setup.
@@ -119,7 +126,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	defer st.Close()
 	d.store = st
-	d.mgr = NewManager(d.reg, st, d.log)
+	d.mgr = NewManager(d.reg, d.cfg.Adapters, st, d.log)
 
 	if n, err := d.mgr.Restore(); err != nil {
 		d.log.Warn("restoring sessions failed", "err", err)
