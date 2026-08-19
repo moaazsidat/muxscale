@@ -146,6 +146,26 @@ func (r *Registry) Insert(s protocol.Session) *protocol.Session {
 	return &cp
 }
 
+// Update mutates an existing session by ID, returning nil if there is none.
+//
+// Distinct from Upsert, which keys on the agent's natural key and will happily
+// create a session that was never there. Update only ever edits.
+func (r *Registry) Update(id string, mutate func(*protocol.Session)) *protocol.Session {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.sessions[id]
+	if !ok {
+		return nil
+	}
+	if mutate != nil {
+		mutate(s)
+	}
+	s.LastEventAt = time.Now()
+	cp := *s
+	r.broadcast(Change{Kind: ChangeSessionUpsert, Session: &cp})
+	return &cp
+}
+
 // Remove deletes a session from the live registry.
 //
 // Used to reconcile duplicates: the same real agent session can be found twice,

@@ -94,6 +94,23 @@ type Session struct {
 	CreatedAt      time.Time `json:"created_at"`
 	LastEventAt    time.Time `json:"last_event_at"`
 
+	// ParentID links a shell session to the agent session whose working
+	// directory it was opened in. Set only for shells a client asked for; a
+	// client uses it to file the shell under its agent rather than listing it
+	// as a peer, which is the difference between "a terminal in this project"
+	// and "an eleventh session you did not start".
+	ParentID string `json:"parent_id,omitempty"`
+
+	// AllowRemoteResize permits a client to resize the PTY (spec §5.5). Off by
+	// default and deliberately so: resizing reflows the TUI for *every* viewer,
+	// including the human at the physical keyboard. It is set only on sessions
+	// a remote client created for itself, where it is the only viewer.
+	//
+	// Neither this nor ParentID is persisted. Both belong to daemon-owned PTYs,
+	// which do not outlive the daemon, so a restored row could only ever
+	// describe a process that is already gone.
+	AllowRemoteResize bool `json:"allow_remote_resize,omitempty"`
+
 	// PendingApproval is set while a decision hook is held open awaiting a human.
 	PendingApproval *ApprovalRequest `json:"pending_approval,omitempty"`
 }

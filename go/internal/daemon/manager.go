@@ -30,6 +30,10 @@ type Manager struct {
 	tailers map[string]*claudecode.Tailer // muxscale session id -> transcript tailer
 	screens map[string]*vt.Emulator       // muxscale session id -> screen state
 
+	// closing records sessions a human asked to end, so their exit-by-signal is
+	// reported as "closed" rather than "crashed".
+	closing map[string]bool
+
 	// tmuxTargets maps a session to an adopted tmux pane, which is how an
 	// already-running session becomes writable without changing anyone's habits.
 	tmuxTargets map[string]string
@@ -50,6 +54,7 @@ func NewManager(reg *Registry, adapters *adapter.Registry, st *store.Store, log 
 		wrapped:     map[string]*attach.Wrapped{},
 		tailers:     map[string]*claudecode.Tailer{},
 		screens:     map[string]*vt.Emulator{},
+		closing:     map[string]bool{},
 		tmuxTargets: map[string]string{},
 	}
 	go m.persistLoop()
@@ -179,6 +184,139 @@ func (m *Manager) Run(opt RunOptions) (*protocol.Session, error) {
 	return sess, nil
 }
 
+// ShellAgentID marks a session that is a plain shell rather than an agent.
+// Adapters never claim it, so nothing tries to parse a transcript out of it.
+const ShellAgentID = "shell"
+
+// RunShell opens a login shell in an agent session's working directory.
+//
+// This is the "drop me into a terminal in this project" affordance. The cwd is
+// read from the parent session rather than taken from the caller: a client that
+// could name any directory would turn one authenticated endpoint into arbitrary
+// filesystem access, and the whole point is that it lands where the agent is.
+//
+// One shell per parent. A second call returns the existing one while it is
+// alive, so navigating away and back does not strand a process or lose
+// scrollback.
+func (m *Manager) RunShell(parentID string, cols, rows uint16) (*protocol.Session, error) {
+	parent, ok := m.reg.Get(parentID)
+	if !ok {
+		return nil, fmt.Errorf("unknown session %s", parentID)
+	}
+	if parent.Cwd == "" {
+		return nil, fmt.Errorf("session %s has no known working directory", parentID)
+	}
+
+	if existing, ok := m.liveShellFor(parentID); ok {
+		return existing, nil
+	}
+
+	sess, err := m.Run(RunOptions{
+		Command: []string{loginShell()},
+		Dir:     parent.Cwd,
+		Name:    "shell — " + filepath.Base(parent.Cwd),
+		AgentID: ShellAgentID,
+		Cols:    cols, Rows: rows,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Set after Run so the fields survive the Upsert inside it.
+	updated := m.reg.Update(sess.ID, func(s *protocol.Session) {
+		s.ParentID = parentID
+		// The client that asked for this shell is its only viewer, which is the
+		// condition §5.5 attaches to remote resize.
+		s.AllowRemoteResize = true
+	})
+	if updated != nil {
+		return updated, nil
+	}
+	return sess, nil
+}
+
+// liveShellFor returns the running shell belonging to a parent session.
+func (m *Manager) liveShellFor(parentID string) (*protocol.Session, bool) {
+	for _, s := range m.reg.List() {
+		if s.ParentID != parentID || s.AgentID != ShellAgentID || s.State.Terminal() {
+			continue
+		}
+		m.mu.RLock()
+		_, alive := m.wrapped[s.ID]
+		m.mu.RUnlock()
+		if alive {
+			found := s
+			return &found, true
+		}
+	}
+	return nil, false
+}
+
+// loginShell picks the shell to open. $SHELL is what the user chose; the
+// fallback is only for a daemon started by a service manager with a bare
+// environment.
+func loginShell() string {
+	if sh := os.Getenv("SHELL"); sh != "" {
+		return sh
+	}
+	return "/bin/sh"
+}
+
+// Resize changes a session's PTY dimensions.
+//
+// Refused unless the session opted in. Spec §5.5: a viewer resizing a shared
+// PTY reflows the TUI for everyone attached to it, including whoever is sat at
+// the physical keyboard, and some TUIs lose scrollback when that happens. Only
+// sessions a remote client created for itself carry the flag.
+func (m *Manager) Resize(sessionID string, cols, rows uint16) error {
+	sess, ok := m.reg.Get(sessionID)
+	if !ok {
+		return fmt.Errorf("unknown session %s", sessionID)
+	}
+	if !sess.AllowRemoteResize {
+		return fmt.Errorf("session %s does not permit remote resize: it has viewers "+
+			"whose display would reflow (see spec §5.5)", sessionID)
+	}
+	if cols == 0 || rows == 0 {
+		return fmt.Errorf("resize needs non-zero cols and rows, got %dx%d", cols, rows)
+	}
+
+	m.mu.RLock()
+	w := m.wrapped[sessionID]
+	em := m.screens[sessionID]
+	m.mu.RUnlock()
+	if w == nil {
+		return fmt.Errorf("session %s has no PTY to resize", sessionID)
+	}
+	if err := w.Resize(cols, rows); err != nil {
+		return err
+	}
+	// The emulator has to follow the PTY or every subsequent frame is decoded
+	// against the wrong width.
+	if em != nil {
+		m.screenMu.Lock()
+		em.Resize(int(cols), int(rows))
+		m.screenMu.Unlock()
+	}
+	return nil
+}
+
+// ScreenClone returns an independent copy of a session's grid.
+//
+// The stream handler diffs against its own copy, so it must not share memory
+// with the emulator the PTY drain loop is writing into.
+func (m *Manager) ScreenClone(sessionID string) (*vt.Grid, bool) {
+	m.mu.RLock()
+	em := m.screens[sessionID]
+	m.mu.RUnlock()
+	if em == nil {
+		return nil, false
+	}
+	m.screenMu.Lock()
+	defer m.screenMu.Unlock()
+	return em.Grid().Clone(), true
+}
+
 // superviseWrapped feeds output into the VT emulator and records the exit.
 func (m *Manager) superviseWrapped(sessionID string, w *attach.Wrapped) {
 	// Draining is mandatory regardless of whether anyone is watching: an unread
@@ -204,10 +342,21 @@ func (m *Manager) superviseWrapped(sessionID string, w *attach.Wrapped) {
 	}
 	<-w.Exited()
 
+	m.mu.Lock()
+	asked := m.closing[sessionID]
+	delete(m.closing, sessionID)
+	m.mu.Unlock()
+
 	code := w.ExitCode()
 	state := protocol.StateExited
 	reason := fmt.Sprintf("exited with code %d", code)
-	if code < 0 {
+	switch {
+	case asked:
+		// Someone closed this session. It exits by signal -- SIGHUP for a shell,
+		// which reports as a negative code -- and calling that a crash would put
+		// a red "crashed" badge on every terminal tab the user shut themselves.
+		reason = "closed"
+	case code < 0:
 		state = protocol.StateCrashed
 		reason = "process terminated abnormally"
 	}
@@ -310,6 +459,9 @@ func (m *Manager) Kill(sessionID string) error {
 	if w == nil {
 		return fmt.Errorf("session %s is not a wrapped session", sessionID)
 	}
+	m.mu.Lock()
+	m.closing[sessionID] = true
+	m.mu.Unlock()
 	_ = m.store.Audit("human", "session_killed", sessionID, "")
 	return w.Close(5 * time.Second)
 }

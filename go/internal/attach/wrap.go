@@ -170,7 +170,7 @@ func (w *Wrapped) ExitCode() int {
 	return w.exitCode
 }
 
-// Close terminates the session, escalating from SIGTERM to SIGKILL.
+// Close terminates the session, escalating from hangup to SIGTERM to SIGKILL.
 // Escalation matters: an agent mid-tool-call may ignore a polite request, and a
 // hung session that cannot be killed is a support ticket.
 func (w *Wrapped) Close(grace time.Duration) error {
@@ -188,6 +188,27 @@ func (w *Wrapped) Close(grace time.Duration) error {
 	default:
 	}
 
+	// Hang up before signalling. An interactive shell sitting at a prompt
+	// *ignores* SIGTERM -- POSIX says so, and it is what stops a stray kill from
+	// taking out your login session -- so a SIGTERM-first close waits out the
+	// whole grace period and then SIGKILLs, losing the shell's exit hooks and
+	// its history. SIGHUP is the signal a terminal emulator's departure produces
+	// and the one every shell acts on; measured at well under a millisecond for
+	// sh, bash and zsh.
+	//
+	// Sent explicitly rather than by closing the PTY master, which is the more
+	// obvious move and does not work: on Darwin the close does not reliably
+	// deliver the hangup, and it would also make Read return EOF before the
+	// final output had been drained.
+	//
+	// Agents are unaffected -- they exit on either -- and now do so on the first.
+	_ = w.Signal(syscall.SIGHUP)
+	select {
+	case <-w.exited:
+		return nil
+	case <-time.After(hangupGrace(grace)):
+	}
+
 	_ = w.Signal(syscall.SIGTERM)
 	select {
 	case <-w.exited:
@@ -201,4 +222,18 @@ func (w *Wrapped) Close(grace time.Duration) error {
 			return errors.New("process did not exit after SIGKILL")
 		}
 	}
+}
+
+// hangupGrace is how long to wait for a hangup to work before signalling.
+//
+// Short by design: this is the path a well-behaved process takes, so it should
+// cost almost nothing, and anything that ignores a hangup is not going to
+// change its mind in another four seconds. The remaining budget is left for
+// SIGTERM, which is where a busy agent legitimately needs time to finish.
+func hangupGrace(grace time.Duration) time.Duration {
+	const cap = 1500 * time.Millisecond
+	if grace/3 < cap {
+		return grace / 3
+	}
+	return cap
 }
