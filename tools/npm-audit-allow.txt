@@ -1,0 +1,25 @@
+# Advisories in app/'s dependency graph that have been reviewed and found
+# unreachable in the shipped app.
+#
+# One GHSA id per line, with a reason and the date it was reviewed. Anything not
+# listed here fails tools/security-scan.sh, so this file is the record of what
+# was decided rather than a way to make the scan quiet. Re-check on any Expo SDK
+# upgrade: an advisory that becomes fixable should be fixed and its line removed.
+#
+# npm counts these as production dependencies because `expo` itself is one --
+# the app cannot run without it. But the packages carrying the advisories are
+# @expo/cli and metro, which run on a developer's machine to produce a bundle
+# and are not part of it.
+
+# image-size, reached only by Metro's asset pipeline at build time, parsing the
+# icons in app/assets/ that we ship ourselves. Denial of service via an infinite
+# loop on a malformed ICNS/JXL/HEIF file. No untrusted image ever reaches it,
+# and the worst case is that a developer's own build hangs. No fix available
+# without a breaking Expo SDK change. Reviewed 2026-08-19.
+GHSA-w3rx-r6r6-pgpr
+GHSA-5p2g-fcmc-qvqq
+
+# uuid, missing buffer bounds check in v3/v5/v6 when an explicit `buf` argument
+# is passed. Used by Expo's CLI tooling, which does not pass one, and the app
+# does not depend on uuid at all. Reviewed 2026-08-19.
+GHSA-w5hq-g745-h8pq
