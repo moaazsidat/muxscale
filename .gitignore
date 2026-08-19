@@ -12,3 +12,8 @@ dist/
 
 # Rust build output
 rust/target/
+
+# Node dependencies. app/ has its own .gitignore from the Expo template; cloud/
+# only grew a node_modules when its typecheck stopped pretending to work
+# without one.
+node_modules/

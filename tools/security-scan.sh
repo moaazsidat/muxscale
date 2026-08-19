@@ -75,7 +75,7 @@ fi
 rm -f "$clippy_log"
 
 echo
-echo "=== npm: audit (app) ==="
+echo "=== pnpm: audit (app) ==="
 # The app has by far the largest dependency graph in the repo, and until it
 # existed there was nothing here to scan. Only production dependencies are
 # considered: a vulnerability in a test runner is not a vulnerability in a
@@ -86,10 +86,12 @@ echo "=== npm: audit (app) ==="
 # being lowered or the whole scan skipped -- the same rule the secret sweep
 # follows with its `notasecret` markers. An advisory not on that list fails.
 if [ ! -d app/node_modules ]; then
-  echo "  skipped: app/node_modules is absent (run npm install in app/)"
+  echo "  skipped: app/node_modules is absent (run pnpm install in app/)"
 else
   allow=tools/npm-audit-allow.txt
-  audit_json=$(cd app && npm audit --omit=dev --json 2>/dev/null || true)
+  # `|| true` because both npm and pnpm exit non-zero when they find
+  # anything; the reviewer decides what counts, not the exit code.
+  audit_json=$(cd app && pnpm audit --prod --json 2>/dev/null || true)
 
   # The reviewer exits 1 when it finds something *or* when it cannot make sense
   # of the input, so a broken check fails loudly instead of reporting clean.
