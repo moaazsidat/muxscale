@@ -34,6 +34,7 @@ run() {
 run "Go" go go test ./...
 run "Rust" rust cargo test --all-features
 run "TypeScript (cloud)" cloud node --test 'test/*.test.ts'
+run "TypeScript (app)" app node --test 'src/**/*.test.ts'
 
 echo
 if [ "$status" -eq 0 ]; then
