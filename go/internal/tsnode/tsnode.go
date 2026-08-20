@@ -304,8 +304,18 @@ func WithIdentity(lc *local.Client, next http.Handler) http.Handler {
 	})
 }
 
-func contextWithIdentity(ctx context.Context, id Identity) context.Context {
+// ContextWithIdentity attaches a verified identity to a request context.
+//
+// Exported for the daemon's own middleware and its tests. It is not a way to
+// grant access: only code inside the process can call it, and the listeners
+// that do so have already verified the identity with Tailscale. A caller cannot
+// reach it over the wire.
+func ContextWithIdentity(ctx context.Context, id Identity) context.Context {
 	return contextWithValue(ctx, identityKey{}, id)
+}
+
+func contextWithIdentity(ctx context.Context, id Identity) context.Context {
+	return ContextWithIdentity(ctx, id)
 }
 
 // contextWithValue exists so the key type stays unexported.

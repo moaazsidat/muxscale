@@ -33,7 +33,7 @@ func (d *Daemon) screenRoutes(mux *http.ServeMux) {
 	//
 	// Opens a login shell in the named session's working directory. The cwd is
 	// resolved from the session, never accepted from the caller.
-	mux.HandleFunc("/v1/sessions/shell", func(w http.ResponseWriter, r *http.Request) {
+	d.handle(mux, "/v1/sessions/shell", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST required", http.StatusMethodNotAllowed)
 			return
@@ -62,7 +62,7 @@ func (d *Daemon) screenRoutes(mux *http.ServeMux) {
 	})
 
 	// POST /v1/sessions/resize {"session_id":"...","cols":N,"rows":N}
-	mux.HandleFunc("/v1/sessions/resize", func(w http.ResponseWriter, r *http.Request) {
+	d.handle(mux, "/v1/sessions/resize", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST required", http.StatusMethodNotAllowed)
 			return
@@ -89,7 +89,7 @@ func (d *Daemon) screenRoutes(mux *http.ServeMux) {
 	//
 	// SSE. One `snapshot` event, then `delta` events for the rows that changed,
 	// with a periodic snapshot as a resync point.
-	mux.HandleFunc("/v1/sessions/screen/stream", func(w http.ResponseWriter, r *http.Request) {
+	d.handle(mux, "/v1/sessions/screen/stream", func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("session")
 		flusher, ok := w.(http.Flusher)
 		if !ok {

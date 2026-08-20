@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/muxscale/muxscale/go/internal/adapter"
@@ -27,10 +29,15 @@ type Config struct {
 	// control API. Loopback only, always: binding this to 0.0.0.0 would expose
 	// an unauthenticated-by-network-position approval endpoint.
 	ListenLocal string
-	HookToken   string
-	HoldTime    time.Duration
-	StateDir    string
-	Log         *slog.Logger
+
+	// LocalToken authenticates callers on the loopback listener: the CLI, and
+	// the agent hooks. Callers arriving over the tailnet are authenticated by
+	// Tailscale identity instead and never see it.
+	LocalToken string
+
+	HoldTime time.Duration
+	StateDir string
+	Log      *slog.Logger
 
 	// Adapters is the set of agent integrations this daemon can identify and
 	// talk to. Injected rather than constructed here so tests can run with one
@@ -146,7 +153,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	go d.mgr.DiscoverLoop(stopScan, 3*time.Second)
 
 	mux := http.NewServeMux()
-	hookSrv := NewHookServer(d.reg, d.cfg.HookToken, d.cfg.HoldTime, d.log)
+	hookSrv := NewHookServer(d.reg, d.cfg.LocalToken, d.cfg.HoldTime, d.log)
 	hookSrv.SetManager(d.mgr)
 	hookSrv.Routes(mux)
 	d.routes(mux)
@@ -197,21 +204,80 @@ func (d *Daemon) Run(ctx context.Context) error {
 // Addr is the bound address, valid after Run has started.
 func (d *Daemon) Addr() string { return d.addr }
 
+// handle registers a control-API route behind authentication.
+//
+// Used instead of mux.HandleFunc for everything in the control API, so that
+// adding a route without thinking about auth is not possible: the registration
+// call is the auth decision.
+func (d *Daemon) handle(mux *http.ServeMux, pattern string, fn http.HandlerFunc) {
+	mux.Handle(pattern, d.requireAuth(fn))
+}
+
+// requireAuth admits a request that has proved itself one of the two ways
+// there are to prove it.
+//
+// Over the tailnet, the listener has already established a Tailscale-attested
+// identity and checked it against muxscale's ACL, so the presence of a verified
+// identity in the context *is* the proof. The context value is set by that
+// middleware and cannot be supplied by a caller.
+//
+// Over loopback, the proof is the bearer token, which anything running as this
+// user can read from the state directory. That is the point: loopback is not a
+// same-user boundary. Every local user can reach 127.0.0.1, as can a sandboxed
+// process, and a browser can be walked onto it by DNS rebinding. Before this,
+// any of them could approve a pending tool call, type into a running agent, or
+// open a shell in one of its project directories -- while the hook endpoint,
+// which can do strictly less, was the only thing asking for a token.
+func (d *Daemon) requireAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := tsnode.IdentityFrom(r); ok {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if d.tokenMatches(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		d.log.Warn("control API request rejected: bad or missing token",
+			"remote", r.RemoteAddr, "path", r.URL.Path)
+		http.Error(w,
+			"this endpoint needs the daemon's local token.\n"+
+				"The muxscale CLI reads it automatically; other callers should send it as "+
+				"`Authorization: Bearer <contents of hook-token in the state directory>`.",
+			http.StatusUnauthorized)
+	})
+}
+
+// tokenMatches compares the presented bearer token in constant time.
+//
+// An empty configured token denies rather than admits. The hook endpoint takes
+// the opposite view -- see HookServer.authorized -- because a hook that cannot
+// authenticate must fail open and let the agent proceed. Nothing here has that
+// obligation, and a fail-open default on an authorization check is how an
+// endpoint ends up unprotected because a config field was left blank.
+func (d *Daemon) tokenMatches(r *http.Request) bool {
+	if d.cfg.LocalToken == "" {
+		return false
+	}
+	got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	return subtle.ConstantTimeCompare([]byte(got), []byte(d.cfg.LocalToken)) == 1
+}
+
 // routes registers the local control API used by the CLI.
 func (d *Daemon) routes(mux *http.ServeMux) {
 	// Terminal-shaped endpoints (shell, resize, grid stream) live in screen.go.
 	d.screenRoutes(mux)
 
-	mux.HandleFunc("/v1/sessions", func(w http.ResponseWriter, r *http.Request) {
+	d.handle(mux, "/v1/sessions", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"sessions": d.reg.List()})
 	})
 
-	mux.HandleFunc("/v1/approvals", func(w http.ResponseWriter, r *http.Request) {
+	d.handle(mux, "/v1/approvals", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"approvals": d.reg.PendingApprovals()})
 	})
 
 	// POST /v1/approvals/decide {"id":..., "behavior":"allow"|"deny"}
-	mux.HandleFunc("/v1/approvals/decide", func(w http.ResponseWriter, r *http.Request) {
+	d.handle(mux, "/v1/approvals/decide", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			ID       string `json:"id"`
 			Behavior string `json:"behavior"`
@@ -233,7 +299,7 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 	})
 
 	// POST /v1/sessions/run  {"command":[...], "dir":"...", "name":"..."}
-	mux.HandleFunc("/v1/sessions/run", func(w http.ResponseWriter, r *http.Request) {
+	d.handle(mux, "/v1/sessions/run", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			Command []string `json:"command"`
 			Dir     string   `json:"dir"`
@@ -257,7 +323,7 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 	})
 
 	// POST /v1/sessions/input
-	mux.HandleFunc("/v1/sessions/input", func(w http.ResponseWriter, r *http.Request) {
+	d.handle(mux, "/v1/sessions/input", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			SessionID string `json:"session_id"`
 			Text      string `json:"text"`
@@ -301,7 +367,7 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 	})
 
 	// POST /v1/sessions/kill {"session_id":"..."}
-	mux.HandleFunc("/v1/sessions/kill", func(w http.ResponseWriter, r *http.Request) {
+	d.handle(mux, "/v1/sessions/kill", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			SessionID string `json:"session_id"`
 		}
@@ -317,7 +383,7 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 	})
 
 	// GET /v1/sessions/transcript?session=ID&since=N
-	mux.HandleFunc("/v1/sessions/transcript", func(w http.ResponseWriter, r *http.Request) {
+	d.handle(mux, "/v1/sessions/transcript", func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("session")
 		since, _ := strconv.ParseUint(r.URL.Query().Get("since"), 10, 64)
 		events, err := d.store.Transcript(id, since, 500)
@@ -329,7 +395,7 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 	})
 
 	// GET /v1/sessions/screen?session=ID[&format=text]
-	mux.HandleFunc("/v1/sessions/screen", func(w http.ResponseWriter, r *http.Request) {
+	d.handle(mux, "/v1/sessions/screen", func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("session")
 		if r.URL.Query().Get("format") == "text" {
 			text, ok := d.mgr.ScreenText(id)
@@ -350,7 +416,7 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 	})
 
 	// GET /v1/status
-	mux.HandleFunc("/v1/status", func(w http.ResponseWriter, r *http.Request) {
+	d.handle(mux, "/v1/status", func(w http.ResponseWriter, r *http.Request) {
 		out := map[string]any{
 			"local_addr": d.addr,
 			"hold":       d.cfg.HoldTime.String(),
@@ -375,7 +441,7 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 	// Deliberately local-only: the ACL is reachable through the loopback API,
 	// never through the tailnet listener it guards. A remote caller must never
 	// be able to grant itself access.
-	mux.HandleFunc("/v1/acl", func(w http.ResponseWriter, r *http.Request) {
+	d.handle(mux, "/v1/acl", func(w http.ResponseWriter, r *http.Request) {
 		if d.acl == nil {
 			http.Error(w, "tailnet is not enabled (start the daemon with --tailnet)", http.StatusNotFound)
 			return
@@ -415,7 +481,7 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 	})
 
 	// GET /v1/audit
-	mux.HandleFunc("/v1/audit", func(w http.ResponseWriter, r *http.Request) {
+	d.handle(mux, "/v1/audit", func(w http.ResponseWriter, r *http.Request) {
 		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 		entries, err := d.store.AuditLog(limit)
 		if err != nil {
@@ -426,7 +492,7 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 	})
 
 	// Server-sent events for `muxscale watch`.
-	mux.HandleFunc("/v1/events", func(w http.ResponseWriter, r *http.Request) {
+	d.handle(mux, "/v1/events", func(w http.ResponseWriter, r *http.Request) {
 		flusher, ok := w.(http.Flusher)
 		if !ok {
 			http.Error(w, "streaming unsupported", http.StatusInternalServerError)

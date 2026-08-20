@@ -66,16 +66,15 @@ func TestRunShellInheritsTheAgentsWorkingDirectory(t *testing.T) {
 // The caller names a session, never a directory. A cwd parameter would turn one
 // authenticated endpoint into "open a shell anywhere on this machine".
 func TestShellEndpointTakesNoDirectoryFromTheCaller(t *testing.T) {
-	m, reg, _ := testManager(t)
-	d := &Daemon{mgr: m, reg: reg}
-	mux := http.NewServeMux()
-	d.screenRoutes(mux)
+	d, mux := testDaemon(t, testToken)
+	m, reg := d.mgr, d.reg
 
 	dir := t.TempDir()
 	parent := agentSession(t, reg, dir)
 
 	body := `{"session_id":"` + parent.ID + `","cols":80,"rows":24,"dir":"/etc","cwd":"/etc"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/sessions/shell", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+testToken)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -128,16 +127,15 @@ func TestRunShellRejectsASessionWithNoKnownDirectory(t *testing.T) {
 
 // Spec §5.5: a viewer must not reflow a PTY that other viewers share.
 func TestResizeRefusedOnSessionsWithOtherViewers(t *testing.T) {
-	m, reg, _ := testManager(t)
-	d := &Daemon{mgr: m, reg: reg}
-	mux := http.NewServeMux()
-	d.screenRoutes(mux)
+	d, mux := testDaemon(t, testToken)
+	m, reg := d.mgr, d.reg
 
 	dir := t.TempDir()
 	parent := agentSession(t, reg, dir)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/sessions/resize",
 		strings.NewReader(`{"session_id":"`+parent.ID+`","cols":52,"rows":20}`))
+	req.Header.Set("Authorization", "Bearer "+testToken)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -154,6 +152,7 @@ func TestResizeRefusedOnSessionsWithOtherViewers(t *testing.T) {
 
 	req = httptest.NewRequest(http.MethodPost, "/v1/sessions/resize",
 		strings.NewReader(`{"session_id":"`+sh.ID+`","cols":52,"rows":20}`))
+	req.Header.Set("Authorization", "Bearer "+testToken)
 	rec = httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -178,10 +177,8 @@ func TestResizeRejectsZeroDimensions(t *testing.T) {
 }
 
 func TestScreenStreamOpensWithASnapshotThenSendsDeltas(t *testing.T) {
-	m, reg, _ := testManager(t)
-	d := &Daemon{mgr: m, reg: reg}
-	mux := http.NewServeMux()
-	d.screenRoutes(mux)
+	d, mux := testDaemon(t, testToken)
+	m, reg := d.mgr, d.reg
 
 	parent := agentSession(t, reg, t.TempDir())
 	sh, err := m.RunShell(parent.ID, 80, 24)
@@ -203,6 +200,7 @@ func TestScreenStreamOpensWithASnapshotThenSendsDeltas(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	req.Header.Set("Authorization", "Bearer "+testToken)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -241,13 +239,11 @@ func TestScreenStreamOpensWithASnapshotThenSendsDeltas(t *testing.T) {
 }
 
 func TestScreenStream404sForASessionWithNoScreen(t *testing.T) {
-	m, reg, _ := testManager(t)
-	d := &Daemon{mgr: m, reg: reg}
-	mux := http.NewServeMux()
-	d.screenRoutes(mux)
+	d, mux := testDaemon(t, testToken)
 
-	parent := agentSession(t, reg, t.TempDir())
+	parent := agentSession(t, d.reg, t.TempDir())
 	req := httptest.NewRequest(http.MethodGet, "/v1/sessions/screen/stream?session="+parent.ID, nil)
+	req.Header.Set("Authorization", "Bearer "+testToken)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 

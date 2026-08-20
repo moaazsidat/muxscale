@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -185,7 +186,7 @@ func cmdDaemon(args []string) error {
 	}
 
 	d, err := daemon.New(daemon.Config{
-		ListenLocal: addr, HookToken: token, HoldTime: hold, Log: log,
+		ListenLocal: addr, LocalToken: token, HoldTime: hold, Log: log,
 		Adapters: builtin.Registry(builtin.Options{}),
 		Tailnet:  tailnet || useSystemTS, TailnetHostname: tsHostname,
 		TailnetAuthKey: tsAuthKey, TailnetPort: tsPort,
@@ -233,7 +234,7 @@ func cmdLs(args []string) error {
 // ---------- watch ----------
 
 func cmdWatch(args []string) error {
-	resp, err := http.Get(apiURL("/v1/events"))
+	resp, err := apiRequest(http.MethodGet, "/v1/events", nil)
 	if err != nil {
 		return daemonDown(err)
 	}
@@ -289,7 +290,7 @@ func cmdApprovals(args []string) error {
 		body, _ := json.Marshal(map[string]string{
 			"id": args[1], "behavior": args[0], "by": "cli",
 		})
-		resp, err := http.Post(apiURL("/v1/approvals/decide"), "application/json", strings.NewReader(string(body)))
+		resp, err := apiPost("/v1/approvals/decide", string(body))
 		if err != nil {
 			return daemonDown(err)
 		}
@@ -359,7 +360,7 @@ func cmdRun(args []string) error {
 	}
 
 	body, _ := json.Marshal(map[string]any{"command": cmd, "dir": dir, "name": name})
-	resp, err := http.Post(apiURL("/v1/sessions/run"), "application/json", strings.NewReader(string(body)))
+	resp, err := apiPost("/v1/sessions/run", string(body))
 	if err != nil {
 		return daemonDown(err)
 	}
@@ -418,7 +419,7 @@ func cmdSend(args []string) error {
 		"fence": map[string]string{"prompt_id": fencePrompt, "state": fenceState},
 		"by":    "cli",
 	})
-	resp, err := http.Post(apiURL("/v1/sessions/input"), "application/json", strings.NewReader(string(body)))
+	resp, err := apiPost("/v1/sessions/input", string(body))
 	if err != nil {
 		return daemonDown(err)
 	}
@@ -450,7 +451,7 @@ func cmdKill(args []string) error {
 		return fmt.Errorf("usage: muxscale kill SESSION_ID")
 	}
 	body, _ := json.Marshal(map[string]string{"session_id": args[0]})
-	resp, err := http.Post(apiURL("/v1/sessions/kill"), "application/json", strings.NewReader(string(body)))
+	resp, err := apiPost("/v1/sessions/kill", string(body))
 	if err != nil {
 		return daemonDown(err)
 	}
@@ -706,7 +707,7 @@ func cmdACL(args []string) error {
 		return fmt.Errorf("unknown: acl %s (want allow, deny, or owner)", verb)
 	}
 	payload, _ := json.Marshal(body)
-	resp, err := http.Post(apiURL("/v1/acl"), "application/json", strings.NewReader(string(payload)))
+	resp, err := apiPost("/v1/acl", string(payload))
 	if err != nil {
 		return daemonDown(err)
 	}
@@ -968,8 +969,49 @@ func cmdTranscript(args []string) error {
 
 func apiURL(path string) string { return "http://" + defaultAddr + path }
 
+// apiToken reads the daemon's local token.
+//
+// Read, never created: the CLI is a client, and a client that mints the
+// credential it is about to present is not authenticating, it is asserting.
+// If the file is missing the request simply goes without one and the daemon's
+// 401 explains itself.
+var apiToken = sync.OnceValue(func() string {
+	dir, err := daemon.DefaultStateDir()
+	if err != nil {
+		return ""
+	}
+	b, err := os.ReadFile(filepath.Join(dir, tokenFile))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+})
+
+// apiRequest calls the daemon with the local token attached.
+//
+// Every control-API call goes through here. Left to individual call sites, the
+// one that forgets the header is the one nobody notices until it 401s in
+// somebody else's terminal.
+func apiRequest(method, path string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest(method, apiURL(path), body)
+	if err != nil {
+		return nil, err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if t := apiToken(); t != "" {
+		req.Header.Set("Authorization", "Bearer "+t)
+	}
+	return http.DefaultClient.Do(req)
+}
+
+func apiPost(path, body string) (*http.Response, error) {
+	return apiRequest(http.MethodPost, path, strings.NewReader(body))
+}
+
 func apiGet(path string, out any) error {
-	resp, err := http.Get(apiURL(path))
+	resp, err := apiRequest(http.MethodGet, path, nil)
 	if err != nil {
 		return daemonDown(err)
 	}
@@ -993,6 +1035,8 @@ func daemonDown(err error) error {
 
 // loadOrCreateToken persists a hook token. M0 uses a file at 0600; the OS
 // keychain lands in M1 -- the token must never end up in config.toml or the DB.
+const tokenFile = "hook-token"
+
 func loadOrCreateToken() (string, error) {
 	dir, err := daemon.DefaultStateDir()
 	if err != nil {
@@ -1001,7 +1045,7 @@ func loadOrCreateToken() (string, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	path := filepath.Join(dir, "hook-token")
+	path := filepath.Join(dir, tokenFile)
 	if b, err := os.ReadFile(path); err == nil && len(b) > 0 {
 		return strings.TrimSpace(string(b)), nil
 	}
