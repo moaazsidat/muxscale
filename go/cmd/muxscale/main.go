@@ -113,11 +113,13 @@ Usage:
 func cmdDaemon(args []string) error {
 	addr := defaultAddr
 	hold := 120 * time.Second
-	var tailnet bool
+	var tailnet, useSystemTS bool
 	var tsHostname, tsAuthKey string
 	tsPort := 4443
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
+		case "--use-system-ts":
+			useSystemTS = true
 		case "--tailnet":
 			tailnet = true
 		case "--tailnet-hostname":
@@ -160,7 +162,7 @@ func cmdDaemon(args []string) error {
 			// whole purpose is to change where the daemon binds, quietly using
 			// a different value than the one asked for is the wrong failure.
 			return fmt.Errorf("unknown option %q for `muxscale daemon`\n"+
-				"valid: --listen ADDR, --hold DURATION, --tailnet, "+
+				"valid: --listen ADDR, --hold DURATION, --tailnet, --use-system-ts, "+
 				"--tailnet-hostname NAME, --tailnet-port PORT, --authkey KEY",
 				args[i])
 		}
@@ -185,8 +187,9 @@ func cmdDaemon(args []string) error {
 	d, err := daemon.New(daemon.Config{
 		ListenLocal: addr, HookToken: token, HoldTime: hold, Log: log,
 		Adapters: builtin.Registry(builtin.Options{}),
-		Tailnet:  tailnet, TailnetHostname: tsHostname,
+		Tailnet:  tailnet || useSystemTS, TailnetHostname: tsHostname,
 		TailnetAuthKey: tsAuthKey, TailnetPort: tsPort,
+		UseSystemTS: useSystemTS,
 	})
 	if err != nil {
 		return err

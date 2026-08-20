@@ -44,6 +44,12 @@ type Config struct {
 	TailnetHostname string
 	TailnetAuthKey  string
 	TailnetPort     int
+
+	// UseSystemTS serves on the machine's existing Tailscale node instead of
+	// joining the tailnet as a new one. See tsnode.SystemNode for the tradeoff;
+	// in short, it gives up per-service tailnet ACLs and works on machines
+	// where registering a new node does not.
+	UseSystemTS bool
 }
 
 // DefaultStateDir follows platform convention.
@@ -63,15 +69,16 @@ func DefaultStateDir() (string, error) {
 
 // Daemon is the long-lived process.
 type Daemon struct {
-	cfg   Config
-	reg   *Registry
-	mgr   *Manager
-	store *store.Store
-	node  *tsnode.Node
-	acl   *tsnode.ACL
-	log   *slog.Logger
-	srv   *http.Server
-	addr  string
+	cfg     Config
+	reg     *Registry
+	mgr     *Manager
+	store   *store.Store
+	node    *tsnode.Node
+	sysnode *tsnode.SystemNode
+	acl     *tsnode.ACL
+	log     *slog.Logger
+	srv     *http.Server
+	addr    string
 }
 
 // New builds a daemon.

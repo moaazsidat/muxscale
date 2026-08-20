@@ -275,8 +275,18 @@ func IdentityFrom(r *http.Request) (Identity, bool) {
 // than treated as anonymous: this endpoint can send input to a coding agent,
 // so "we could not tell who this is" must never mean "proceed".
 func (n *Node) withIdentity(next http.Handler) http.Handler {
+	return WithIdentity(n.lc, next)
+}
+
+// WithIdentity attaches the verified tailnet identity to each request, using
+// whichever Tailscale client is in play -- tsnet's own, or the system daemon's.
+//
+// Shared rather than duplicated because it is the security boundary: both
+// listeners must refuse an unidentifiable caller identically, and two copies of
+// that check is one copy too many.
+func WithIdentity(lc *local.Client, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		who, err := n.lc.WhoIs(r.Context(), r.RemoteAddr)
+		who, err := lc.WhoIs(r.Context(), r.RemoteAddr)
 		if err != nil || who.UserProfile == nil {
 			http.Error(w, "could not verify your tailnet identity", http.StatusForbidden)
 			return
