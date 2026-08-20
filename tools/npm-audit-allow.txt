@@ -10,6 +10,11 @@
 # the app cannot run without it. But the packages carrying the advisories are
 # @expo/cli and metro, which run on a developer's machine to produce a bundle
 # and are not part of it.
+#
+# Prefer a pnpm override to an entry here whenever a fixed version exists in the
+# same major. app/package.json pins postcss that way, which cleared four
+# advisories that would otherwise be listed below. This file is for the ones
+# with no fix to take.
 
 # image-size, reached only by Metro's asset pipeline at build time, parsing the
 # icons in app/assets/ that we ship ourselves. Denial of service via an infinite
