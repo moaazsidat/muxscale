@@ -123,3 +123,34 @@ func TestACLDenialNamesTheFix(t *testing.T) {
 		t.Errorf("the refusal does not say how to fix it:\n%s", body)
 	}
 }
+
+// The URL the daemon prints has to be the one that works. Printing https for a
+// plain-HTTP listener -- or the reverse -- sends the user to a bare TLS
+// handshake error with nothing to connect it to, which is exactly the failure
+// this scheme selection exists to prevent.
+func TestURLReportsTheSchemeActuallyServed(t *testing.T) {
+	n := &SystemNode{port: 4443, dnsName: "studio.example.ts.net"}
+
+	if got, want := n.URL(), "http://studio.example.ts.net:4443"; got != want {
+		t.Errorf("without TLS: URL() = %q, want %q", got, want)
+	}
+	n.tls = true
+	if got, want := n.URL(), "https://studio.example.ts.net:4443"; got != want {
+		t.Errorf("with TLS: URL() = %q, want %q", got, want)
+	}
+}
+
+// Listen decides the scheme; Serve must not run before it has. The two used to
+// be one call, which meant the caller logged a guess at the scheme while a
+// background goroutine was still deciding it -- wrong half the time, and a data
+// race the rest.
+func TestServeBeforeListenIsRefused(t *testing.T) {
+	n := &SystemNode{port: 4443}
+	err := n.Serve(context.Background(), http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	if err == nil {
+		t.Fatal("Serve ran without a listener")
+	}
+	if !strings.Contains(err.Error(), "Listen") {
+		t.Errorf("error does not name the missing step: %v", err)
+	}
+}

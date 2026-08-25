@@ -2,6 +2,7 @@ package tsnode
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"tailscale.com/client/local"
+	"tailscale.com/ipn/ipnstate"
 )
 
 // SystemNode serves the daemon on the machine's existing Tailscale node,
@@ -30,14 +32,26 @@ import (
 // address, so a tailnet ACL cannot distinguish muxscale from anything else the
 // host serves. muxscale's ACL still can.
 //
-// Transport is plain HTTP. There is no TLS to add here: the address only exists
-// inside the tailnet and every byte reaching it has already been through
-// WireGuard. tsnet's listener uses TLS only because Tailscale issues it a
-// certificate for its own name, and even there the encryption is redundant.
+// Transport is HTTPS where Tailscale will issue a certificate for the node's
+// name, and plain HTTP where it will not.
+//
+// The encryption is redundant either way -- the address only exists inside the
+// tailnet and every byte reaching it has already been through WireGuard. TLS is
+// here because clients assume it. A bare hostname typed into the app becomes an
+// https URL, browsers upgrade, and a plain-HTTP listener answers all of them
+// with a TLS handshake failure that says nothing about what is wrong. Serving
+// the certificate Tailscale is already willing to issue costs one call and
+// removes a whole category of confusing failure.
 type SystemNode struct {
 	lc   *local.Client
 	port int
 	ln   net.Listener
+
+	// tls records which scheme Start settled on, so the daemon can print a URL
+	// that actually works rather than one that looks right.
+	tls     bool
+	certErr error
+	dnsName string
 }
 
 // SystemConfig configures the system-Tailscale listener.
@@ -72,11 +86,16 @@ func NewSystem(ctx context.Context, cfg SystemConfig) (*SystemNode, error) {
 	return &SystemNode{lc: lc, port: cfg.Port}, nil
 }
 
-// Start listens and serves until ctx is done.
+// Listen binds the tailnet address and settles on a scheme.
+//
+// Separate from Serve so the caller can report a working URL before anything is
+// served. Doing both in one call meant the scheme was decided on a background
+// goroutine while the caller was already logging a guess at it -- wrong half the
+// time, and a data race the rest.
 //
 // It binds the host's tailnet addresses specifically, never all interfaces. The
 // difference is the whole point: on 0.0.0.0 this would answer on café wifi.
-func (s *SystemNode) Start(ctx context.Context, handler http.Handler) error {
+func (s *SystemNode) Listen(ctx context.Context) error {
 	st, err := s.lc.Status(ctx)
 	if err != nil {
 		return err
@@ -102,8 +121,20 @@ func (s *SystemNode) Start(ctx context.Context, handler http.Handler) error {
 	if err != nil {
 		return fmt.Errorf("listening on the tailnet address %s: %w", addr, err)
 	}
+	if tlsLn, ok := s.tlsListener(ctx, ln, st); ok {
+		ln = tlsLn
+		s.tls = true
+	}
 	s.ln = ln
+	s.dnsName = strings.TrimSuffix(st.Self.DNSName, ".")
+	return nil
+}
 
+// Serve handles requests until ctx is done. Listen must have run first.
+func (s *SystemNode) Serve(ctx context.Context, handler http.Handler) error {
+	if s.ln == nil {
+		return fmt.Errorf("Serve called before Listen")
+	}
 	srv := &http.Server{
 		Handler:           WithIdentity(s.lc, handler),
 		ReadHeaderTimeout: 10 * time.Second,
@@ -114,8 +145,50 @@ func (s *SystemNode) Start(ctx context.Context, handler http.Handler) error {
 		<-ctx.Done()
 		_ = srv.Close()
 	}()
-	return srv.Serve(ln)
+	return srv.Serve(s.ln)
 }
+
+// tlsListener wraps the listener in TLS if Tailscale will issue a certificate
+// for this node, and reports whether it did.
+//
+// The certificate is fetched once up front rather than left to the handshake.
+// tls.Config.GetCertificate is called lazily, so an unavailable certificate --
+// HTTPS not enabled for the tailnet, most commonly -- surfaces to the client as
+// an opaque handshake error with nothing in the daemon's log to match it
+// against. Asking now means the daemon can say plainly which scheme it ended up
+// serving, and the fetch warms tailscaled's cache for the first real request.
+func (s *SystemNode) tlsListener(ctx context.Context, ln net.Listener, st *ipnstate.Status) (net.Listener, bool) {
+	name := strings.TrimSuffix(st.Self.DNSName, ".")
+	if name == "" {
+		return nil, false
+	}
+
+	// Issuing a certificate for the first time talks to Let's Encrypt, which is
+	// slower than anything else here; renewals come from cache.
+	probeCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	if _, _, err := s.lc.CertPair(probeCtx, name); err != nil {
+		s.certErr = err
+		return nil, false
+	}
+
+	return tls.NewListener(ln, &tls.Config{
+		GetCertificate: s.lc.GetCertificate,
+		MinVersion:     tls.VersionTLS12,
+	}), true
+}
+
+// URL is where a client should point. Valid after Listen.
+func (s *SystemNode) URL() string {
+	scheme := "http"
+	if s.tls {
+		scheme = "https"
+	}
+	return fmt.Sprintf("%s://%s:%d", scheme, s.dnsName, s.port)
+}
+
+// CertError is why TLS was not used, if it was not. Empty when serving HTTPS.
+func (s *SystemNode) CertError() error { return s.certErr }
 
 // Close stops the listener.
 func (s *SystemNode) Close() error {

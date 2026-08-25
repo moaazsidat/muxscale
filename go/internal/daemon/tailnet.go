@@ -78,17 +78,27 @@ func (d *Daemon) startSystemTailnet(ctx context.Context, acl *tsnode.ACL, mux ht
 		d.log.Warn("refused a tailnet connection", "identity", id.LoginName, "node", id.NodeName)
 	})
 
+	// Bind before serving, so the URL logged below is the one that works. The
+	// scheme is not known until Tailscale has been asked for a certificate.
+	if err := node.Listen(ctx); err != nil {
+		return err
+	}
+
 	go func() {
-		if err := node.Start(ctx, guarded); err != nil && ctx.Err() == nil {
+		if err := node.Serve(ctx, guarded); err != nil && ctx.Err() == nil {
 			d.log.Error("tailnet listener stopped", "err", err)
 		}
 	}()
 
-	if st, err := node.Status(ctx); err == nil && st.DNSName != "" {
-		// http, not https: the address exists only inside the tailnet and every
-		// byte reaching it has already been through WireGuard.
-		d.log.Info("tailnet listener ready (system Tailscale)",
-			"url", fmt.Sprintf("http://%s:%d", st.DNSName, st.Port))
+	d.log.Info("tailnet listener ready (system Tailscale)", "url", node.URL())
+	if err := node.CertError(); err != nil {
+		// Serving plain HTTP is a working setup, but a client that assumes
+		// https gets a bare TLS handshake failure and no way to know why. Say
+		// it here, once, where it can be matched against that.
+		d.log.Warn("serving without TLS: Tailscale would not issue a certificate "+
+			"(enable HTTPS for the tailnet at https://tailscale.com/kb/1153) -- "+
+			"use the http:// URL above",
+			"err", err)
 	}
 	return nil
 }
