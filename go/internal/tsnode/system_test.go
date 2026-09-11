@@ -154,3 +154,36 @@ func TestServeBeforeListenIsRefused(t *testing.T) {
 		t.Errorf("error does not name the missing step: %v", err)
 	}
 }
+
+// Regression: a node that had registered, had a name and was Running still told
+// the user to log in, and the CLI returned early on that line so it hid the
+// address at the same time. The cached URL is captured from tsnet's log while
+// Up() blocks; once login completes the backend reports no URL at all, so
+// "keep the cached one unless the backend offers better" keeps a spent URL
+// forever.
+func TestResolveAuthURL(t *testing.T) {
+	const cached = "https://login.tailscale.com/a/cached"
+	const live = "https://login.tailscale.com/a/live"
+
+	cases := []struct {
+		name                  string
+		cached, live, backend string
+		want                  string
+	}{
+		{"login still pending, only the cached URL known", cached, "", "NeedsLogin", cached},
+		{"backend offers its own URL, which wins", cached, live, "NeedsLogin", live},
+		{"login finished: the cached URL is spent", cached, "", "Running", ""},
+		{"nothing anywhere", "", "", "Running", ""},
+		{"starting up, nothing known yet", "", "", "NoState", ""},
+		// Stopped is not Running, so a URL there is still actionable.
+		{"stopped with a pending URL", cached, "", "Stopped", cached},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveAuthURL(tc.cached, tc.live, tc.backend); got != tc.want {
+				t.Errorf("resolveAuthURL(%q, %q, %q) = %q, want %q",
+					tc.cached, tc.live, tc.backend, got, tc.want)
+			}
+		})
+	}
+}

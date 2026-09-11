@@ -111,3 +111,32 @@ func hexDigit(n byte) byte {
 	}
 	return 'a' + n - 10
 }
+
+// tmux reports "nothing is running" in more than one wording, and matching only
+// one of them made a machine with no tmux server look like a broken one.
+func TestNoTmuxServerRecognisesBothWordings(t *testing.T) {
+	yes := []string{
+		"no server running on /private/tmp/tmux-501/default",
+		"error connecting to /private/tmp/tmux-501/default (No such file or directory)",
+		"error connecting to /tmp/tmux-0/default (no such file or directory)",
+	}
+	for _, s := range yes {
+		if !noTmuxServer(s) {
+			t.Errorf("not recognised as an absent server: %q", s)
+		}
+	}
+
+	// Real failures must still surface: swallowing these would make a broken
+	// tmux indistinguishable from an unused one.
+	no := []string{
+		"error connecting to /tmp/tmux-501/default (Permission denied)",
+		"lost server",
+		"",
+		"unknown command: list-panes",
+	}
+	for _, s := range no {
+		if noTmuxServer(s) {
+			t.Errorf("wrongly treated as an absent server: %q", s)
+		}
+	}
+}

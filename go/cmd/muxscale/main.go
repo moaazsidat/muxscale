@@ -658,7 +658,7 @@ func cmdStatus(args []string) error {
 	}
 	t := out.Tailnet
 	fmt.Printf("tailnet     %s  [%s]\n", t.Hostname, t.BackendState)
-	if t.AuthURL != "" {
+	if t.AuthURL != "" && t.BackendState != "Running" {
 		// This is the whole reason someone runs `status` on first launch.
 		fmt.Printf("\n  Log in to finish connecting:\n    %s\n\n", t.AuthURL)
 		return nil

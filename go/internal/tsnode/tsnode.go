@@ -238,8 +238,11 @@ func (n *Node) Status(ctx context.Context) (Status, error) {
 		return s, err
 	}
 	s.BackendState = st.BackendState
-	if st.AuthURL != "" {
-		s.AuthURL = st.AuthURL
+	s.AuthURL = resolveAuthURL(s.AuthURL, st.AuthURL, st.BackendState)
+	// Clear the cache too, or the next call resurrects it from the field
+	// instead of from the backend.
+	if s.AuthURL != n.AuthURL() {
+		n.setAuthURL(s.AuthURL)
 	}
 	if st.Self != nil {
 		s.DNSName = strings.TrimSuffix(st.Self.DNSName, ".")
@@ -248,6 +251,27 @@ func (n *Node) Status(ctx context.Context) (Status, error) {
 		}
 	}
 	return s, nil
+}
+
+// resolveAuthURL decides which login URL, if any, is still worth showing.
+//
+// The cached one is captured from tsnet's log while Up() blocks, because until
+// Up() returns there is no Tailscale client to ask and the URL is the only
+// thing the user needs. The trap is what happens afterwards: once login
+// completes the backend reports no URL at all, so a rule of "keep the cached
+// one unless the backend offers a better" keeps showing a spent URL forever.
+// That is what `muxscale status` did -- a node that had registered, had a name
+// and was Running still told you to log in, and hid the address while doing it.
+//
+// A backend that is Running has, by definition, nothing left to log into.
+func resolveAuthURL(cached, live, backendState string) string {
+	if live != "" {
+		return live
+	}
+	if backendState == ipn.Running.String() {
+		return ""
+	}
+	return cached
 }
 
 // Identity is a verified tailnet caller.

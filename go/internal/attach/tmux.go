@@ -44,6 +44,22 @@ func TmuxVersion() (string, error) {
 }
 
 // ListPanes enumerates every pane on the running tmux server.
+// noTmuxServer reports whether tmux's stderr means "nothing is running", as
+// opposed to something actually wrong.
+//
+// tmux says this two different ways depending on version and how the socket is
+// reached: "no server running on /path", and "error connecting to /path (No
+// such file or directory)". Matching only the first meant that on a machine
+// with no tmux server -- the exact case this is here to tolerate -- discovery
+// logged a failure every scan, and the test asserting it is not an error failed.
+// Missed for a while because any running tmux server hides it.
+func noTmuxServer(stderr string) bool {
+	s := strings.ToLower(stderr)
+	return strings.Contains(s, "no server running") ||
+		(strings.Contains(s, "error connecting to") &&
+			strings.Contains(s, "no such file or directory"))
+}
+
 func ListPanes() ([]TmuxPane, error) {
 	const format = "#{session_name}:#{window_index}.#{pane_index}\t#{pane_id}\t" +
 		"#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}\t" +
@@ -52,8 +68,7 @@ func ListPanes() ([]TmuxPane, error) {
 	out, err := exec.Command("tmux", "list-panes", "-a", "-F", format).Output()
 	if err != nil {
 		// No server running is a normal state, not an error worth surfacing.
-		if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 &&
-			strings.Contains(string(ee.Stderr), "no server running") {
+		if ee, ok := err.(*exec.ExitError); ok && noTmuxServer(string(ee.Stderr)) {
 			return nil, nil
 		}
 		return nil, err
