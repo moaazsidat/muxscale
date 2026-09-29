@@ -63,6 +63,10 @@ func main() {
 		err = cmdDown(os.Args[2:])
 	case "status":
 		err = cmdStatus(os.Args[2:])
+	case "tailnet":
+		err = cmdTailnet(os.Args[2:])
+	case "adopt":
+		err = cmdAdopt(os.Args[2:])
 	case "acl":
 		err = cmdACL(os.Args[2:])
 	case "hooks":
@@ -90,6 +94,9 @@ Usage:
   muxscale down                Stop and remove the background service
   muxscale daemon [--tailnet]  Run the daemon in the foreground
   muxscale status              Daemon, tailnet, and session summary
+  muxscale tailnet             Tailnet listener status
+  muxscale tailnet on|off      Serve over Tailscale, no restart (--system: host node)
+  muxscale adopt               Adopt already-running sessions now, and report
   muxscale acl [allow|deny U]  Tailnet identities permitted to connect
   muxscale run -- CMD          Launch CMD as a managed session (enables replies)
   muxscale send ID "text"      Send input to a session
@@ -626,13 +633,16 @@ func cmdDown(args []string) error {
 
 func cmdStatus(args []string) error {
 	var out struct {
-		LocalAddr string   `json:"local_addr"`
-		Hold      string   `json:"hold"`
-		Sessions  int      `json:"sessions"`
-		Approvals int      `json:"approvals"`
-		DB        string   `json:"db"`
-		ACL       []string `json:"acl"`
-		Tailnet   *struct {
+		LocalAddr      string   `json:"local_addr"`
+		Hold           string   `json:"hold"`
+		Sessions       int      `json:"sessions"`
+		Approvals      int      `json:"approvals"`
+		DB             string   `json:"db"`
+		ACL            []string `json:"acl"`
+		TailnetEnabled bool     `json:"tailnet_enabled"`
+		TailnetMode    string   `json:"tailnet_mode"`
+		TailnetURL     string   `json:"tailnet_url"`
+		Tailnet        *struct {
 			Hostname     string   `json:"hostname"`
 			DNSName      string   `json:"dns_name"`
 			TailnetIPs   []string `json:"tailnet_ips"`
@@ -652,8 +662,15 @@ func cmdStatus(args []string) error {
 	fmt.Printf("sessions    %d  (%d pending approval)\n", out.Sessions, out.Approvals)
 	fmt.Printf("database    %s\n", out.DB)
 
+	if !out.TailnetEnabled {
+		fmt.Printf("tailnet     off  (serve it with `muxscale tailnet on`)\n")
+		return nil
+	}
 	if out.Tailnet == nil {
-		fmt.Printf("tailnet     not enabled  (start the daemon with --tailnet)\n")
+		fmt.Printf("tailnet     on [%s], starting\n", out.TailnetMode)
+		if out.TailnetURL != "" {
+			fmt.Printf("            %s\n", out.TailnetURL)
+		}
 		return nil
 	}
 	t := out.Tailnet
@@ -674,6 +691,201 @@ func cmdStatus(args []string) error {
 	} else {
 		fmt.Printf("permitted   nobody yet - run `muxscale acl allow you@example.com`\n")
 	}
+	return nil
+}
+
+// ---------- tailnet ----------
+
+// tailnetView is the shape /v1/tailnet answers with.
+type tailnetView struct {
+	Enabled bool   `json:"enabled"`
+	Mode    string `json:"mode"`
+	URL     string `json:"url"`
+	Status  *struct {
+		Hostname     string   `json:"hostname"`
+		DNSName      string   `json:"dns_name"`
+		TailnetIPs   []string `json:"tailnet_ips"`
+		BackendState string   `json:"backend_state"`
+		AuthURL      string   `json:"auth_url"`
+		Port         int      `json:"port"`
+	} `json:"status"`
+}
+
+// cmdTailnet turns the Tailscale listener on and off on a running daemon.
+//
+// This is the answer to "I started the daemon, now how do I enable the
+// tailnet?" -- you do not restart it. Restarting is not free: it drops the
+// PTY of every session muxscale launched, and those sessions die with it.
+// Sessions in a terminal, under tmux, or adopted through a terminal emulator
+// survive and are re-adopted, but there is no reason to make anyone find that
+// out the hard way.
+func cmdTailnet(args []string) error {
+	verb := "status"
+	for _, a := range args {
+		if !strings.HasPrefix(a, "-") {
+			verb = a
+		}
+	}
+	switch verb {
+	case "status":
+		var out tailnetView
+		if err := apiGet("/v1/tailnet", &out); err != nil {
+			return err
+		}
+		if hasFlag(args, "--json") {
+			return json.NewEncoder(os.Stdout).Encode(out)
+		}
+		printTailnet(out)
+		return nil
+
+	case "on":
+		body, _ := json.Marshal(map[string]any{
+			"enable": true, "system": hasFlag(args, "--system"),
+		})
+		resp, err := apiPost("/v1/tailnet", string(body))
+		if err != nil {
+			return daemonDown(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			b, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("%s", strings.TrimSpace(string(b)))
+		}
+		var out tailnetView
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return err
+		}
+		fmt.Printf("tailnet listener on (%s)\n", out.Mode)
+		printTailnet(out)
+		return nil
+
+	case "off":
+		resp, err := apiPost("/v1/tailnet", `{"enable":false}`)
+		if err != nil {
+			return daemonDown(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			b, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("%s", strings.TrimSpace(string(b)))
+		}
+		fmt.Println("tailnet listener stopped. Local access is unaffected, and")
+		fmt.Println("already-running sessions keep being monitored.")
+		return nil
+	}
+	return fmt.Errorf("usage: muxscale tailnet [status|on|off] [--system] [--json]")
+}
+
+func printTailnet(out tailnetView) {
+	if !out.Enabled {
+		fmt.Println("tailnet     off  (serve it with `muxscale tailnet on`)")
+		return
+	}
+	fmt.Printf("tailnet     on  [%s]\n", out.Mode)
+	if out.URL != "" {
+		fmt.Printf("            %s\n", out.URL)
+	}
+	if out.Status == nil {
+		fmt.Println("            starting; run `muxscale status` in a moment")
+		return
+	}
+	t := out.Status
+	if t.AuthURL != "" && t.BackendState != "Running" {
+		// The whole reason someone runs this command the first time.
+		fmt.Printf("\n  Log in to finish connecting:\n    %s\n\n", t.AuthURL)
+		return
+	}
+	if t.DNSName != "" && out.URL == "" {
+		fmt.Printf("            https://%s:%d\n", t.DNSName, t.Port)
+	}
+	for _, ip := range t.TailnetIPs {
+		fmt.Printf("            %s\n", ip)
+	}
+}
+
+// ---------- adopt ----------
+
+// cmdAdopt runs a discovery pass now and prints what muxscale can reach.
+//
+// Adoption is continuous, so this changes nothing on its own. It exists to
+// answer the question the whole feature creates: "the daemon is up -- did it
+// find my running sessions, and can I reply to them?" Waiting three seconds
+// and reading `muxscale ls` answers the first half; the second half is why
+// this prints attachment and writability together, with the fix for any
+// terminal that could be adopted but is not yet enabled.
+func cmdAdopt(args []string) error {
+	resp, err := apiPost("/v1/adopt", "")
+	if err != nil {
+		return daemonDown(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("%s", strings.TrimSpace(string(b)))
+	}
+	var out struct {
+		Sessions []struct {
+			ID             string `json:"id"`
+			AgentID        string `json:"agent_id"`
+			Title          string `json:"title"`
+			Cwd            string `json:"cwd"`
+			Attachment     string `json:"attachment"`
+			Fidelity       string `json:"fidelity"`
+			Writable       bool   `json:"writable"`
+			TranscriptPath string `json:"transcript_path"`
+		} `json:"sessions"`
+		Terminals []struct {
+			Kind      string `json:"kind"`
+			Available bool   `json:"available"`
+			Enabled   bool   `json:"enabled"`
+			Reason    string `json:"reason"`
+			HowToFix  string `json:"how_to_fix"`
+		} `json:"terminals"`
+		Note string `json:"note"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return err
+	}
+	if hasFlag(args, "--json") {
+		return json.NewEncoder(os.Stdout).Encode(out)
+	}
+
+	if out.Note != "" {
+		fmt.Println(out.Note)
+	} else {
+		fmt.Printf("%d session(s) found:\n\n", len(out.Sessions))
+		for _, s := range out.Sessions {
+			reply := "read-only"
+			if s.Writable {
+				reply = "replies enabled"
+			}
+			title := s.Title
+			if title == "" {
+				title = filepath.Base(s.Cwd)
+			}
+			fmt.Printf("  %-9s %-14s %-8s %s\n", s.Attachment, s.Fidelity, reply, title)
+			fmt.Printf("  %-9s %s\n", "", s.ID)
+			if s.TranscriptPath != "" {
+				fmt.Printf("  %-9s transcript: %s\n", "", s.TranscriptPath)
+			}
+		}
+	}
+
+	fmt.Println()
+	for _, t := range out.Terminals {
+		switch {
+		case t.Enabled:
+			fmt.Printf("terminal %-8s remote control enabled\n", t.Kind)
+		case t.Available:
+			fmt.Printf("terminal %-8s %s\n", t.Kind, t.Reason)
+			if t.HowToFix != "" {
+				fmt.Printf("         fix: %s\n", t.HowToFix)
+			}
+		}
+	}
+	fmt.Println("\nSessions started under `muxscale run`, in tmux, or in a")
+	fmt.Println("remote-control terminal accept replies; the rest are watched")
+	fmt.Println("read-only until they are restarted that way.")
 	return nil
 }
 
@@ -967,7 +1179,21 @@ func cmdTranscript(args []string) error {
 
 // ---------- helpers ----------
 
-func apiURL(path string) string { return "http://" + defaultAddr + path }
+// apiURL is where the CLI looks for the daemon.
+//
+// MUXSCALE_ADDR overrides the default port. The daemon's listen address is a
+// startup flag, so without this a second daemon is unreachable from the CLI --
+// and testing a change against a second daemon is exactly how you avoid
+// restarting the one that is busy watching someone's sessions.
+func apiURL(path string) string { return "http://" + apiAddr() + path }
+
+// apiAddr is the daemon address the CLI will talk to.
+func apiAddr() string {
+	if x := os.Getenv("MUXSCALE_ADDR"); x != "" {
+		return x
+	}
+	return defaultAddr
+}
 
 // apiToken reads the daemon's local token.
 //
@@ -1030,7 +1256,7 @@ func apiGet(path string, out any) error {
 }
 
 func daemonDown(err error) error {
-	return fmt.Errorf("daemon not reachable at %s (run `muxscale daemon`): %w", defaultAddr, err)
+	return fmt.Errorf("daemon not reachable at %s (run `muxscale daemon`): %w", apiAddr(), err)
 }
 
 // loadOrCreateToken persists a hook token. M0 uses a file at 0600; the OS

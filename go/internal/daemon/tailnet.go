@@ -11,6 +11,91 @@ import (
 	"github.com/muxscale/muxscale/go/internal/tsnode"
 )
 
+// EnableTailnet brings up the Tailscale listener on a running daemon.
+//
+// This exists because the listener used to be start-only, and turning it on
+// meant restarting the daemon -- which kills every session muxscale holds the
+// PTY for. Sessions in a terminal, under tmux, or adopted through a terminal
+// emulator survive a restart, but "restart the daemon to enable the tailnet"
+// is still the wrong shape: the daemon is the thing that is watching, and it
+// should not have to blink to start serving.
+//
+// useSystem serves on the machine's existing Tailscale node instead of
+// joining the tailnet as one of its own; see tsnode.SystemNode for the tradeoff.
+func (d *Daemon) EnableTailnet(ctx context.Context, useSystem bool) (string, error) {
+	d.tailnetMu.Lock()
+	defer d.tailnetMu.Unlock()
+
+	if d.tailnetCancel != nil {
+		return d.tailnetURL, fmt.Errorf(
+			"the tailnet listener is already running (%s at %s); "+
+				"turn it off first with `muxscale tailnet off`", d.tailnetMode, d.tailnetURL)
+	}
+	if d.mux == nil || d.stateDir == "" {
+		return "", fmt.Errorf("the daemon is not running yet")
+	}
+
+	// Parented to the daemon, never to the caller. See runCtx.
+	parent := d.runCtx
+	if parent == nil {
+		parent = ctx
+	}
+	tctx, cancel := context.WithCancel(parent)
+	start := d.tailnetStarter
+	if start == nil {
+		start = d.startTailnet
+	}
+	url, err := start(tctx, d.stateDir, d.mux, useSystem)
+	if err != nil {
+		cancel()
+		d.node, d.sysnode = nil, nil
+		return "", err
+	}
+	d.tailnetCancel = cancel
+	d.tailnetURL = url
+	d.tailnetMode = "tsnet"
+	if useSystem {
+		d.tailnetMode = "system"
+	}
+	_ = d.store.Audit("cli", "tailnet_enabled", "", d.tailnetMode)
+	return url, nil
+}
+
+// DisableTailnet stops the Tailscale listener. The loopback listener, the
+// sessions, and everything already discovered are untouched.
+func (d *Daemon) DisableTailnet() error {
+	d.tailnetMu.Lock()
+	defer d.tailnetMu.Unlock()
+
+	if d.tailnetCancel == nil {
+		return fmt.Errorf("the tailnet listener is not running")
+	}
+	d.tailnetCancel()
+	d.tailnetCancel = nil
+
+	var err error
+	if d.sysnode != nil {
+		err = d.sysnode.Close()
+		d.sysnode = nil
+	}
+	if d.node != nil {
+		if e := d.node.Close(); err == nil {
+			err = e
+		}
+		d.node = nil
+	}
+	d.tailnetURL, d.tailnetMode = "", ""
+	_ = d.store.Audit("cli", "tailnet_disabled", "", "")
+	return err
+}
+
+// TailnetEnabled reports whether the listener is up, and in which mode.
+func (d *Daemon) TailnetEnabled() (mode string, url string, ok bool) {
+	d.tailnetMu.Lock()
+	defer d.tailnetMu.Unlock()
+	return d.tailnetMode, d.tailnetURL, d.tailnetCancel != nil
+}
+
 // startTailnet brings up the Tailscale node that phones connect to.
 //
 // Two independent gates guard it: Tailscale attests the caller's identity
@@ -18,14 +103,18 @@ import (
 // may reach this daemon. Tailnet ACLs alone are not enough -- a fresh tailnet
 // lets a user's devices reach each other on every port, and a user on a company
 // tailnet may not be able to change that.
-func (d *Daemon) startTailnet(ctx context.Context, stateDir string, mux http.Handler) error {
+//
+// The returned URL is best-effort: a tsnet node does not know its own name
+// until it has registered, so that path returns "" and the URL is reported by
+// reportTailnet once it exists.
+func (d *Daemon) startTailnet(ctx context.Context, stateDir string, mux http.Handler, useSystem bool) (string, error) {
 	acl, err := tsnode.LoadACL(stateDir)
 	if err != nil {
-		return err
+		return "", err
 	}
 	d.acl = acl
 
-	if d.cfg.UseSystemTS {
+	if useSystem {
 		return d.startSystemTailnet(ctx, acl, mux)
 	}
 
@@ -37,7 +126,7 @@ func (d *Daemon) startTailnet(ctx context.Context, stateDir string, mux http.Han
 		Logf:     tsnetLogf(d.log),
 	})
 	if err != nil {
-		return err
+		return "", err
 	}
 	d.node = node
 
@@ -56,7 +145,7 @@ func (d *Daemon) startTailnet(ctx context.Context, stateDir string, mux http.Han
 	}()
 
 	go d.reportTailnet(ctx, node)
-	return nil
+	return "", nil
 }
 
 // startSystemTailnet serves on the machine's existing Tailscale node.
@@ -65,10 +154,10 @@ func (d *Daemon) startTailnet(ctx context.Context, stateDir string, mux http.Han
 // muxscale's ACL decides whether they may. The hook endpoint is untouched and
 // stays loopback-only -- this adds a second, authenticated listener rather than
 // widening the first one.
-func (d *Daemon) startSystemTailnet(ctx context.Context, acl *tsnode.ACL, mux http.Handler) error {
+func (d *Daemon) startSystemTailnet(ctx context.Context, acl *tsnode.ACL, mux http.Handler) (string, error) {
 	node, err := tsnode.NewSystem(ctx, tsnode.SystemConfig{Port: d.cfg.TailnetPort})
 	if err != nil {
-		return err
+		return "", err
 	}
 	d.sysnode = node
 
@@ -81,7 +170,7 @@ func (d *Daemon) startSystemTailnet(ctx context.Context, acl *tsnode.ACL, mux ht
 	// Bind before serving, so the URL logged below is the one that works. The
 	// scheme is not known until Tailscale has been asked for a certificate.
 	if err := node.Listen(ctx); err != nil {
-		return err
+		return "", err
 	}
 
 	go func() {
@@ -100,7 +189,7 @@ func (d *Daemon) startSystemTailnet(ctx context.Context, acl *tsnode.ACL, mux ht
 			"use the http:// URL above",
 			"err", err)
 	}
-	return nil
+	return node.URL(), nil
 }
 
 // tsnetLogf decides what to do with tsnet's own logging.
@@ -170,17 +259,21 @@ func (d *Daemon) reportTailnet(ctx context.Context, node *tsnode.Node) {
 
 // TailnetStatus reports the node state for `status` and `doctor`.
 func (d *Daemon) TailnetStatus(ctx context.Context) (tsnode.Status, bool) {
-	if d.sysnode != nil {
-		st, err := d.sysnode.Status(ctx)
+	d.tailnetMu.Lock()
+	sysnode, node := d.sysnode, d.node
+	d.tailnetMu.Unlock()
+
+	if sysnode != nil {
+		st, err := sysnode.Status(ctx)
 		if err != nil {
 			return tsnode.Status{}, false
 		}
 		return st, true
 	}
-	if d.node == nil {
+	if node == nil {
 		return tsnode.Status{}, false
 	}
-	st, err := d.node.Status(ctx)
+	st, err := node.Status(ctx)
 	if err != nil {
 		return tsnode.Status{}, false
 	}

@@ -10,7 +10,8 @@ machines, notifies you the moment one blocks, and lets you unblock it with a sen
 **Status: M0 complete, M1 mostly complete.** Claude Code only, terminal only — no phone app
 and no cloud yet. See [the technical spec](docs/20260729-technical-spec.md) for the full
 design and [§13 Milestones](docs/20260729-technical-spec.md#13-milestones) for what lands
-when.
+when. Adopting agents that are *already running* is specified and partly built in
+[the adoption spec](docs/20260925-adopting-existing-sessions.md).
 
 ## What works today
 
@@ -39,6 +40,19 @@ when.
 - Send new prompts to sessions muxscale owns (`muxscale run`) or has adopted from tmux.
 - **Input fencing**: a reply is bound to the exact turn that asked. If the agent moved on,
   the input is refused with an explanation rather than answering the wrong question.
+
+**Adopting agents you already had running**
+
+- A Claude Code session started in iTerm2 *before muxscale existed*, in no multiplexer, is
+  **writable from the CLI** — the daemon joins the pane to the process on the tty and types
+  through iTerm2's scripting interface. No restart, no re-launch, no shim.
+- Those sessions carry a **sampled** screen (polled at ~2 Hz, not a live stream) and say so.
+- Its transcript is matched by **process start time**, not "newest file in the project", so
+  two agents in one project each get their own conversation.
+- A write is refused unless the adopted agent is still the process sitting in that pane —
+  otherwise a reply would land on a shell prompt after the agent exited.
+- `muxscale adopt` reports what was adopted, what it can reply to, and what a terminal would
+  need to be adoptable at all.
 
 **Watching them work**
 
@@ -72,6 +86,61 @@ export MUXSCALE_HOOK_TOKEN=…  # printed by hooks install; add to your shell pr
 
 `hooks install` writes a timestamped backup, preserves every existing hook, and is
 idempotent. `hooks uninstall` removes exactly muxscale's tagged entries.
+
+To serve the daemon to your phone, turn the tailnet listener on — **without restarting
+anything**, including the daemon:
+
+```bash
+./muxscale tailnet on --system          # serve on the machine's existing Tailscale node
+./muxscale acl allow you@example.com    # the second gate; Tailscale identity is the first
+./muxscale adopt                        # what did it find, and can I reply to it?
+```
+
+`muxscale tailnet on` (no `--system`) joins the tailnet as its own node instead, which gives
+up less but needs to register with Tailscale's control plane. Restarting the daemon is only
+ever necessary for `muxscale run` sessions — those are the ones it holds a PTY for. Sessions
+in iTerm2, tmux, or a plain terminal survive and are re-adopted.
+
+### Gotchas
+
+- **`muxscale up` will not give you `--use-system-ts`.** The unit it writes runs
+  `muxscale daemon` (or `muxscale daemon --tailnet` with `up --tailnet`), and `--tailnet`
+  means *a new tsnet node* (`muxscale-<host>.<tailnet>.ts.net`), not the machine's existing
+  Tailscale identity. Nothing writes `--use-system-ts` into a service unit. To serve on the
+  system node, start the daemon by hand with that flag, or start it plainly and run
+  `muxscale tailnet on --system`.
+
+- **A daemon you started by hand is supervised by nobody.** Nothing restarts it when it
+  exits, and nothing replaces the binary when you rebuild — so an old build keeps running
+  silently, serving an old API. Check what is actually running, and with which flags, before
+  believing a feature exists:
+
+  ```bash
+  ps -o pid=,ppid=,lstart=,args= -ax | grep '[m]uxscale.*daemon'
+  ```
+
+- **A tailnet *node* being `Running` does not mean the listener is up.** The daemon can fail
+  to bind its port (address changed, port taken, certificate trouble) and carry on serving
+  loopback only, because monitoring must never depend on the network. `muxscale status` shows
+  the node; `muxscale tailnet` shows whether anything is actually listening:
+
+  ```bash
+  muxscale tailnet                        # on [system] + URL, or off
+  lsof -nP -iTCP:4443 -sTCP:LISTEN        # the same answer, from the OS
+  ```
+
+- **Killing the daemon drops any approval it is holding open.** A `PermissionRequest` hook
+  waits inside the daemon for up to `--hold`; if the daemon dies first, the hook returns "no
+  decision" and Claude Code asks locally instead. Fail-open by design, but the prompt comes
+  back in the terminal rather than to your phone.
+
+- **Restarting the daemon kills `muxscale run` sessions and only those.** `muxscale ls` does
+  not show the attachment, so check before you kill anything:
+
+  ```bash
+  muxscale adopt | grep wrap                            # PTYs the daemon owns
+  pgrep -P "$(pgrep -f 'muxscale.*daemon' | head -1)"   # its children; empty = nothing to lose
+  ```
 
 > **Heads-up before installing globally.** The decision hooks hold a permission prompt open
 > for up to the configured hold window (default 120s) while waiting for an answer. Until the

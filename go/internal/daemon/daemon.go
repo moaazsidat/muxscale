@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/muxscale/muxscale/go/internal/adapter"
@@ -60,7 +61,15 @@ type Config struct {
 }
 
 // DefaultStateDir follows platform convention.
+//
+// MUXSCALE_STATE_DIR overrides it. The daemon and the CLI both read it, so a
+// second daemon can run alongside the first -- on another port, with its own
+// database and token -- which is what makes a change testable without
+// restarting, or even touching, the daemon someone is already relying on.
 func DefaultStateDir() (string, error) {
+	if x := os.Getenv("MUXSCALE_STATE_DIR"); x != "" {
+		return x, nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
@@ -86,6 +95,33 @@ type Daemon struct {
 	log     *slog.Logger
 	srv     *http.Server
 	addr    string
+
+	// mux and stateDir are kept so the tailnet listener can be brought up
+	// after Run has started. The listener used to be start-only, so turning it
+	// on meant restarting the daemon -- which kills every session muxscale
+	// owns the PTY for. Enabling it at runtime is what makes "start the daemon
+	// now, decide about the tailnet later" a safe order to do things in.
+	mux      http.Handler
+	stateDir string
+
+	// runCtx is the daemon's own lifetime. A listener enabled by an HTTP
+	// request must not be parented to that request's context: the request
+	// context is cancelled the moment the handler returns, so the listener
+	// would bind, report success, and be torn down before the caller could
+	// connect to it. That is exactly what the first version did.
+	runCtx context.Context
+
+	// tailnetMu guards the listener's lifecycle and the fields describing it.
+	// Held across a start or stop, which can take a second or two: a status
+	// request that raced a stop would otherwise read a half-cleared node.
+	tailnetMu     sync.Mutex
+	tailnetCancel context.CancelFunc
+	tailnetMode   string // "tsnet" or "system"; empty when no listener is up
+	tailnetURL    string
+
+	// tailnetStarter is the seam tests use to drive the listener lifecycle
+	// without a real Tailscale. Nil means startTailnet.
+	tailnetStarter func(context.Context, string, http.Handler, bool) (string, error)
 }
 
 // New builds a daemon.
@@ -141,6 +177,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	defer st.Close()
 	d.store = st
 	d.mgr = NewManager(d.reg, d.cfg.Adapters, st, d.log)
+	d.stateDir = stateDir
 
 	if n, err := d.mgr.Restore(); err != nil {
 		d.log.Warn("restoring sessions failed", "err", err)
@@ -153,6 +190,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	go d.mgr.DiscoverLoop(stopScan, 3*time.Second)
 
 	mux := http.NewServeMux()
+	d.mux = mux
+	d.runCtx = ctx
 	hookSrv := NewHookServer(d.reg, d.cfg.LocalToken, d.cfg.HoldTime, d.log)
 	hookSrv.SetManager(d.mgr)
 	hookSrv.Routes(mux)
@@ -181,9 +220,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}()
 
 	// The tailnet listener is what a phone connects to. It is optional so the
-	// daemon is fully usable locally without any Tailscale setup at all.
+	// daemon is fully usable locally without any Tailscale setup at all, and
+	// it can be turned on later with `muxscale tailnet on` -- see
+	// EnableTailnet for why that matters.
 	if d.cfg.Tailnet {
-		if err := d.startTailnet(ctx, stateDir, mux); err != nil {
+		if _, err := d.EnableTailnet(ctx, d.cfg.UseSystemTS); err != nil {
 			// A tailnet failure must not take down local monitoring, which is
 			// the part that works with no network at all.
 			d.log.Error("tailnet listener unavailable; local access still works", "err", err)
@@ -196,6 +237,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	case <-ctx.Done():
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		_ = d.DisableTailnet()
 		d.mgr.Shutdown(3 * time.Second)
 		return d.srv.Shutdown(shutCtx)
 	}
@@ -424,6 +466,13 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 			"approvals":  len(d.reg.PendingApprovals()),
 			"db":         d.store.Path(),
 		}
+		if mode, url, on := d.TailnetEnabled(); on {
+			out["tailnet_enabled"] = true
+			out["tailnet_mode"] = mode
+			out["tailnet_url"] = url
+		} else {
+			out["tailnet_enabled"] = false
+		}
 		if st, ok := d.TailnetStatus(r.Context()); ok {
 			out["tailnet"] = st
 		} else {
@@ -435,6 +484,60 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 		writeJSON(w, out)
 	})
 
+	// GET  /v1/tailnet                      status
+	// POST /v1/tailnet {"enable":bool,"system":bool}
+	//
+	// The listener is startable at runtime so enabling it does not require
+	// restarting the daemon, which would drop every PTY it owns. Still
+	// local-only in the sense that matters: this route is on the loopback
+	// listener, and the tailnet listener it starts is guarded by the ACL.
+	d.handle(mux, "/v1/tailnet", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			mode, url, on := d.TailnetEnabled()
+			out := map[string]any{"enabled": on, "mode": mode, "url": url}
+			if st, ok := d.TailnetStatus(r.Context()); ok {
+				out["status"] = st
+			}
+			writeJSON(w, out)
+			return
+		}
+		var body struct {
+			Enable bool `json:"enable"`
+			System bool `json:"system"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if !body.Enable {
+			if err := d.DisableTailnet(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			writeJSON(w, map[string]any{"enabled": false})
+			return
+		}
+		url, err := d.EnableTailnet(r.Context(), body.System)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		mode, _, _ := d.TailnetEnabled()
+		out := map[string]any{"enabled": true, "mode": mode, "url": url}
+		if st, ok := d.TailnetStatus(r.Context()); ok {
+			out["status"] = st
+		}
+		writeJSON(w, out)
+	})
+
+	// POST /v1/adopt
+	//
+	// Force a discovery pass and report what muxscale can reach. Adoption
+	// itself is continuous; this is for the moment after a setting changed.
+	d.handle(mux, "/v1/adopt", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, d.mgr.AdoptNow())
+	})
+
 	// GET  /v1/acl              list
 	// POST /v1/acl {"allow"|"deny": "user@example.com"}
 	//
@@ -443,7 +546,7 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 	// be able to grant itself access.
 	d.handle(mux, "/v1/acl", func(w http.ResponseWriter, r *http.Request) {
 		if d.acl == nil {
-			http.Error(w, "tailnet is not enabled (start the daemon with --tailnet)", http.StatusNotFound)
+			http.Error(w, "tailnet is not enabled (run `muxscale tailnet on`)", http.StatusNotFound)
 			return
 		}
 		if r.Method == http.MethodGet {
