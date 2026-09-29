@@ -103,7 +103,7 @@ func Discover() ([]Process, error) {
 		if err1 != nil || err2 != nil {
 			continue
 		}
-		started, _ := time.Parse("Jan 2 15:04:05 2006", strings.Join(fields[2:7], " "))
+		started := ParseLstart(strings.Join(fields[2:7], " "))
 		tty := fields[7]
 		argv := fields[8:]
 		all[pid] = procRow{
@@ -131,6 +131,30 @@ func Discover() ([]Process, error) {
 		found = append(found, p)
 	}
 	return found, nil
+}
+
+// lstartLayouts are the orderings `ps` uses for lstart.
+//
+// Which one you get depends on the machine's locale, and both appear on macOS
+// in the wild -- "Fri Sep 25 21:02:16 2026" and "Fri 25 Sep 21:02:16 2026".
+// Parsing only the first is why every discovered process had a zero start time
+// on a machine set to the second: the error was discarded, so nothing said so,
+// and the only visible symptom was a session's creation time being the moment
+// muxscale first noticed it.
+var lstartLayouts = []string{
+	"Mon Jan 2 15:04:05 2006",
+	"Mon 2 Jan 15:04:05 2006",
+}
+
+// ParseLstart reads a start time as `ps` prints it, or the zero time.
+func ParseLstart(s string) time.Time {
+	s = strings.Join(strings.Fields(s), " ") // ps pads the day to two columns
+	for _, layout := range lstartLayouts {
+		if t, err := time.ParseInLocation(layout, s, time.Local); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
 }
 
 // ForAdapter converts a discovered process into the form adapters match on.

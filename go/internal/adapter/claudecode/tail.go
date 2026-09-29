@@ -1,6 +1,7 @@
 package claudecode
 
 import (
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -181,6 +182,134 @@ func FindTranscripts(cwd string) ([]string, error) {
 		out[i] = f.path
 	}
 	return out, nil
+}
+
+// TranscriptCandidate is one of a project's session files, carrying the facts
+// needed to tell whether it belongs to a particular running process.
+type TranscriptCandidate struct {
+	Path      string
+	SessionID string
+	Started   time.Time // the first event's timestamp; zero if unreadable
+	Modified  time.Time
+}
+
+// transcriptStartTolerance bounds how far a session's first event may sit from
+// the process's start time and still count as an exact match.
+//
+// A fresh session writes its first line as it boots, so the gap is the second
+// or two it takes the process to get there. The window is generous because
+// `ps` reports start time to the second and a loaded machine is slow to boot.
+const transcriptStartTolerance = 60 * time.Second
+
+// TranscriptCandidates lists a project's session files, newest first.
+//
+// FindTranscripts returns paths alone, which leaves the caller picking by
+// modification time -- and modification time cannot tell two agents in one
+// project apart: whichever wrote last wins, so a newly discovered session
+// adopts its neighbour's transcript and the phone shows the wrong
+// conversation. Reading the first line of each file costs one small read per
+// candidate and yields the session id and the time the session began, which
+// together are what the join actually needs.
+func TranscriptCandidates(cwd string) ([]TranscriptCandidate, error) {
+	paths, err := FindTranscripts(cwd)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]TranscriptCandidate, 0, len(paths))
+	for _, p := range paths {
+		c := TranscriptCandidate{Path: p}
+		if fi, err := os.Stat(p); err == nil {
+			c.Modified = fi.ModTime()
+		}
+		c.SessionID, c.Started = firstEntry(p)
+		out = append(out, c)
+	}
+	return out, nil
+}
+
+// firstEntry reads a transcript's opening line for its session id and time.
+//
+// Only the first JSON object is decoded, so this is one small read per
+// candidate rather than a parse of a file that can be hundreds of megabytes.
+func firstEntry(path string) (sessionID string, started time.Time) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", time.Time{}
+	}
+	defer f.Close()
+	var e entry
+	if err := json.NewDecoder(f).Decode(&e); err != nil {
+		return "", time.Time{}
+	}
+	return e.SessionID, parseTime(e.Timestamp)
+}
+
+// PickTranscript chooses the session file belonging to a process that started
+// at started, excluding files already claimed by another live session.
+//
+// Three cases, in order, because they are not equally trustworthy:
+//
+//   - A fresh session writes its first event within moments of the process
+//     starting. That is an exact join on two independently-known times, and it
+//     wins outright.
+//   - One unclaimed file and one discovered process: there is nothing to
+//     choose between, and refusing to answer would leave a session muxscale
+//     can see without its transcript.
+//   - Otherwise the session was resumed (claude --resume reuses a file that
+//     already existed), so its first event predates the process. The file
+//     written most recently *after* this process began is the closest thing to
+//     an answer, and it is the only discriminator available.
+//
+// Returning "" is a valid outcome: the caller then leaves the session without a
+// transcript rather than attaching it to someone else's conversation.
+func PickTranscript(cands []TranscriptCandidate, started time.Time, claimed map[string]bool) string {
+	free := make([]TranscriptCandidate, 0, len(cands))
+	for _, c := range cands {
+		if !claimed[c.Path] {
+			free = append(free, c)
+		}
+	}
+	if len(free) == 0 {
+		return ""
+	}
+
+	if !started.IsZero() {
+		best, bestDelta := "", time.Duration(0)
+		for _, c := range free {
+			if c.Started.IsZero() {
+				continue
+			}
+			d := c.Started.Sub(started).Abs()
+			if d > transcriptStartTolerance {
+				continue
+			}
+			if best == "" || d < bestDelta {
+				best, bestDelta = c.Path, d
+			}
+		}
+		if best != "" {
+			return best
+		}
+	}
+
+	if len(free) == 1 {
+		return free[0].Path
+	}
+
+	if started.IsZero() {
+		return free[0].Path // FindTranscripts orders newest first
+	}
+	best, bestDelta := "", time.Duration(0)
+	for _, c := range free {
+		if c.Modified.IsZero() || c.Modified.Before(started) {
+			continue
+		}
+		d := c.Modified.Sub(started)
+		if best == "" || d < bestDelta {
+			best, bestDelta = c.Path, d
+		}
+	}
+	return best
 }
 
 // InferState derives a state from a transcript alone, for sessions with no

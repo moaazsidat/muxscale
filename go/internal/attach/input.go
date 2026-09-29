@@ -25,10 +25,14 @@ const (
 	KeyCtrlD     NamedKey = "ctrl-d"
 	KeyCtrlR     NamedKey = "ctrl-r"
 	KeyCtrlL     NamedKey = "ctrl-l"
-	KeyPageUp    NamedKey = "pageup"
-	KeyPageDown  NamedKey = "pagedown"
-	KeyHome      NamedKey = "home"
-	KeyEnd       NamedKey = "end"
+	// KeyCtrlU clears the composer. On a phone there is no held-down
+	// backspace, so without this the only way to abandon a half-typed reply is
+	// to send it.
+	KeyCtrlU    NamedKey = "ctrl-u"
+	KeyPageUp   NamedKey = "pageup"
+	KeyPageDown NamedKey = "pagedown"
+	KeyHome     NamedKey = "home"
+	KeyEnd      NamedKey = "end"
 )
 
 var keyBytes = map[NamedKey]string{
@@ -44,6 +48,7 @@ var keyBytes = map[NamedKey]string{
 	KeyCtrlD:     "\x04",
 	KeyCtrlR:     "\x12",
 	KeyCtrlL:     "\x0c",
+	KeyCtrlU:     "\x15",
 	KeyPageUp:    "\x1b[5~",
 	KeyPageDown:  "\x1b[6~",
 	KeyHome:      "\x1b[H",

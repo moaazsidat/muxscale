@@ -31,11 +31,11 @@ const (
 
 // TermCapability describes what muxscale can do with a terminal.
 type TermCapability struct {
-	Kind      TermKind
-	Available bool   // the control binary exists
-	Enabled   bool   // remote control actually works right now
-	Reason    string // why not, and what to do about it
-	HowToFix  string
+	Kind      TermKind `json:"kind"`
+	Available bool     `json:"available"`        // the control binary exists
+	Enabled   bool     `json:"enabled"`          // remote control actually works right now
+	Reason    string   `json:"reason,omitempty"` // why not, and what to do about it
+	HowToFix  string   `json:"how_to_fix,omitempty"`
 }
 
 // DetectTerminals reports remote-control support for each known terminal.
@@ -78,16 +78,33 @@ func detectWezTerm() TermCapability {
 
 func detectITerm2() TermCapability {
 	c := TermCapability{Kind: TermITerm2}
-	// iTerm2's Python API needs its own runtime; AppleScript is the fallback
-	// and needs Automation permission, which cannot be probed without
-	// triggering a permission prompt. Report availability only.
 	if _, err := os.Stat("/Applications/iTerm.app"); err != nil {
 		c.Reason = "iTerm2 is not installed"
 		return c
 	}
 	c.Available = true
-	c.Reason = "iTerm2 control needs the Python API enabled and Automation permission"
-	c.HowToFix = "enable the Python API in iTerm2 > Settings > General > Magic"
+
+	// Probe the path muxscale actually uses: AppleScript session enumeration.
+	//
+	// Reporting "needs the Python API enabled" while the daemon was adopting
+	// panes over AppleScript made doctor contradict the daemon's own
+	// behaviour -- it said no terminal control while five sessions were
+	// writable. The probe is one Apple event, and the first one raises macOS's
+	// Automation prompt, which is exactly the moment to raise it: a user
+	// running doctor has asked what is missing and is watching the screen.
+	sessions, err := ITerm2Sessions()
+	switch {
+	case err != nil && strings.Contains(err.Error(), "is not running"):
+		c.Reason = "iTerm2 is not running"
+		c.HowToFix = "open iTerm2, then run `muxscale adopt` to pick up its sessions"
+	case err != nil:
+		c.Reason = err.Error()
+		c.HowToFix = "grant muxscale permission to control iTerm2 in " +
+			"System Settings > Privacy & Security > Automation"
+	default:
+		_ = sessions
+		c.Enabled = true
+	}
 	return c
 }
 

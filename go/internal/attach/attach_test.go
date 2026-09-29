@@ -241,8 +241,8 @@ func TestWrapResize(t *testing.T) {
 	if err := w.Resize(120, 40); err != nil {
 		t.Fatalf("Resize: %v", err)
 	}
-	if w.Cols != 120 || w.Rows != 40 {
-		t.Errorf("size = %dx%d, want 120x40", w.Cols, w.Rows)
+	if cols, rows := w.Size(); cols != 120 || rows != 40 {
+		t.Errorf("size = %dx%d, want 120x40", cols, rows)
 	}
 }
 

@@ -19,10 +19,15 @@ import (
 
 // Wrapped is an agent process running under a daemon-owned PTY.
 type Wrapped struct {
-	Cmd  *exec.Cmd
-	PTY  *os.File
-	Cols uint16
-	Rows uint16
+	Cmd *exec.Cmd
+	PTY *os.File
+
+	// cols and rows are the PTY's current size. Unexported, and read through
+	// Size, because Resize can change them from an HTTP handler while the
+	// drain goroutine is reading them -- which was a data race the moment
+	// remote resize existed.
+	cols uint16
+	rows uint16
 
 	mu       sync.Mutex
 	closed   bool
@@ -33,6 +38,13 @@ type Wrapped struct {
 	// writeMu serialises writes so two concurrent inputs cannot interleave
 	// bytes mid-escape-sequence.
 	writeMu sync.Mutex
+}
+
+// Size reports the PTY's current dimensions.
+func (w *Wrapped) Size() (cols, rows uint16) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.cols, w.rows
 }
 
 // WrapOptions configures a wrapped launch.
@@ -77,7 +89,7 @@ func Wrap(opt WrapOptions) (*Wrapped, error) {
 	}
 
 	w := &Wrapped{
-		Cmd: cmd, PTY: f, Cols: opt.Cols, Rows: opt.Rows,
+		Cmd: cmd, PTY: f, cols: opt.Cols, rows: opt.Rows,
 		exited: make(chan struct{}), exitCode: -1,
 	}
 	go w.reap()
@@ -138,7 +150,7 @@ func (w *Wrapped) Resize(cols, rows uint16) error {
 		return err
 	}
 	w.mu.Lock()
-	w.Cols, w.Rows = cols, rows
+	w.cols, w.rows = cols, rows
 	w.mu.Unlock()
 	return nil
 }

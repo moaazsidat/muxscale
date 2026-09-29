@@ -96,6 +96,12 @@ func (r *Registry) broadcast(c Change) {
 }
 
 // Upsert finds or creates a session by its natural key, applying mutate.
+//
+// The returned session is a copy, never the registry's own struct. Callers
+// marshal it to clients, and a client that read a session while a concurrent
+// state change was landing on the same memory was a data race `go test -race`
+// caught between this and SetState. Everything a caller needs from the result
+// -- the id, mostly -- is in the copy.
 func (r *Registry) Upsert(agentID, naturalKey string, mutate func(*protocol.Session)) *protocol.Session {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -122,9 +128,10 @@ func (r *Registry) Upsert(agentID, naturalKey string, mutate func(*protocol.Sess
 		mutate(s)
 	}
 	s.LastEventAt = time.Now()
-	cp := *s
-	r.broadcast(Change{Kind: ChangeSessionUpsert, Session: &cp})
-	return s
+	announced := *s
+	r.broadcast(Change{Kind: ChangeSessionUpsert, Session: &announced})
+	returned := *s
+	return &returned
 }
 
 // Insert registers a session under its existing ID, for restoring from disk.
@@ -138,12 +145,13 @@ func (r *Registry) Insert(s protocol.Session) *protocol.Session {
 	if s.ID == "" {
 		s.ID = newID()
 	}
-	cp := s
-	r.sessions[s.ID] = &cp
+	internal := s
+	r.sessions[s.ID] = &internal
 	r.byNatural[s.AgentID+"/"+s.NaturalKey] = s.ID
-	out := cp
-	r.broadcast(Change{Kind: ChangeSessionUpsert, Session: &out})
-	return &cp
+	announced := s
+	r.broadcast(Change{Kind: ChangeSessionUpsert, Session: &announced})
+	returned := s
+	return &returned
 }
 
 // Update mutates an existing session by ID, returning nil if there is none.

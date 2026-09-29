@@ -6,8 +6,10 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/muxscale/muxscale/go/internal/adapter"
 	"github.com/muxscale/muxscale/go/internal/adapter/claudecode"
@@ -30,6 +32,14 @@ type Manager struct {
 	tailers map[string]*claudecode.Tailer // muxscale session id -> transcript tailer
 	screens map[string]*vt.Emulator       // muxscale session id -> screen state
 
+	// sampled is guarded by screenMu, not mu. See sampleScreen.
+	//
+	// sampled holds a screen reconstructed from an adopted terminal's own
+	// idea of its contents, for sessions muxscale has no pty for. Kept
+	// between polls rather than rebuilt each time so the grid-diffing that
+	// drives the stream still produces small deltas.
+	sampled map[string]*vt.Emulator
+
 	// closing records sessions a human asked to end, so their exit-by-signal is
 	// reported as "closed" rather than "crashed".
 	closing map[string]bool
@@ -38,9 +48,24 @@ type Manager struct {
 	// already-running session becomes writable without changing anyone's habits.
 	tmuxTargets map[string]string
 
+	// termctlTargets maps a session to a terminal-emulator pane adopted through
+	// that emulator's scripting interface. This is the last resort and the one
+	// that covers the common case: an agent already running in an ordinary
+	// terminal window, started long before the daemon, in no multiplexer.
+	termctlTargets map[string]attach.TermTarget
+
+	// termctlWarnOnce keeps a standing failure -- almost always a denied
+	// Automation permission -- from being logged on every scan.
+	termctlWarnOnce sync.Once
+
 	// screenMu guards emulator writes/reads separately from the map, so a
 	// client reading a snapshot never blocks the PTY drain loop for long.
 	screenMu sync.Mutex
+
+	// scanMu serializes discovery passes. The loop runs one every few seconds
+	// and `muxscale adopt` runs one on demand; two at once would race to adopt
+	// the same pane and could double-match a transcript.
+	scanMu sync.Mutex
 }
 
 // NewManager wires a registry to durable storage.
@@ -51,11 +76,13 @@ type Manager struct {
 func NewManager(reg *Registry, adapters *adapter.Registry, st *store.Store, log *slog.Logger) *Manager {
 	m := &Manager{
 		reg: reg, adapters: adapters, store: st, log: log,
-		wrapped:     map[string]*attach.Wrapped{},
-		tailers:     map[string]*claudecode.Tailer{},
-		screens:     map[string]*vt.Emulator{},
-		closing:     map[string]bool{},
-		tmuxTargets: map[string]string{},
+		wrapped:        map[string]*attach.Wrapped{},
+		tailers:        map[string]*claudecode.Tailer{},
+		screens:        map[string]*vt.Emulator{},
+		closing:        map[string]bool{},
+		tmuxTargets:    map[string]string{},
+		termctlTargets: map[string]attach.TermTarget{},
+		sampled:        map[string]*vt.Emulator{},
 	}
 	go m.persistLoop()
 	return m
@@ -310,7 +337,7 @@ func (m *Manager) ScreenClone(sessionID string) (*vt.Grid, bool) {
 	em := m.screens[sessionID]
 	m.mu.RUnlock()
 	if em == nil {
-		return nil, false
+		return m.sampleScreen(sessionID)
 	}
 	m.screenMu.Lock()
 	defer m.screenMu.Unlock()
@@ -322,7 +349,8 @@ func (m *Manager) superviseWrapped(sessionID string, w *attach.Wrapped) {
 	// Draining is mandatory regardless of whether anyone is watching: an unread
 	// PTY fills its buffer and blocks the agent, which would look like a hang
 	// caused by muxscale.
-	em := vt.NewEmulator(int(w.Cols), int(w.Rows))
+	cols, rows := w.Size()
+	em := vt.NewEmulator(int(cols), int(rows))
 	m.mu.Lock()
 	m.screens[sessionID] = em
 	m.mu.Unlock()
@@ -377,7 +405,11 @@ func (m *Manager) Screen(sessionID string) (vt.Snapshot, bool) {
 	em := m.screens[sessionID]
 	m.mu.RUnlock()
 	if em == nil {
-		return vt.Snapshot{}, false
+		g, ok := m.sampleScreen(sessionID)
+		if !ok {
+			return vt.Snapshot{}, false
+		}
+		return g.Snapshot(), true
 	}
 	m.screenMu.Lock()
 	defer m.screenMu.Unlock()
@@ -390,11 +422,93 @@ func (m *Manager) ScreenText(sessionID string) (string, bool) {
 	em := m.screens[sessionID]
 	m.mu.RUnlock()
 	if em == nil {
-		return "", false
+		// No pty of our own. An adopted terminal pane can still be read, by
+		// asking its emulator what it is showing.
+		g, ok := m.sampleScreen(sessionID)
+		if !ok {
+			return "", false
+		}
+		return g.Text(), true
 	}
 	m.screenMu.Lock()
 	defer m.screenMu.Unlock()
 	return em.Grid().Text(), true
+}
+
+// sampleScreen reconstructs an adopted session's screen from what its terminal
+// emulator reports.
+//
+// This is a sample, not a stream: it is whatever the window looked like at the
+// moment it was asked, with no colour, because the emulator's scripting
+// interface hands back plain text. It exists so the same grid endpoints work
+// for a session muxscale merely adopted as for one it owns -- a client should
+// not need a second code path to look at a terminal -- and clients are told
+// which they have through the session's attachment. See attach.SampledNotice.
+func (m *Manager) sampleScreen(sessionID string) (*vt.Grid, bool) {
+	m.mu.RLock()
+	term, ok := m.termctlTargets[sessionID]
+	m.mu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+	text, err := term.Text()
+	if err != nil {
+		if attach.IsTargetStale(err) {
+			m.mu.Lock()
+			delete(m.termctlTargets, sessionID)
+			m.mu.Unlock()
+			m.screenMu.Lock()
+			delete(m.sampled, sessionID)
+			m.screenMu.Unlock()
+		}
+		m.log.Debug("sampling an adopted terminal failed", "session", sessionID, "err", err)
+		return nil, false
+	}
+
+	cols, rows := textDimensions(text)
+
+	// sampled is guarded by screenMu rather than mu, so that the emulator and
+	// the map holding it are under one lock. Two locks here was a nesting
+	// order nothing else in this file uses, and the first bug in it left mu
+	// held by a panicking request and wedged every later one.
+	m.screenMu.Lock()
+	defer m.screenMu.Unlock()
+	em := m.sampled[sessionID]
+	if em == nil {
+		em = vt.NewEmulator(cols, rows)
+		m.sampled[sessionID] = em
+	}
+
+	em.Resize(cols, rows)
+	// Home and erase first: this is a whole-screen replacement, and without it
+	// a shorter frame would leave the previous one'"'"'s tail on screen.
+	_, _ = em.Write([]byte("\x1b[H\x1b[2J"))
+	_, _ = em.Write([]byte(strings.ReplaceAll(text, "\n", "\r\n")))
+	return em.Grid().Clone(), true
+}
+
+// textDimensions sizes a grid to hold a block of text.
+//
+// Width is counted in runes, not bytes, or a screen with any non-ASCII on it
+// would be sized too wide and render with a ragged right edge.
+func textDimensions(text string) (cols, rows int) {
+	for _, line := range strings.Split(text, "\n") {
+		if n := utf8.RuneCountInString(strings.TrimRight(line, "\r")); n > cols {
+			cols = n
+		}
+		rows++
+	}
+	return clamp(cols, 20, 400), clamp(rows, 5, 200)
+}
+
+func clamp(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
 }
 
 // SendInput delivers input to a session, honouring its fence.
@@ -425,6 +539,7 @@ func (m *Manager) SendInput(sessionID string, text string, key attach.NamedKey, 
 	m.mu.RLock()
 	w := m.wrapped[sessionID]
 	target := m.tmuxTargets[sessionID]
+	term, viaTerm := m.termctlTargets[sessionID]
 	m.mu.RUnlock()
 
 	switch {
@@ -434,6 +549,17 @@ func (m *Manager) SendInput(sessionID string, text string, key attach.NamedKey, 
 		}
 	case target != "":
 		if err := attach.SendKeys(target, payload); err != nil {
+			return err
+		}
+	case viaTerm:
+		if err := term.SendText(payload); err != nil {
+			// The target is gone or has moved. Drop it so the next scan can
+			// re-adopt rather than leaving a target that fails forever.
+			if attach.IsTargetStale(err) {
+				m.mu.Lock()
+				delete(m.termctlTargets, sessionID)
+				m.mu.Unlock()
+			}
 			return err
 		}
 	default:
@@ -466,6 +592,66 @@ func (m *Manager) Kill(sessionID string) error {
 	return w.Close(5 * time.Second)
 }
 
+// AdoptReport describes what a discovery pass found and what it can reach.
+type AdoptReport struct {
+	Sessions  []AdoptRow              `json:"sessions"`
+	Terminals []attach.TermCapability `json:"terminals"`
+	Note      string                  `json:"note,omitempty"`
+}
+
+// AdoptRow is one session as the adoption pass left it.
+type AdoptRow struct {
+	ID             string              `json:"id"`
+	AgentID        string              `json:"agent_id"`
+	Title          string              `json:"title,omitempty"`
+	Cwd            string              `json:"cwd,omitempty"`
+	Attachment     protocol.Attachment `json:"attachment"`
+	Fidelity       protocol.Fidelity   `json:"fidelity"`
+	Writable       bool                `json:"writable"`
+	TranscriptPath string              `json:"transcript_path,omitempty"`
+}
+
+// AdoptNow runs a discovery pass immediately and reports the result.
+//
+// The loop already runs every few seconds, so this is not how sessions get
+// adopted -- it is how a user finds out what happened after they changed
+// something (enabled terminal remote control, installed the shims, started the
+// daemon) without waiting for the next tick and guessing. The report says both
+// what muxscale reached and what it could reach if a setting were changed,
+// because "read-only" with no explanation is the answer that wastes people's
+// afternoons.
+func (m *Manager) AdoptNow() AdoptReport {
+	m.scanOnce()
+
+	rep := AdoptReport{Sessions: m.adoptRows(), Terminals: attach.DetectTerminals()}
+	if len(rep.Sessions) == 0 {
+		rep.Note = "no agent sessions found on this machine"
+	}
+	return rep
+}
+
+// adoptRows describes every live session and whether muxscale can type into it.
+func (m *Manager) adoptRows() []AdoptRow {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var rows []AdoptRow
+	for _, s := range m.reg.List() {
+		if s.State.Terminal() {
+			continue
+		}
+		_, wrapped := m.wrapped[s.ID]
+		tmuxTarget := m.tmuxTargets[s.ID]
+		_, termctl := m.termctlTargets[s.ID]
+		rows = append(rows, AdoptRow{
+			ID: s.ID, AgentID: s.AgentID, Title: s.Title, Cwd: s.Cwd,
+			Attachment: s.Attachment, Fidelity: s.Fidelity,
+			Writable:       wrapped || tmuxTarget != "" || termctl,
+			TranscriptPath: s.TranscriptPath,
+		})
+	}
+	return rows
+}
+
 // DiscoverLoop periodically scans for agent processes muxscale did not launch.
 func (m *Manager) DiscoverLoop(stop <-chan struct{}, interval time.Duration) {
 	if interval == 0 {
@@ -485,6 +671,12 @@ func (m *Manager) DiscoverLoop(stop <-chan struct{}, interval time.Duration) {
 }
 
 func (m *Manager) scanOnce() {
+	m.scanMu.Lock()
+	defer m.scanMu.Unlock()
+	m.scanOnceLocked()
+}
+
+func (m *Manager) scanOnceLocked() {
 	m.scanTmux()
 
 	procs, err := attach.Discover()
@@ -492,6 +684,7 @@ func (m *Manager) scanOnce() {
 		m.log.Debug("discovery failed", "err", err)
 		return
 	}
+	panes := m.terminalPanes(procs)
 	for _, p := range procs {
 		agentID := m.identify(p.Command, p.Args)
 		if agentID == "" {
@@ -504,8 +697,14 @@ func (m *Manager) scanOnce() {
 		}
 		natural := "pid:" + strconv.Itoa(p.Pid)
 		sess := m.reg.Upsert(agentID, natural, func(s *protocol.Session) {
-			if s.Attachment == protocol.AttachWrap || s.Attachment == protocol.AttachNative {
-				return // a better attachment already owns this session
+			if attachRank(s.Attachment) > attachRank(protocol.AttachTranscript) {
+				// Something better already owns this session. The scan runs
+				// every few seconds, so downgrading here would undo an
+				// adoption on the very next tick -- which it did, silently,
+				// leaving sessions writable in memory and read-only on the
+				// wire.
+				s.Cwd = p.Cwd
+				return
 			}
 			s.Cwd = p.Cwd
 			s.Attachment = protocol.AttachTranscript
@@ -524,8 +723,8 @@ func (m *Manager) scanOnce() {
 			if s, ok := m.reg.Get(sess.ID); ok {
 				path := s.TranscriptPath
 				if path == "" && p.Cwd != "" {
-					if files, err := claudecode.FindTranscripts(p.Cwd); err == nil && len(files) > 0 {
-						path = files[0]
+					path = m.matchTranscript(p)
+					if path != "" {
 						m.reg.Upsert(agentID, natural, func(t *protocol.Session) {
 							t.TranscriptPath = path
 						})
@@ -535,6 +734,8 @@ func (m *Manager) scanOnce() {
 			}
 		}
 
+		m.adoptTerminalPane(sess.ID, agentID, natural, p, panes)
+
 		if s, ok := m.reg.Get(sess.ID); ok && s.State == protocol.StateStarting {
 			m.reg.SetState(sess.ID, protocol.StateGuess{
 				State: protocol.StateUnknown, Confidence: 0.5,
@@ -543,6 +744,84 @@ func (m *Manager) scanOnce() {
 			})
 		}
 	}
+}
+
+// terminalPanes lists adoptable emulator panes, but only when this scan found
+// an agent that could use one.
+//
+// The enumeration costs an Apple event round trip. On a machine with no
+// unadopted agent in a scriptable terminal -- which is every machine where the
+// shims did their job -- that round trip buys nothing, and this loop runs every
+// few seconds forever.
+func (m *Manager) terminalPanes(procs []attach.Process) map[string]attach.TermTarget {
+	wanted := false
+	for _, p := range procs {
+		if strings.HasPrefix(p.WritableVia(), "termctl:") && !m.hasWrappedPid(p.Pid) {
+			wanted = true
+			break
+		}
+	}
+	if !wanted {
+		return nil
+	}
+	panes, err := attach.AdoptableTerminalPanes()
+	if err != nil {
+		// Once, not every three seconds. The usual cause is a denied
+		// Automation permission, which is a standing condition: repeating it
+		// would bury everything else in the log without telling anyone
+		// anything new.
+		m.termctlWarnOnce.Do(func() {
+			m.log.Warn("cannot adopt sessions from the terminal emulator", "err", err)
+		})
+		return nil
+	}
+	return panes
+}
+
+// adoptTerminalPane gives a discovered session a writable channel through its
+// terminal emulator, when it has no better one.
+//
+// "No better one" is the whole condition: a wrapped PTY and a tmux pane are
+// both live streams, and this is a 2 Hz sample of someone else's window. It is
+// the mechanism of last resort, and the only one that reaches a session the
+// user started before muxscale was running.
+func (m *Manager) adoptTerminalPane(sessionID, agentID, natural string, p attach.Process, panes map[string]attach.TermTarget) {
+	if len(panes) == 0 {
+		return
+	}
+	dev := attach.DevPath(p.TTY)
+	if dev == "" {
+		return
+	}
+	target, ok := panes[dev]
+	if !ok {
+		return
+	}
+
+	m.mu.Lock()
+	if _, already := m.termctlTargets[sessionID]; already {
+		m.mu.Unlock()
+		return
+	}
+	if m.tmuxTargets[sessionID] != "" || m.wrapped[sessionID] != nil {
+		m.mu.Unlock()
+		return
+	}
+	target.Pid, target.Started = p.Pid, p.Started
+	m.termctlTargets[sessionID] = target
+	m.mu.Unlock()
+
+	m.reg.Upsert(agentID, natural, func(s *protocol.Session) {
+		if attachRank(s.Attachment) > attachRank(protocol.AttachTermctl) {
+			return
+		}
+		s.Attachment = protocol.AttachTermctl
+		s.Fidelity = protocol.FidelityStructured
+	})
+	m.log.Info("adopted a session through its terminal",
+		"session", sessionID, "terminal", target.Kind, "tty", dev)
+	_ = m.store.Audit("muxscale", "session_adopted", sessionID,
+		fmt.Sprintf("termctl=%s tty=%s", target.Kind, dev))
 }
 
 // Reconcile drops weaker duplicates of a session.
@@ -572,8 +851,27 @@ func (m *Manager) Reconcile(keepID, transcriptPath string) {
 
 		m.mu.Lock()
 		delete(m.tailers, other.ID)
+		delete(m.termctlTargets, other.ID)
 		m.mu.Unlock()
 	}
+}
+
+// attachRank orders attachments by capability, so a scan that finds a session
+// a second way can never trade a live channel for a weaker one.
+func attachRank(a protocol.Attachment) int {
+	switch a {
+	case protocol.AttachNative:
+		return 5
+	case protocol.AttachWrap:
+		return 4
+	case protocol.AttachTmux:
+		return 3
+	case protocol.AttachTermctl:
+		return 2
+	case protocol.AttachTranscript:
+		return 1
+	}
+	return 0
 }
 
 // fidelityRank orders attachments by capability, so reconciliation keeps the
@@ -590,6 +888,39 @@ func fidelityRank(f protocol.Fidelity) int {
 		return 1
 	}
 	return 0
+}
+
+// matchTranscript finds the transcript belonging to a discovered process.
+//
+// The join is on start time, not on "newest file in the project directory":
+// two agents can share one project, and picking the most recently written file
+// would hand a freshly discovered session its neighbour's conversation -- which
+// looks like success until someone reads the transcript on their phone.
+func (m *Manager) matchTranscript(p attach.Process) string {
+	if p.Cwd == "" {
+		return ""
+	}
+	cands, err := claudecode.TranscriptCandidates(p.Cwd)
+	if err != nil {
+		m.log.Debug("listing transcript candidates failed", "cwd", p.Cwd, "err", err)
+		return ""
+	}
+	return claudecode.PickTranscript(cands, p.Started, m.claimedTranscripts())
+}
+
+// claimedTranscripts is every transcript file a live session already owns.
+//
+// Read fresh on each call rather than cached: the discovery loop claims files
+// as it goes, and within one scan two processes in the same project would
+// otherwise both be matched to the same transcript.
+func (m *Manager) claimedTranscripts() map[string]bool {
+	claimed := map[string]bool{}
+	for _, s := range m.reg.List() {
+		if s.TranscriptPath != "" && !s.State.Terminal() {
+			claimed[s.TranscriptPath] = true
+		}
+	}
+	return claimed
 }
 
 // EnsureTailer starts following a session's transcript file if it is not
@@ -724,11 +1055,11 @@ func (m *Manager) scanTmux() {
 			})
 		}
 		if agentID == "claude-code" && p.Path != "" {
-			if files, err := claudecode.FindTranscripts(p.Path); err == nil && len(files) > 0 {
+			if path := m.matchTranscript(attach.Process{Cwd: p.Path}); path != "" {
 				m.reg.Upsert(agentID, natural, func(t *protocol.Session) {
-					t.TranscriptPath = files[0]
+					t.TranscriptPath = path
 				})
-				m.EnsureTailer(sess.ID, files[0])
+				m.EnsureTailer(sess.ID, path)
 			}
 		}
 	}
