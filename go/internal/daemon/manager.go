@@ -769,6 +769,22 @@ func (m *Manager) scanOnceLocked() {
 		if agentID == "claude-code" {
 			if s, ok := m.reg.Get(sess.ID); ok {
 				path := s.TranscriptPath
+				if own := claudecode.ProcessTranscript(p.Pid, p.Started, p.Cwd); own != "" && own != path {
+					// The process says which file is its own. Either the
+					// match was a guess that picked a neighbour's, or the
+					// session moved to another with /resume or /clear; the
+					// history read so far is someone else's, so read again.
+					if path != "" {
+						m.log.Info("following the transcript a session says is its own",
+							"session", sess.ID, "pid", p.Pid, "was", path, "now", own)
+						m.Retail(sess.ID, own)
+					} else {
+						m.reg.Upsert(agentID, natural, func(t *protocol.Session) {
+							t.TranscriptPath = own
+						})
+					}
+					path = own
+				}
 				if path == "" && p.Cwd != "" {
 					path = m.matchTranscript(p)
 					if path != "" {
