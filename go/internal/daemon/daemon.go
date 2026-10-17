@@ -305,6 +305,10 @@ func (d *Daemon) tokenMatches(r *http.Request) bool {
 	return subtle.ConstantTimeCompare([]byte(got), []byte(d.cfg.LocalToken)) == 1
 }
 
+// How often /v1/events writes a keepalive when there is nothing to send. Well
+// under the app's silence timeout (45s), so one late ping is not a reconnect.
+var eventsKeepalive = 15 * time.Second
+
 // routes registers the local control API used by the CLI.
 func (d *Daemon) routes(mux *http.ServeMux) {
 	// Terminal-shaped endpoints (shell, resize, grid stream) live in screen.go.
@@ -609,11 +613,24 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 		ch, cancel := d.reg.Subscribe()
 		defer cancel()
 
+		// A comment line on a quiet stream. Without it an idle connection
+		// carries no bytes at all, so a client cannot tell "nothing has
+		// happened" from "the network went away" -- a phone that changed
+		// networks would show live forever and receive nothing. Clients treat
+		// a long enough silence as a dead connection and reconnect.
+		ping := time.NewTicker(eventsKeepalive)
+		defer ping.Stop()
+
 		enc := json.NewEncoder(w)
 		for {
 			select {
 			case <-r.Context().Done():
 				return
+			case <-ping.C:
+				if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {
+					return
+				}
+				flusher.Flush()
 			case c, ok := <-ch:
 				if !ok {
 					return
