@@ -100,6 +100,9 @@ pub struct Session {
     pub agent_id: String,
     #[serde(default)]
     pub title: String,
+    /// The name a person gave the session; wins over `title` when set.
+    #[serde(default)]
+    pub name: String,
     #[serde(default)]
     pub cwd: String,
     #[serde(default)]

@@ -275,7 +275,8 @@ impl From<&Session> for SessionSummary {
         SessionSummary {
             id: s.id.clone(),
             agent_id: s.agent_id.clone(),
-            title: s.title.clone(),
+            // What a list shows: the name a person gave it, else the agent's own.
+            title: if s.name.is_empty() { s.title.clone() } else { s.name.clone() },
             cwd: s.cwd.clone(),
             git_branch: s.git_branch.clone(),
             model: s.model.clone(),

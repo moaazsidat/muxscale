@@ -1016,6 +1016,7 @@ func (m *Manager) tailLoop(sessionID string, tl *claudecode.Tailer) {
 			continue
 		}
 		misses = 0
+		m.applyMeta(sessionID, meta)
 		if len(events) == 0 {
 			// Nothing new, which is itself news: inference said "running"
 			// when the last line landed, and only a later look can see that it
@@ -1030,23 +1031,6 @@ func (m *Manager) tailLoop(sessionID string, tl *claudecode.Tailer) {
 			events[i].SessionID = sessionID
 			m.reg.AppendEvent(events[i])
 		}
-
-		// Metadata recovered from the transcript is free enrichment: title,
-		// branch, and model without asking the agent anything.
-		m.reg.Upsert("claude-code", naturalOf(m.reg, sessionID), func(s *protocol.Session) {
-			if meta.Title != "" {
-				s.Title = meta.Title
-			}
-			if meta.GitBranch != "" {
-				s.GitBranch = meta.GitBranch
-			}
-			if meta.Model != "" {
-				s.Model = meta.Model
-			}
-			if meta.Version != "" {
-				s.AgentVer = meta.Version
-			}
-		})
 
 		// Only infer state for sessions with no authoritative hook source: a
 		// guess must never override what the agent told us directly.
@@ -1077,6 +1061,71 @@ func (m *Manager) reinfer(sessionID string, tl *claudecode.Tailer, last []protoc
 	if guess := claudecode.InferState(last, fi.ModTime(), 6*time.Second); guess.State != s.State {
 		m.reg.SetState(sessionID, guess)
 	}
+}
+
+// applyMeta copies what a transcript says about its session onto the row:
+// title, name, branch and model, for free, without asking the agent anything.
+// Applied whether or not the chunk held any conversation, since a /rename is a
+// line of its own.
+func (m *Manager) applyMeta(sessionID string, meta claudecode.Meta) {
+	if meta.Title == "" && meta.CustomTitle == nil && meta.GitBranch == "" &&
+		meta.Model == "" && meta.Version == "" {
+		return
+	}
+	m.reg.Upsert("claude-code", naturalOf(m.reg, sessionID), func(s *protocol.Session) {
+		if meta.Title != "" {
+			s.Title = meta.Title
+		}
+		if meta.CustomTitle != nil {
+			s.Name = *meta.CustomTitle
+		}
+		if meta.GitBranch != "" {
+			s.GitBranch = meta.GitBranch
+		}
+		if meta.Model != "" {
+			s.Model = meta.Model
+		}
+		if meta.Version != "" {
+			s.AgentVer = meta.Version
+		}
+	})
+}
+
+// maxNameLen bounds a session name: long enough for any title a person would
+// type, short enough that nobody can park a document in the session list.
+const maxNameLen = 120
+
+// Rename gives a session a name of the person's choosing, or clears it when
+// name is empty.
+//
+// For a Claude Code session the name is also written where Claude Code keeps
+// its own, so `claude --resume` shows it and a /rename in the terminal and a
+// rename from the phone are one setting, not two that drift. The tailer then
+// reads that entry back like any other, which keeps the transcript the single
+// record. Every other agent's name lives in muxscale only.
+func (m *Manager) Rename(sessionID, name, actor string) (*protocol.Session, error) {
+	name = strings.Join(strings.Fields(name), " ")
+	if utf8.RuneCountInString(name) > maxNameLen {
+		return nil, fmt.Errorf("a name can be at most %d characters", maxNameLen)
+	}
+	sess, ok := m.reg.Get(sessionID)
+	if !ok {
+		return nil, fmt.Errorf("unknown session %s", sessionID)
+	}
+	if sess.AgentID == "claude-code" && sess.TranscriptPath != "" {
+		agentSession := strings.TrimSuffix(filepath.Base(sess.TranscriptPath), ".jsonl")
+		if err := claudecode.SetCustomTitle(sess.TranscriptPath, agentSession, name); err != nil {
+			// The name still holds in muxscale; only the terminal side missed it.
+			m.log.Warn("could not write the name into the transcript",
+				"session", sessionID, "err", err)
+		}
+	}
+	updated := m.reg.Update(sessionID, func(s *protocol.Session) { s.Name = name })
+	if updated == nil {
+		return nil, fmt.Errorf("unknown session %s", sessionID)
+	}
+	_ = m.store.Audit(actor, "session_renamed", sessionID, "")
+	return updated, nil
 }
 
 // naturalOf looks up a session's natural key so Upsert targets the right row.

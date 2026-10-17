@@ -73,7 +73,11 @@ type Session struct {
 	// AgentID it identifies the session across daemon restarts and resumes.
 	NaturalKey string `json:"natural_key"`
 
-	Title      string     `json:"title,omitempty"` // e.g. Claude Code's ai-title
+	Title string `json:"title,omitempty"` // e.g. Claude Code's ai-title
+	// Name is the title a person gave the session, from a client or the
+	// agent's own rename command. Wins over Title, which the agent makes up
+	// for itself and may change at any time.
+	Name       string     `json:"name,omitempty"`
 	Cwd        string     `json:"cwd"`
 	GitBranch  string     `json:"git_branch,omitempty"`
 	Model      string     `json:"model,omitempty"`

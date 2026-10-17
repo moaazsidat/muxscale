@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   agent_id        TEXT NOT NULL,
   natural_key     TEXT NOT NULL,
   title           TEXT,
+  name            TEXT,
   cwd             TEXT,
   git_branch      TEXT,
   model           TEXT,
@@ -109,10 +110,38 @@ func Open(dir string) (*Store, error) {
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("migrating %s: %w", path, err)
 	}
+	// Columns added after the first release. CREATE TABLE IF NOT EXISTS leaves
+	// an existing table alone, so each is added here when it is missing.
+	if err := addColumn(db, "sessions", "name", "TEXT"); err != nil {
+		return nil, fmt.Errorf("migrating %s: %w", path, err)
+	}
 	if err := os.Chmod(path, 0o600); err != nil {
 		return nil, err
 	}
 	return &Store{db: db, path: path}, nil
+}
+
+// addColumn adds a column to a table that lacks it.
+func addColumn(db *sql.DB, table, column, typ string) error {
+	rows, err := db.Query(`SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, typ))
+	return err
 }
 
 // Close releases the database.
@@ -129,20 +158,20 @@ func (s *Store) SaveSession(sess *protocol.Session) error {
 		endedAt = sess.StateSince.UnixMilli()
 	}
 	_, err := s.db.Exec(`
-INSERT INTO sessions (id, agent_id, natural_key, title, cwd, git_branch, model,
+INSERT INTO sessions (id, agent_id, natural_key, title, name, cwd, git_branch, model,
   agent_version, attachment, fidelity, state, state_since, guess_json, prompt_id,
   transcript_path, created_at, last_event_at, ended_at)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(agent_id, natural_key) DO UPDATE SET
-  title=excluded.title, cwd=excluded.cwd, git_branch=excluded.git_branch,
+  title=excluded.title, name=excluded.name, cwd=excluded.cwd, git_branch=excluded.git_branch,
   model=excluded.model, agent_version=excluded.agent_version,
   attachment=excluded.attachment, fidelity=excluded.fidelity,
   state=excluded.state, state_since=excluded.state_since,
   guess_json=excluded.guess_json, prompt_id=excluded.prompt_id,
   transcript_path=excluded.transcript_path, last_event_at=excluded.last_event_at,
   ended_at=excluded.ended_at`,
-		sess.ID, sess.AgentID, sess.NaturalKey, sess.Title, sess.Cwd, sess.GitBranch,
-		sess.Model, sess.AgentVer, string(sess.Attachment), string(sess.Fidelity),
+		sess.ID, sess.AgentID, sess.NaturalKey, sess.Title, sess.Name, sess.Cwd,
+		sess.GitBranch, sess.Model, sess.AgentVer, string(sess.Attachment), string(sess.Fidelity),
 		string(sess.State), sess.StateSince.UnixMilli(), string(guess), sess.PromptID,
 		sess.TranscriptPath, sess.CreatedAt.UnixMilli(), sess.LastEventAt.UnixMilli(), endedAt)
 	return err
@@ -156,7 +185,7 @@ ON CONFLICT(agent_id, natural_key) DO UPDATE SET
 // live.
 func (s *Store) LoadSessions() ([]protocol.Session, error) {
 	rows, err := s.db.Query(`
-SELECT id, agent_id, natural_key, COALESCE(title,''), COALESCE(cwd,''),
+SELECT id, agent_id, natural_key, COALESCE(title,''), COALESCE(name,''), COALESCE(cwd,''),
        COALESCE(git_branch,''), COALESCE(model,''), COALESCE(agent_version,''),
        COALESCE(attachment,''), COALESCE(fidelity,''), state, state_since,
        COALESCE(guess_json,''), COALESCE(prompt_id,''), COALESCE(transcript_path,''),
@@ -175,7 +204,7 @@ FROM sessions ORDER BY last_event_at DESC`)
 			stateSince, created, last int64
 			guessJSON                 string
 		)
-		if err := rows.Scan(&sess.ID, &sess.AgentID, &sess.NaturalKey, &sess.Title,
+		if err := rows.Scan(&sess.ID, &sess.AgentID, &sess.NaturalKey, &sess.Title, &sess.Name,
 			&sess.Cwd, &sess.GitBranch, &sess.Model, &sess.AgentVer, &attachment,
 			&fidelity, &st, &stateSince, &guessJSON, &sess.PromptID,
 			&sess.TranscriptPath, &created, &last); err != nil {

@@ -62,3 +62,34 @@ func TestRewriteEventsOnce(t *testing.T) {
 		t.Fatalf("another agent's transcript was rewritten: %+v", other)
 	}
 }
+
+func TestSessionNamePersistsAndOldDatabasesMigrate(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A database from before names: drop the column and reopen.
+	if _, err := st.db.Exec(`ALTER TABLE sessions DROP COLUMN name`); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	if st, err = Open(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	now := time.Now()
+	in := protocol.Session{ID: "s", AgentID: "claude-code", NaturalKey: "k", Title: "auto", Name: "mine",
+		State: protocol.StateIdle, StateSince: now, CreatedAt: now, LastEventAt: now}
+	if err := st.SaveSession(&in); err != nil {
+		t.Fatal(err)
+	}
+	out, err := st.LoadSessions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 1 || out[0].Name != "mine" || out[0].Title != "auto" {
+		t.Fatalf("loaded %+v", out)
+	}
+}

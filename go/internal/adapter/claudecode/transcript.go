@@ -39,10 +39,13 @@ type entry struct {
 	Message          json.RawMessage `json:"message"`
 
 	// Sidecar entry types that carry session metadata rather than conversation.
-	AITitle    string `json:"aiTitle"`
-	LastPrompt string `json:"lastPrompt"`
-	Mode       string `json:"mode"`
-	PermMode   string `json:"permissionMode"`
+	AITitle string `json:"aiTitle"`
+	// CustomTitle is what /rename set. A pointer, because renaming to nothing
+	// clears the name and has to be told apart from an entry without one.
+	CustomTitle *string `json:"customTitle"`
+	LastPrompt  string  `json:"lastPrompt"`
+	Mode        string  `json:"mode"`
+	PermMode    string  `json:"permissionMode"`
 }
 
 // message is the Anthropic Messages API shape as persisted.
@@ -79,13 +82,17 @@ type contentBlock struct {
 
 // Meta is session-level metadata recovered from a transcript.
 type Meta struct {
-	SessionID  string
-	Cwd        string
-	GitBranch  string
-	Model      string
-	Version    string
-	Title      string
-	LastPrompt string
+	SessionID string
+	Cwd       string
+	GitBranch string
+	Model     string
+	Version   string
+	Title     string
+	// CustomTitle is the last name set by /rename (or by muxscale on its
+	// behalf), nil when the transcript holds none. Last one wins, as in
+	// Claude Code itself.
+	CustomTitle *string
+	LastPrompt  string
 }
 
 // excerptBytes caps how much of any single text or tool output we retain
@@ -129,6 +136,12 @@ func ParseTranscript(r io.Reader) ([]protocol.TranscriptEvent, Meta, error) {
 		case "ai-title":
 			if e.AITitle != "" {
 				meta.Title = e.AITitle
+			}
+			continue
+		case "custom-title":
+			if e.CustomTitle != nil {
+				name := strings.TrimSpace(*e.CustomTitle)
+				meta.CustomTitle = &name
 			}
 			continue
 		case "last-prompt":
