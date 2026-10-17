@@ -533,9 +533,34 @@ func (m *Manager) SendInput(sessionID string, text string, key attach.NamedKey, 
 		}
 		payload = b
 	} else {
-		payload = attach.EncodeText(text, submit)
+		payload = attach.EncodeText(text, false)
 	}
 
+	if err := m.deliver(sessionID, payload); err != nil {
+		return err
+	}
+	// The carriage return goes in a write of its own, after a pause. Agent
+	// TUIs (Claude Code among them) treat a burst of bytes arriving at once as
+	// a paste, and a return inside a paste is a newline in the composer, not a
+	// submit -- so text+"\r" in one write left replies sitting in the box.
+	if key == "" && submit {
+		time.Sleep(submitDelay)
+		if err := m.deliver(sessionID, []byte("\r")); err != nil {
+			return err
+		}
+	}
+	// Record that input happened and how much, never the content by default.
+	_ = m.store.Audit(actor, "input_sent", sessionID,
+		fmt.Sprintf("key=%s bytes=%d submit=%v", key, len(payload), submit))
+	return nil
+}
+
+// submitDelay separates typed text from the return that submits it, long
+// enough that the TUI has finished handling the text as its own input.
+const submitDelay = 150 * time.Millisecond
+
+// deliver writes raw bytes to whatever terminal the session is reachable by.
+func (m *Manager) deliver(sessionID string, payload []byte) error {
 	m.mu.RLock()
 	w := m.wrapped[sessionID]
 	target := m.tmuxTargets[sessionID]
@@ -571,9 +596,6 @@ func (m *Manager) SendInput(sessionID string, text string, key attach.NamedKey, 
 				"run it inside tmux, or enable remote control in your terminal "+
 				"(kitty, WezTerm, or iTerm2)", sessionID)
 	}
-	// Record that input happened and how much, never the content by default.
-	_ = m.store.Audit(actor, "input_sent", sessionID,
-		fmt.Sprintf("key=%s bytes=%d submit=%v", key, len(payload), submit))
 	return nil
 }
 
