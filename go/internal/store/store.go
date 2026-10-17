@@ -234,6 +234,89 @@ ON CONFLICT(session_id, seq) DO NOTHING`)
 	return tx.Commit()
 }
 
+// RewriteEventsOnce passes every stored event of one kind, from one agent's
+// sessions, through fn, which returns the event to keep (changed or not) or
+// false to delete it. It runs once per name, recorded in meta.
+//
+// Stored events are otherwise never rewritten: AppendEvents ignores a seq it
+// already has. This exists for the one case that needs it, a parser that
+// learned to read something it used to misread, so that history already in the
+// store reads the same as what arrives from now on.
+func (s *Store) RewriteEventsOnce(
+	name, agentID string,
+	kind protocol.EventKind,
+	fn func(protocol.TranscriptEvent) (protocol.TranscriptEvent, bool),
+) (changed int, err error) {
+	var done int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM meta WHERE k = ?`, "rewrite:"+name).Scan(&done); err != nil {
+		return 0, err
+	}
+	if done > 0 {
+		return 0, nil
+	}
+
+	rows, err := s.db.Query(`
+SELECT t.session_id, t.seq, t.payload FROM transcript t
+JOIN sessions s ON s.id = t.session_id
+WHERE s.agent_id = ? AND t.kind = ?`, agentID, string(kind))
+	if err != nil {
+		return 0, err
+	}
+	type row struct {
+		session string
+		seq     uint64
+		ev      protocol.TranscriptEvent
+	}
+	var all []row
+	for rows.Next() {
+		var r row
+		var payload string
+		if err := rows.Scan(&r.session, &r.seq, &payload); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		if json.Unmarshal([]byte(payload), &r.ev) == nil {
+			all = append(all, r)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	for _, r := range all {
+		next, keep := fn(r.ev)
+		if !keep {
+			if _, err := tx.Exec(`DELETE FROM transcript WHERE session_id = ? AND seq = ?`, r.session, r.seq); err != nil {
+				return 0, err
+			}
+			changed++
+			continue
+		}
+		if next.Kind == r.ev.Kind && next.Text == r.ev.Text {
+			continue
+		}
+		payload, err := json.Marshal(next)
+		if err != nil {
+			return 0, err
+		}
+		if _, err := tx.Exec(`UPDATE transcript SET kind = ?, payload = ? WHERE session_id = ? AND seq = ?`,
+			string(next.Kind), string(payload), r.session, r.seq); err != nil {
+			return 0, err
+		}
+		changed++
+	}
+	if _, err := tx.Exec(`INSERT INTO meta (k, v) VALUES (?, ?)`, "rewrite:"+name, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		return 0, err
+	}
+	return changed, tx.Commit()
+}
+
 // Transcript returns a session's events, oldest first, from the given seq.
 func (s *Store) Transcript(sessionID string, sinceSeq uint64, limit int) ([]protocol.TranscriptEvent, error) {
 	if limit <= 0 {

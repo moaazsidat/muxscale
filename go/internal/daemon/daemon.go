@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/muxscale/muxscale/go/internal/adapter"
+	"github.com/muxscale/muxscale/go/internal/adapter/claudecode"
 	"github.com/muxscale/muxscale/go/internal/attach"
 	"github.com/muxscale/muxscale/go/internal/protocol"
 	"github.com/muxscale/muxscale/go/internal/store"
@@ -176,6 +177,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	defer st.Close()
 	d.store = st
+	// Sessions recorded before the parser could tell a slash command or a
+	// compaction summary from the human speaking still have them stored as
+	// user messages. Read them again with the current rules, once.
+	if n, err := st.RewriteEventsOnce("claudecode-cli-entries-v1", "claude-code",
+		protocol.EventUserMessage, claudecode.Reclassify); err != nil {
+		d.log.Warn("could not reclassify stored transcript entries", "err", err)
+	} else if n > 0 {
+		d.log.Info("reclassified stored transcript entries", "changed", n)
+	}
 	d.mgr = NewManager(d.reg, d.cfg.Adapters, st, d.log)
 	d.stateDir = stateDir
 

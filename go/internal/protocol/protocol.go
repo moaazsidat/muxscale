@@ -130,6 +130,17 @@ const (
 	EventTokenUsage       EventKind = "token_usage"
 	EventCompaction       EventKind = "compaction"
 	EventError            EventKind = "error"
+
+	// EventCommand is something the human ran in the agent's own UI rather
+	// than said to the model: a slash command such as /compact, or a shell
+	// command. Text is the command line as typed.
+	EventCommand EventKind = "command"
+	// EventCommandOutput is what such a command printed, in Text. It follows
+	// its command; the two are paired by position, not by id.
+	EventCommandOutput EventKind = "command_output"
+	// EventNotice is the agent's harness talking, not the human or the model:
+	// a background task finishing, say. Text is a one-line summary.
+	EventNotice EventKind = "notice"
 )
 
 // TranscriptEvent is one entry in a session's structured transcript.

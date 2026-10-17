@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -21,17 +22,21 @@ import (
 
 // entry is one line of the JSONL.
 type entry struct {
-	Type        string          `json:"type"`
-	UUID        string          `json:"uuid"`
-	ParentUUID  string          `json:"parentUuid"`
-	SessionID   string          `json:"sessionId"`
-	Timestamp   string          `json:"timestamp"`
-	Cwd         string          `json:"cwd"`
-	GitBranch   string          `json:"gitBranch"`
-	Version     string          `json:"version"`
-	IsSidechain bool            `json:"isSidechain"`
-	IsMeta      bool            `json:"isMeta"`
-	Message     json.RawMessage `json:"message"`
+	Type        string `json:"type"`
+	UUID        string `json:"uuid"`
+	ParentUUID  string `json:"parentUuid"`
+	SessionID   string `json:"sessionId"`
+	Timestamp   string `json:"timestamp"`
+	Cwd         string `json:"cwd"`
+	GitBranch   string `json:"gitBranch"`
+	Version     string `json:"version"`
+	IsSidechain bool   `json:"isSidechain"`
+	IsMeta      bool   `json:"isMeta"`
+	// IsCompactSummary marks the user entry Claude Code writes after
+	// compacting: the model's summary of everything before it, which the CLI
+	// sends as if the human had said it.
+	IsCompactSummary bool            `json:"isCompactSummary"`
+	Message          json.RawMessage `json:"message"`
 
 	// Sidecar entry types that carry session metadata rather than conversation.
 	AITitle    string `json:"aiTitle"`
@@ -87,6 +92,10 @@ type Meta struct {
 // inline. The full body is fetched on demand (spec §5.3) -- shipping a 2 MB
 // tool result to a phone is never the right default.
 const excerptBytes = 4096
+
+// summaryBytes is the larger cap for a compaction summary, which is the one
+// long text a reader catching up on a session actually wants whole.
+const summaryBytes = 32 * 1024
 
 // ParseTranscript reads a Claude Code JSONL session file and returns the
 // structured transcript plus recovered session metadata.
@@ -150,6 +159,13 @@ func ParseTranscript(r io.Reader) ([]protocol.TranscriptEvent, Meta, error) {
 		if len(e.Message) == 0 {
 			continue
 		}
+		// Meta entries are the CLI talking to the model on the human's behalf:
+		// the caveat before a slash command's output, a skill's expanded body,
+		// a hook's note. Nobody typed them, and showing them as the human's
+		// words is a misattribution.
+		if e.Type == "user" && e.IsMeta {
+			continue
+		}
 
 		var m message
 		if err := json.Unmarshal(e.Message, &m); err != nil {
@@ -177,6 +193,16 @@ func ParseTranscript(r io.Reader) ([]protocol.TranscriptEvent, Meta, error) {
 			}
 		}
 
+		if e.Type == "user" && e.IsCompactSummary {
+			ev := base
+			ev.Kind = protocol.EventCompaction
+			ev.Text, ev.Truncated = clipTo(contentText(m.Content), summaryBytes)
+			seq++
+			ev.Seq = seq
+			events = append(events, ev)
+			continue
+		}
+
 		for _, ev := range blocksToEvents(base, e.Type, m.Content) {
 			seq++
 			ev.Seq = seq
@@ -200,13 +226,10 @@ func blocksToEvents(base protocol.TranscriptEvent, entryType string, content jso
 	// Plain-string content: a simple user message.
 	var s string
 	if err := json.Unmarshal(content, &s); err == nil {
-		if strings.TrimSpace(s) == "" {
-			return nil
+		if ev, ok := userText(base, s); ok {
+			return []protocol.TranscriptEvent{ev}
 		}
-		ev := base
-		ev.Kind = protocol.EventUserMessage
-		ev.Text, ev.Truncated = clip(s)
-		return []protocol.TranscriptEvent{ev}
+		return nil
 	}
 
 	var blocks []contentBlock
@@ -223,11 +246,14 @@ func blocksToEvents(base protocol.TranscriptEvent, entryType string, content jso
 				continue
 			}
 			if entryType == "user" {
-				ev.Kind = protocol.EventUserMessage
+				var ok bool
+				if ev, ok = userText(base, b.Text); !ok {
+					continue
+				}
 			} else {
 				ev.Kind = protocol.EventAssistantMessage
+				ev.Text, ev.Truncated = clip(b.Text)
 			}
-			ev.Text, ev.Truncated = clip(b.Text)
 		case "thinking":
 			if strings.TrimSpace(b.Thinking) == "" {
 				continue
@@ -250,6 +276,146 @@ func blocksToEvents(base protocol.TranscriptEvent, entryType string, content jso
 		out = append(out, ev)
 	}
 	return out
+}
+
+// userText classifies text from a user entry.
+//
+// Only some of it is the human. The CLI records a slash command, what it
+// printed, shell commands run with `!`, and its own notifications as user
+// entries too, each wrapped in a tag of its own. These are the tags Claude
+// Code writes, matched literally; text that is not wrapped in one is what the
+// human typed. Returns false when nothing is left to show.
+func userText(base protocol.TranscriptEvent, s string) (protocol.TranscriptEvent, bool) {
+	ev := base
+	s = strings.TrimSpace(stripTag(s, "system-reminder"))
+	switch {
+	case s == "":
+		return ev, false
+
+	case strings.HasPrefix(s, "<command-name>"):
+		name, _ := tagged(s, "command-name")
+		args, _ := tagged(s, "command-args")
+		ev.Kind = protocol.EventCommand
+		ev.Text = strings.TrimSpace(name + " " + strings.TrimSpace(args))
+
+	case strings.HasPrefix(s, "<bash-input>"):
+		in, _ := tagged(s, "bash-input")
+		ev.Kind = protocol.EventCommand
+		ev.Text = "!" + strings.TrimSpace(in)
+
+	case strings.HasPrefix(s, "<local-command-stdout>"),
+		strings.HasPrefix(s, "<local-command-stderr>"),
+		strings.HasPrefix(s, "<bash-stdout>"),
+		strings.HasPrefix(s, "<bash-stderr>"):
+		var parts []string
+		for _, t := range []string{"local-command-stdout", "local-command-stderr", "bash-stdout", "bash-stderr"} {
+			if v, ok := tagged(s, t); ok && strings.TrimSpace(v) != "" {
+				parts = append(parts, strings.TrimSpace(stripANSI(v)))
+			}
+		}
+		if len(parts) == 0 {
+			return ev, false
+		}
+		ev.Kind = protocol.EventCommandOutput
+		ev.Text, ev.Truncated = clip(strings.Join(parts, "\n"))
+
+	case strings.HasPrefix(s, "<task-notification>"):
+		summary, ok := tagged(s, "summary")
+		if !ok {
+			summary, _ = tagged(s, "status")
+		}
+		if strings.TrimSpace(summary) == "" {
+			return ev, false
+		}
+		ev.Kind = protocol.EventNotice
+		ev.Text = strings.TrimSpace(summary)
+
+	case strings.HasPrefix(s, "<local-command-caveat>"):
+		// Normally isMeta and skipped earlier; older CLIs did not mark it.
+		return ev, false
+
+	default:
+		ev.Kind = protocol.EventUserMessage
+		ev.Text, ev.Truncated = clip(s)
+	}
+	return ev, true
+}
+
+// summaryPreamble opens every compaction summary Claude Code writes.
+const summaryPreamble = "This session is being continued from a previous conversation"
+
+// Reclassify applies userText to a user message stored before the parser
+// knew to look for the CLI's tags, for store.RewriteEventsOnce. A stored row
+// has lost isCompactSummary, so a summary is recognised by the sentence the
+// CLI opens every one with -- acceptable for history, which is not where
+// anything new is decided.
+func Reclassify(ev protocol.TranscriptEvent) (protocol.TranscriptEvent, bool) {
+	if ev.Kind != protocol.EventUserMessage {
+		return ev, true
+	}
+	if strings.HasPrefix(ev.Text, summaryPreamble) {
+		ev.Kind = protocol.EventCompaction
+		return ev, true
+	}
+	base := ev
+	base.Text, base.Kind = "", ""
+	return userText(base, ev.Text)
+}
+
+// tagged returns what is between <name> and </name>, if both are present.
+func tagged(s, name string) (string, bool) {
+	open, close := "<"+name+">", "</"+name+">"
+	i := strings.Index(s, open)
+	if i < 0 {
+		return "", false
+	}
+	rest := s[i+len(open):]
+	j := strings.Index(rest, close)
+	if j < 0 {
+		return "", false
+	}
+	return rest[:j], true
+}
+
+// stripTag removes every <name>...</name> block from s.
+func stripTag(s, name string) string {
+	open, close := "<"+name+">", "</"+name+">"
+	for {
+		i := strings.Index(s, open)
+		if i < 0 {
+			return s
+		}
+		j := strings.Index(s[i:], close)
+		if j < 0 {
+			return s
+		}
+		s = s[:i] + s[i+j+len(close):]
+	}
+}
+
+var ansi = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
+
+// stripANSI drops terminal escapes. Command output is recorded as the CLI
+// printed it -- dimmed, coloured -- and a phone renders it as text.
+func stripANSI(s string) string { return ansi.ReplaceAllString(s, "") }
+
+// contentText joins the text of a message's content, string or blocks.
+func contentText(raw json.RawMessage) string {
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	var blocks []contentBlock
+	if err := json.Unmarshal(raw, &blocks); err != nil {
+		return ""
+	}
+	var parts []string
+	for _, b := range blocks {
+		if b.Type == "text" && b.Text != "" {
+			parts = append(parts, b.Text)
+		}
+	}
+	return strings.Join(parts, "\n\n")
 }
 
 // flattenResult renders a tool_result's content, which may be a string or an
@@ -276,12 +442,14 @@ func flattenResult(raw json.RawMessage) string {
 	return string(raw)
 }
 
-func clip(s string) (string, bool) {
-	if len(s) <= excerptBytes {
+func clip(s string) (string, bool) { return clipTo(s, excerptBytes) }
+
+func clipTo(s string, max int) (string, bool) {
+	if len(s) <= max {
 		return s, false
 	}
 	// Trim to a rune boundary so we never emit invalid UTF-8 to a client.
-	cut := excerptBytes
+	cut := max
 	for cut > 0 && !utf8Start(s[cut]) {
 		cut--
 	}

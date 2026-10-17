@@ -196,3 +196,70 @@ func TestClipShortStringUntouched(t *testing.T) {
 		t.Errorf("clip(short) = %q, %v; want unchanged", got, truncated)
 	}
 }
+
+// Shapes copied from a real Claude Code 2.1.301 session that ran /compact.
+const compactLines = `{"type":"user","uuid":"c1","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>The command below was run directly in Claude Code.</local-command-caveat>"}}
+{"type":"user","uuid":"c2","message":{"role":"user","content":"<command-name>/compact</command-name>\n            <command-message>compact</command-message>\n            <command-args>keep the API notes</command-args>"}}
+{"type":"user","uuid":"c3","message":{"role":"user","content":"<local-command-stdout>\u001b[2mCompacted (ctrl+o to see full summary)\u001b[22m</local-command-stdout>"},"repeatsCompactSummary":true}
+{"type":"system","subtype":"compact_boundary","content":"Conversation compacted"}
+{"type":"user","uuid":"c4","isCompactSummary":true,"isVisibleInTranscriptOnly":true,"message":{"role":"user","content":"This session is being continued from a previous conversation.\n\nSummary:\n1. Things"}}
+{"type":"user","uuid":"c5","message":{"role":"user","content":"<task-notification>\n<task-id>b1</task-id>\n<status>killed</status>\n<summary>Background command \"Inspect raw screen\" was stopped</summary>\n</task-notification>"}}
+{"type":"user","uuid":"c6","message":{"role":"user","content":[{"type":"text","text":"<system-reminder>\nwhatever the harness adds\n</system-reminder>"},{"type":"text","text":"now fix the chat"}]}}
+{"type":"user","uuid":"c7","message":{"role":"user","content":"<bash-input>git status</bash-input>"}}
+{"type":"user","uuid":"c8","message":{"role":"user","content":"<bash-stdout>On branch main</bash-stdout><bash-stderr></bash-stderr>"}}
+`
+
+func TestCLIEntriesAreNotTheHumanSpeaking(t *testing.T) {
+	events, _, err := ParseTranscript(strings.NewReader(compactLines))
+	if err != nil {
+		t.Fatal(err)
+	}
+	type got struct {
+		kind protocol.EventKind
+		text string
+	}
+	want := []got{
+		{protocol.EventCommand, "/compact keep the API notes"},
+		{protocol.EventCommandOutput, "Compacted (ctrl+o to see full summary)"},
+		{protocol.EventCompaction, "This session is being continued from a previous conversation.\n\nSummary:\n1. Things"},
+		{protocol.EventNotice, `Background command "Inspect raw screen" was stopped`},
+		{protocol.EventUserMessage, "now fix the chat"},
+		{protocol.EventCommand, "!git status"},
+		{protocol.EventCommandOutput, "On branch main"},
+	}
+	if len(events) != len(want) {
+		for _, e := range events {
+			t.Logf("%s %q", e.Kind, e.Text)
+		}
+		t.Fatalf("got %d events, want %d", len(events), len(want))
+	}
+	for i, w := range want {
+		if events[i].Kind != w.kind || events[i].Text != w.text {
+			t.Errorf("event %d = %s %q, want %s %q", i, events[i].Kind, events[i].Text, w.kind, w.text)
+		}
+	}
+}
+
+func TestReclassifyStoredRows(t *testing.T) {
+	cases := []struct {
+		text    string
+		kind    protocol.EventKind
+		want    string
+		dropped bool
+	}{
+		{"just words", protocol.EventUserMessage, "just words", false},
+		{"<command-name>/compact</command-name><command-args></command-args>", protocol.EventCommand, "/compact", false},
+		{"<local-command-caveat>x</local-command-caveat>", "", "", true},
+		{summaryPreamble + " that ran out of context.\n\nSummary: x", protocol.EventCompaction, summaryPreamble + " that ran out of context.\n\nSummary: x", false},
+	}
+	for _, c := range cases {
+		ev, ok := Reclassify(protocol.TranscriptEvent{Seq: 7, ID: "x", Kind: protocol.EventUserMessage, Text: c.text})
+		if ok == c.dropped {
+			t.Errorf("%q: kept = %v, want %v", c.text, ok, !c.dropped)
+			continue
+		}
+		if ok && (ev.Kind != c.kind || ev.Text != c.want || ev.Seq != 7 || ev.ID != "x") {
+			t.Errorf("%q: got %s %q seq %d id %q", c.text, ev.Kind, ev.Text, ev.Seq, ev.ID)
+		}
+	}
+}

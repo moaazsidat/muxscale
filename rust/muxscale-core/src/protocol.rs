@@ -143,6 +143,12 @@ pub enum EventKind {
     Compaction,
     #[serde(rename = "error")]
     Error,
+    #[serde(rename = "command")]
+    Command,
+    #[serde(rename = "command_output")]
+    CommandOutput,
+    #[serde(rename = "notice")]
+    Notice,
 }
 
 /// One entry in a session's structured transcript.
