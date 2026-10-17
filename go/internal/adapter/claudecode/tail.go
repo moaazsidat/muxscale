@@ -312,8 +312,19 @@ func PickTranscript(cands []TranscriptCandidate, started time.Time, claimed map[
 	return best
 }
 
-// longToolCall is how long a tool call with no result still reads as running.
-const longToolCall = 10 * time.Minute
+// longTurn is how long the model's turn can stay quiet and still read as
+// running: a tool call with no result, or a model thinking with nothing
+// written yet.
+const longTurn = 10 * time.Minute
+
+// modelsTurn reports whether an entry leaves the model to speak next.
+func modelsTurn(k protocol.EventKind) bool {
+	switch k {
+	case protocol.EventToolResult, protocol.EventUserMessage, protocol.EventThinking:
+		return true
+	}
+	return false
+}
 
 // InferState derives a state from a transcript alone, for sessions with no
 // hooks (started before muxscale, or on a version below the floor).
@@ -344,9 +355,9 @@ func InferState(events []protocol.TranscriptEvent, lastMod time.Time, quiescence
 
 	// Still no result, but quiet: a long tool -- a build, a test run -- is
 	// the usual reason, and calling it unknown made a session flick between
-	// Working and Idle for the whole of every slow command. Past longToolCall
+	// Working and Idle for the whole of every slow command. Past longTurn
 	// it is more likely stuck, or sitting at a permission prompt, than working.
-	if last.Kind == protocol.EventToolCall && idle < longToolCall {
+	if last.Kind == protocol.EventToolCall && idle < longTurn {
 		return protocol.StateGuess{
 			State: protocol.StateRunning, Confidence: 0.55,
 			Reason:   "a tool call has been running for " + idle.Round(time.Second).String(),
@@ -362,12 +373,35 @@ func InferState(events []protocol.TranscriptEvent, lastMod time.Time, quiescence
 		}
 	}
 
+	// Interrupted with Escape: the prompt is back, whatever came before.
+	if last.Kind == protocol.EventUserMessage && strings.HasPrefix(last.Text, "[Request interrupted by user") {
+		return protocol.StateGuess{
+			State: protocol.StateWaitingInput, Confidence: 0.6,
+			Reason:   "the turn was interrupted",
+			Evidence: "transcript:interrupted", At: now,
+		}
+	}
+
 	// Quiet, and the last thing said was the assistant's: most likely waiting.
 	if last.Kind == protocol.EventAssistantMessage {
 		return protocol.StateGuess{
 			State: protocol.StateWaitingInput, Confidence: 0.6,
 			Reason:   "quiet after an assistant message",
 			Evidence: "transcript:idle " + idle.Round(time.Second).String(), At: now,
+		}
+	}
+
+	// Quiet, but the turn is the model's: a tool result or a prompt it has
+	// not answered yet. Claude Code writes a reply only once a block is done,
+	// so a model thinking hard is silent for as long as it thinks. Calling
+	// that unknown flipped a working session out of Working and back with
+	// every line it wrote.
+	if modelsTurn(last.Kind) && idle < longTurn {
+		return protocol.StateGuess{
+			State: protocol.StateRunning, Confidence: 0.55,
+			Reason:   "the model has been working on its reply for " + idle.Round(time.Second).String(),
+			Evidence: "transcript:idle " + idle.Round(time.Second).String() + " last=" + string(last.Kind),
+			At:       now,
 		}
 	}
 

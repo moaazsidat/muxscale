@@ -193,9 +193,18 @@ func TestInferStateConfidenceStaysBelowHooks(t *testing.T) {
 		{"quiet after assistant",
 			[]protocol.TranscriptEvent{{Kind: protocol.EventAssistantMessage}},
 			now.Add(-time.Hour), protocol.StateWaitingInput},
-		{"quiet after tool result",
+		{"a model thinking after a tool result is running",
+			[]protocol.TranscriptEvent{{Kind: protocol.EventToolResult}},
+			now.Add(-time.Minute), protocol.StateRunning},
+		{"a prompt not yet answered is running",
+			[]protocol.TranscriptEvent{{Kind: protocol.EventUserMessage, Text: "fix it"}},
+			now.Add(-30 * time.Second), protocol.StateRunning},
+		{"quiet for too long after a tool result is not",
 			[]protocol.TranscriptEvent{{Kind: protocol.EventToolResult}},
 			now.Add(-time.Hour), protocol.StateUnknown},
+		{"an interrupted turn hands back the prompt",
+			[]protocol.TranscriptEvent{{Kind: protocol.EventUserMessage, Text: "[Request interrupted by user]"}},
+			now.Add(-time.Minute), protocol.StateWaitingInput},
 	}
 	for _, c := range cases {
 		g := InferState(c.events, c.mod, 6*time.Second)
