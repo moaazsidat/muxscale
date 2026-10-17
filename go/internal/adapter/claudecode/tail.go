@@ -391,6 +391,20 @@ func InferState(events []protocol.TranscriptEvent, lastMod time.Time, quiescence
 		}
 	}
 
+	// Quiet after the harness, not the model, had the last word: a
+	// compaction (Claude Code compacts idle sessions on its own) or a local
+	// command's output. Either way the prompt is back. Less sure than after
+	// a reply, since an automatic compaction mid-turn is followed by more
+	// work -- but then it is not quiet for long.
+	if last.Kind == protocol.EventCompaction || last.Kind == protocol.EventCommandOutput {
+		return protocol.StateGuess{
+			State: protocol.StateWaitingInput, Confidence: 0.5,
+			Reason:   "quiet after a " + strings.ReplaceAll(string(last.Kind), "_", " "),
+			Evidence: "transcript:idle " + idle.Round(time.Second).String() + " last=" + string(last.Kind),
+			At:       now,
+		}
+	}
+
 	// Quiet, but the turn is the model's: a tool result or a prompt it has
 	// not answered yet. Claude Code writes a reply only once a block is done,
 	// so a model thinking hard is silent for as long as it thinks. Calling
