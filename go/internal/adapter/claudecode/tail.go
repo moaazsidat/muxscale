@@ -312,6 +312,9 @@ func PickTranscript(cands []TranscriptCandidate, started time.Time, claimed map[
 	return best
 }
 
+// longToolCall is how long a tool call with no result still reads as running.
+const longToolCall = 10 * time.Minute
+
 // InferState derives a state from a transcript alone, for sessions with no
 // hooks (started before muxscale, or on a version below the floor).
 //
@@ -335,6 +338,18 @@ func InferState(events []protocol.TranscriptEvent, lastMod time.Time, quiescence
 		return protocol.StateGuess{
 			State: protocol.StateRunning, Confidence: 0.7,
 			Reason:   "a tool call is in flight",
+			Evidence: "transcript:trailing tool_use " + last.ToolName, At: now,
+		}
+	}
+
+	// Still no result, but quiet: a long tool -- a build, a test run -- is
+	// the usual reason, and calling it unknown made a session flick between
+	// Working and Idle for the whole of every slow command. Past longToolCall
+	// it is more likely stuck, or sitting at a permission prompt, than working.
+	if last.Kind == protocol.EventToolCall && idle < longToolCall {
+		return protocol.StateGuess{
+			State: protocol.StateRunning, Confidence: 0.55,
+			Reason:   "a tool call has been running for " + idle.Round(time.Second).String(),
 			Evidence: "transcript:trailing tool_use " + last.ToolName, At: now,
 		}
 	}

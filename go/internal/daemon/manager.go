@@ -818,6 +818,18 @@ func (m *Manager) adoptTerminalPane(sessionID, agentID, natural string, p attach
 		s.Attachment = protocol.AttachTermctl
 		s.Fidelity = protocol.FidelityStructured
 	})
+	// A restart marks every session it did not launch DETACHED, certainly so,
+	// and adopting it again restores the attachment but not the state. Left
+	// there, a re-adopted session read as detached until the next hook -- and
+	// without hooks, forever. Hand it back to inference, which the transcript
+	// tailer answers within a poll.
+	if s, ok := m.reg.Get(sessionID); ok && s.State == protocol.StateDetached && s.Guess.Evidence == "restore" {
+		m.reg.SetState(sessionID, protocol.StateGuess{
+			State: protocol.StateUnknown, Confidence: 0.3,
+			Reason:   "adopted again after a restart",
+			Evidence: "adopt", At: time.Now(),
+		})
+	}
 	m.log.Info("adopted a session through its terminal",
 		"session", sessionID, "terminal", target.Kind, "tty", dev)
 	_ = m.store.Audit("muxscale", "session_adopted", sessionID,
@@ -960,6 +972,14 @@ func (m *Manager) tailLoop(sessionID string, tl *claudecode.Tailer) {
 		m.mu.Unlock()
 	}()
 
+	// The newest event seen, for inferring state while the file is quiet.
+	// Seeded from the store, since a tailer resumed after a restart starts at
+	// the end of the file and would otherwise know nothing until the next line.
+	var last []protocol.TranscriptEvent
+	if maxSeq, err := m.store.MaxSeq(sessionID); err == nil && maxSeq > 0 {
+		last, _ = m.store.Transcript(sessionID, maxSeq-1, 1)
+	}
+
 	var misses int
 	for range t.C {
 		if s, ok := m.reg.Get(sessionID); ok && s.State.Terminal() {
@@ -975,8 +995,14 @@ func (m *Manager) tailLoop(sessionID string, tl *claudecode.Tailer) {
 		}
 		misses = 0
 		if len(events) == 0 {
+			// Nothing new, which is itself news: inference said "running"
+			// when the last line landed, and only a later look can see that it
+			// went quiet. Without this a session stayed Working forever after
+			// its turn ended, unless a hook happened to correct it.
+			m.reinfer(sessionID, tl, last)
 			continue
 		}
+		last = events[len(events)-1:]
 
 		for i := range events {
 			events[i].SessionID = sessionID
@@ -1008,6 +1034,26 @@ func (m *Manager) tailLoop(sessionID string, tl *claudecode.Tailer) {
 				m.reg.SetState(sessionID, guess)
 			}
 		}
+	}
+}
+
+// reinfer re-runs state inference for a quiet transcript, and records the
+// result only when it changes the state. It never replaces a state the agent
+// reported (confidence 1) -- a hook's word outranks a guess from silence.
+func (m *Manager) reinfer(sessionID string, tl *claudecode.Tailer, last []protocol.TranscriptEvent) {
+	if len(last) == 0 {
+		return
+	}
+	s, ok := m.reg.Get(sessionID)
+	if !ok || s.Attachment == protocol.AttachNative || s.Guess.Confidence >= 1 {
+		return
+	}
+	fi, err := os.Stat(tl.Path())
+	if err != nil {
+		return
+	}
+	if guess := claudecode.InferState(last, fi.ModTime(), 6*time.Second); guess.State != s.State {
+		m.reg.SetState(sessionID, guess)
 	}
 }
 
