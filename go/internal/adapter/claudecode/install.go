@@ -3,8 +3,10 @@ package claudecode
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 )
@@ -20,12 +22,24 @@ import (
 // managedTag marks entries muxscale owns. Uninstall matches on it.
 const managedTag = "muxscale-managed"
 
+// TokenEnvVar is the variable the hooks send as their bearer token.
+//
+// Install puts it in settings.json's env block, which Claude Code copies into
+// its own environment at startup, rather than leaving it to a line in a shell
+// profile: that only reached sessions started from a shell that had sourced
+// it, and a session started any other way -- or before the line was added --
+// had every hook rejected.
+const TokenEnvVar = "MUXSCALE_HOOK_TOKEN"
+
 // InstallOptions configures hook installation.
 type InstallOptions struct {
 	SettingsPath string // default ~/.claude/settings.json
 	Endpoint     string // e.g. http://127.0.0.1:4455/v1/hook/claude-code
-	TokenEnvVar  string // e.g. MUXSCALE_HOOK_TOKEN
-	HoldSeconds  int    // decision-hook timeout; must exceed the daemon's hold
+	TokenEnvVar  string // default TokenEnvVar
+	// Token, when set, is written into settings.json's env block under
+	// TokenEnvVar, so the hooks can authenticate with no shell setup.
+	Token        string
+	HoldSeconds  int // decision-hook timeout; must exceed the daemon's hold
 	Events       []string
 	DecisionEvts []string
 }
@@ -54,7 +68,6 @@ type hookHandler struct {
 	AllowedEnvVars []string          `json:"allowedEnvVars,omitempty"`
 	Timeout        int               `json:"timeout,omitempty"`
 	StatusMessage  string            `json:"statusMessage,omitempty"`
-	Async          bool              `json:"async,omitempty"`
 	Comment        string            `json:"//,omitempty"`
 }
 
@@ -80,6 +93,9 @@ func BuildInstall(opt InstallOptions) (*Plan, error) {
 	}
 	if opt.HoldSeconds == 0 {
 		opt.HoldSeconds = 600
+	}
+	if opt.TokenEnvVar == "" {
+		opt.TokenEnvVar = TokenEnvVar
 	}
 
 	root, before, err := loadSettings(opt.SettingsPath)
@@ -118,8 +134,12 @@ func BuildInstall(opt InstallOptions) (*Plan, error) {
 			h.Timeout = opt.HoldSeconds
 			h.StatusMessage = "muxscale · waiting for your phone…"
 		} else {
-			h.Async = true // never sit in the agent's critical path
-			h.Timeout = 10
+			// Claude Code waits for an HTTP hook's answer: unlike command
+			// hooks, they have no async mode, and an "async" key is dropped
+			// the next time it rewrites the file. The daemon answers these at
+			// once, so the wait is a round trip on loopback; the short ceiling
+			// bounds how long a hung daemon could stall each tool call.
+			h.Timeout = 5
 		}
 
 		entry := map[string]any{
@@ -139,6 +159,14 @@ func BuildInstall(opt InstallOptions) (*Plan, error) {
 	}
 
 	root["hooks"] = hooks
+	if opt.Token != "" {
+		env, _ := root["env"].(map[string]any)
+		if env == nil {
+			env = map[string]any{}
+		}
+		env[opt.TokenEnvVar] = opt.Token
+		root["env"] = env
+	}
 	after, err := marshalSettings(root)
 	if err != nil {
 		return nil, err
@@ -186,6 +214,15 @@ func BuildUninstall(settingsPath string) (*Plan, error) {
 			delete(root, "hooks")
 		}
 	}
+	if env, ok := root["env"].(map[string]any); ok {
+		if _, ours := env[TokenEnvVar]; ours {
+			delete(env, TokenEnvVar)
+			plan.Removing = append(plan.Removing, "env "+TokenEnvVar)
+		}
+		if len(env) == 0 {
+			delete(root, "env")
+		}
+	}
 
 	after, err := marshalSettings(root)
 	if err != nil {
@@ -196,9 +233,47 @@ func BuildUninstall(settingsPath string) (*Plan, error) {
 }
 
 // Empty reports that settings.json already says what we would write.
-// Distinguished from a real change so `muxscale up` can say "already
+// Distinguished from a real change so a caller can say "already
 // configured" rather than showing a diff with nothing in it.
 func (p *Plan) Empty() bool { return len(p.Adding) == 0 && len(p.Removing) == 0 }
+
+// Changes reports whether applying the plan would change what settings.json
+// says. Compared as JSON values, not text, so a file someone formatted by hand
+// is not rewritten -- and backed up -- on every daemon start for no reason.
+func (p *Plan) Changes() bool {
+	if p.Before == "" {
+		return true
+	}
+	var before, after any
+	if json.Unmarshal([]byte(p.Before), &before) != nil || json.Unmarshal([]byte(p.After), &after) != nil {
+		return true
+	}
+	// The "//" tags are left out: Claude Code strips them whenever it rewrites
+	// the file, and putting them back is not worth a rewrite and a backup on
+	// every start.
+	return !reflect.DeepEqual(untagged(before), untagged(after))
+}
+
+// untagged returns v without "//" keys, at any depth.
+func untagged(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, x := range t {
+			if k != "//" {
+				out[k] = untagged(x)
+			}
+		}
+		return out
+	case []any:
+		out := make([]any, len(t))
+		for i, x := range t {
+			out[i] = untagged(x)
+		}
+		return out
+	}
+	return v
+}
 
 // Describe renders the pending change for a human. Callers show this and get
 // confirmation before Apply; nothing here touches the disk.
@@ -274,7 +349,11 @@ func isManaged(e any) bool {
 	if c, _ := m["//"].(string); c == managedTag {
 		return true
 	}
-	// Also match on the nested handler, in case the outer comment was edited.
+	// Also match on the nested handler: by its tag, in case the outer comment
+	// was edited, and by where it sends, because the tags do not survive.
+	// Claude Code drops keys it does not know when it rewrites settings.json,
+	// and an install that recognised its entries only by tag found none and
+	// added a second set beside the first -- every hook then fired twice.
 	hooks, _ := m["hooks"].([]any)
 	for _, h := range hooks {
 		hm, ok := h.(map[string]any)
@@ -284,8 +363,20 @@ func isManaged(e any) bool {
 		if c, _ := hm["//"].(string); c == managedTag {
 			return true
 		}
+		if u, _ := hm["url"].(string); isHookEndpoint(u) {
+			return true
+		}
 	}
 	return false
+}
+
+// hookPath is the daemon's hook endpoint path, on whatever address it serves.
+const hookPath = "/v1/hook/claude-code"
+
+// isHookEndpoint reports whether a hook URL points at a muxscale daemon.
+func isHookEndpoint(u string) bool {
+	parsed, err := url.Parse(u)
+	return err == nil && parsed.Path == hookPath
 }
 
 func toMap(h hookHandler) map[string]any {
@@ -293,4 +384,42 @@ func toMap(h hookHandler) map[string]any {
 	m := map[string]any{}
 	_ = json.Unmarshal(b, &m)
 	return m
+}
+
+// EnsureHooks makes settings.json say what a running daemon needs: muxscale's
+// hooks pointed at endpoint, and the token they authenticate with. The daemon
+// calls it on every start, which is what makes hooks part of running muxscale
+// rather than a step someone has to know to take.
+//
+// It writes only when something differs -- first run, a new token, a moved
+// endpoint, an entry someone deleted -- and then backs the file up first, as
+// install always has. The applied plan is returned so the caller can say what
+// changed; nil means settings.json was already right.
+//
+// Below the supported floor it changes nothing and says why: hooks on an
+// older Claude Code are a weaker safety model, not a degraded one.
+func EnsureHooks(endpoint, token string) (*Plan, error) {
+	v, err := DetectVersion()
+	if err != nil {
+		return nil, fmt.Errorf("Claude Code not found, so no hooks: %w", err)
+	}
+	if Classify(v) == SupportNone {
+		return nil, fmt.Errorf("%s", SupportMessage(v, SupportNone))
+	}
+	plan, err := BuildInstall(InstallOptions{
+		Endpoint:     endpoint,
+		Token:        token,
+		Events:       ObservationalEvents,
+		DecisionEvts: DecisionEvents,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !plan.Changes() {
+		return nil, nil
+	}
+	if err := plan.Apply(); err != nil {
+		return nil, err
+	}
+	return plan, nil
 }

@@ -38,8 +38,9 @@ const (
 	HookSessionEnd        = "SessionEnd"
 )
 
-// ObservationalEvents are registered async:true so they never sit in the
-// agent's critical path.
+// ObservationalEvents only tell the daemon what happened. The daemon answers
+// them at once and the hook's timeout is short, so they cost the agent a
+// loopback round trip and no more.
 var ObservationalEvents = []string{
 	HookSessionStart, HookUserPromptSubmit, HookPreToolUse,
 	HookPostToolUse, HookPostToolUseFail, HookNotification,
