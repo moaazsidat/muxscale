@@ -94,7 +94,13 @@ anything**, including the daemon:
 ./muxscale tailnet on --system          # serve on the machine's existing Tailscale node
 ./muxscale acl allow you@example.com    # the second gate; Tailscale identity is the first
 ./muxscale adopt                        # what did it find, and can I reply to it?
+./muxscale qr                           # scan this with the phone to connect the app
 ```
+
+`muxscale qr` encodes `muxscale://connect?url=https://<host>.ts.net:4443` — the address and
+nothing else. There is no secret in it to leak: who may connect is decided by Tailscale
+identity and the ACL, and it says so when the ACL is still empty. `--link` prints just the
+URL, `--json` both.
 
 `muxscale tailnet on` (no `--system`) joins the tailnet as its own node instead, which gives
 up less but needs to register with Tailscale's control plane. Restarting the daemon is only

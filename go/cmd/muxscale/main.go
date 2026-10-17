@@ -65,6 +65,8 @@ func main() {
 		err = cmdStatus(os.Args[2:])
 	case "tailnet":
 		err = cmdTailnet(os.Args[2:])
+	case "qr":
+		err = cmdQR(os.Args[2:])
 	case "adopt":
 		err = cmdAdopt(os.Args[2:])
 	case "acl":
@@ -96,6 +98,7 @@ Usage:
   muxscale status              Daemon, tailnet, and session summary
   muxscale tailnet             Tailnet listener status
   muxscale tailnet on|off      Serve over Tailscale, no restart (--system: host node)
+  muxscale qr                  QR code that connects the phone app to this daemon
   muxscale adopt               Adopt already-running sessions now, and report
   muxscale acl [allow|deny U]  Tailnet identities permitted to connect
   muxscale run -- CMD          Launch CMD as a managed session (enables replies)
