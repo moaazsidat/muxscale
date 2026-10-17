@@ -73,3 +73,60 @@ func TestRestoredHookSessionIsInferredUntilItsNextHook(t *testing.T) {
 		t.Fatalf("state = %s, want WAITING_INPUT inferred from the quiet transcript", got.State)
 	}
 }
+
+// Regression: a session the scan found kept its last state after its process
+// exited -- often "needs you" -- and after a restart sat in Detached for good.
+func TestSessionsWhoseProcessIsGoneAreEnded(t *testing.T) {
+	m, reg, _ := testManager(t)
+	gone := reg.Upsert("claude-code", "pid:111", nil)
+	reg.SetState(gone.ID, protocol.StateGuess{State: protocol.StateWaitingInput, Confidence: 0.6})
+	alive := reg.Upsert("claude-code", "pid:222", nil)
+	reg.SetState(alive.ID, protocol.StateGuess{State: protocol.StateWaitingInput, Confidence: 0.6})
+	wrapped := reg.Upsert("claude-code", "pid:333", func(s *protocol.Session) { s.Attachment = protocol.AttachWrap })
+	hooked := reg.Upsert("claude-code", "abc-session", nil)
+
+	m.markEnded(map[int]bool{222: true}, nil, false)
+
+	if s, _ := reg.Get(gone.ID); s.State != protocol.StateExited || s.Guess.Confidence != 1 {
+		t.Errorf("gone: %s %v, want EXITED at 1", s.State, s.Guess.Confidence)
+	}
+	for _, id := range []string{alive.ID, wrapped.ID, hooked.ID} {
+		if s, _ := reg.Get(id); s.State.Terminal() {
+			t.Errorf("%s was ended, but its process is running or reports its own exit", s.NaturalKey)
+		}
+	}
+}
+
+func TestHelperProcessesAreNotSessions(t *testing.T) {
+	for _, argv := range [][]string{
+		{"claude", "--chrome-native-host"},
+		{"claude", "mcp", "serve"},
+	} {
+		if !helperProcess(argv) {
+			t.Errorf("%v should not be listed as a session", argv)
+		}
+	}
+	if helperProcess([]string{"claude", "--dangerously-skip-permissions"}) {
+		t.Error("an interactive session was taken for a helper")
+	}
+}
+
+// The same for a tmux pane, but only when the tmux scan could say which panes
+// exist: a failed listing must not end every tmux session.
+func TestTmuxSessionsEndWithTheirPane(t *testing.T) {
+	m, reg, _ := testManager(t)
+	gone := reg.Upsert("codex", "tmux:%1", func(s *protocol.Session) { s.Attachment = protocol.AttachTmux })
+	kept := reg.Upsert("codex", "tmux:%2", func(s *protocol.Session) { s.Attachment = protocol.AttachTmux })
+
+	m.markEnded(nil, nil, false)
+	if s, _ := reg.Get(gone.ID); s.State.Terminal() {
+		t.Fatal("ended on a tmux listing that failed")
+	}
+	m.markEnded(nil, map[string]bool{"%2": true}, true)
+	if s, _ := reg.Get(gone.ID); s.State != protocol.StateExited {
+		t.Errorf("pane %%1 is gone, state = %s", s.State)
+	}
+	if s, _ := reg.Get(kept.ID); s.State.Terminal() {
+		t.Error("pane %2 is still there")
+	}
+}

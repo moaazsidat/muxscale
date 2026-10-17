@@ -125,7 +125,7 @@ func (m *Manager) persistLoop() {
 }
 
 // staleHookSession is how long a session known only from its hooks can go
-// unheard from and still be restored as live. Nothing else can say it ended:
+// unheard from and still be restored as live; past it, it is restored ended. Nothing else can say it ended:
 // a process the scan found is checked against the process table, but a
 // hook-only session that exits without a SessionEnd -- a crash, a test, a
 // machine that slept through it -- otherwise stayed in the list forever.
@@ -159,6 +159,13 @@ func (m *Manager) Restore() (int, error) {
 			state = protocol.StateUnknown
 			reason = "daemon restarted; awaiting the next hook"
 			confidence = 0.3
+		}
+		// Nothing can find this one again -- no process, no tmux pane -- and
+		// nothing has been heard from it in a day: it ended, unannounced.
+		refindable := strings.HasPrefix(s.NaturalKey, "pid:") || strings.HasPrefix(s.NaturalKey, "tmux:")
+		if !refindable && time.Since(s.LastEventAt) >= staleHookSession {
+			state = protocol.StateExited
+			reason = "not heard from in over a day"
 		}
 		// Insert under the persisted ID so notification threads and any saved
 		// deep links keep pointing at the same session across restarts.
@@ -714,7 +721,7 @@ func (m *Manager) scanOnce() {
 }
 
 func (m *Manager) scanOnceLocked() {
-	m.scanTmux()
+	tmuxPanes, panesKnown := m.scanTmux()
 
 	procs, err := attach.Discover()
 	if err != nil {
@@ -722,11 +729,14 @@ func (m *Manager) scanOnceLocked() {
 		return
 	}
 	panes := m.terminalPanes(procs)
+	running := map[int]bool{}
+	defer func() { m.markEnded(running, tmuxPanes, panesKnown) }()
 	for _, p := range procs {
 		agentID := m.identify(p.Command, p.Args)
-		if agentID == "" {
+		if agentID == "" || helperProcess(p.Args) {
 			continue
 		}
+		running[p.Pid] = true
 		// A wrapped session already has a higher-fidelity attachment under a
 		// pid natural key; do not shadow it with a discovery-only entry.
 		if m.hasWrappedPid(p.Pid) {
@@ -780,6 +790,62 @@ func (m *Manager) scanOnceLocked() {
 				Evidence: "scan:pid=" + strconv.Itoa(p.Pid), At: time.Now(),
 			})
 		}
+	}
+}
+
+// helperProcess reports an agent binary running as something other than an
+// agent session: Claude Code serving the Chrome extension, or serving MCP.
+// Each is a long-lived process with nothing to read or answer, and showed in
+// the list as a session that never said anything.
+func helperProcess(argv []string) bool {
+	for i, a := range argv {
+		if a == "--chrome-native-host" {
+			return true
+		}
+		if a == "mcp" && i+1 < len(argv) && argv[i+1] == "serve" {
+			return true
+		}
+	}
+	return false
+}
+
+// markEnded marks the sessions the scan found earlier, whose process is now
+// gone, as ended.
+//
+// Nothing did. A session whose terminal was closed kept its last state --
+// often "needs you" -- until the daemon restarted, which then called it
+// detached; and detached it stayed, a hundred-odd rows of agents that had
+// exited weeks before. A process that is not running is a fact, not a guess,
+// so this says so with full confidence.
+//
+// Only sessions keyed by their process, or by their tmux pane when the tmux
+// scan could say which panes exist: a wrapped one reports its own exit, and
+// one known only from its hooks has SessionEnd.
+func (m *Manager) markEnded(running map[int]bool, panes map[string]bool, panesKnown bool) {
+	now := time.Now()
+	for _, s := range m.reg.List() {
+		if s.State.Terminal() || s.Attachment == protocol.AttachWrap {
+			continue
+		}
+		var reason, evidence string
+		if pid, ok := strings.CutPrefix(s.NaturalKey, "pid:"); ok {
+			n, err := strconv.Atoi(pid)
+			if err != nil || running[n] {
+				continue
+			}
+			reason, evidence = "the process is no longer running", "scan:gone pid="+pid
+		} else if pane, ok := strings.CutPrefix(s.NaturalKey, "tmux:"); ok && panesKnown {
+			if panes[pane] {
+				continue
+			}
+			reason, evidence = "its tmux pane no longer has an agent in it", "scan:gone pane="+pane
+		} else {
+			continue
+		}
+		m.reg.SetState(s.ID, protocol.StateGuess{
+			State: protocol.StateExited, Confidence: 1,
+			Reason: reason, Evidence: evidence, At: now,
+		})
 	}
 }
 
@@ -1250,21 +1316,25 @@ func naturalOf(reg *Registry, sessionID string) string {
 	return sessionID
 }
 
-// scanTmux adopts agent panes so already-running sessions accept input.
-func (m *Manager) scanTmux() {
+// scanTmux adopts agent panes so already-running sessions accept input. It
+// returns the panes with an agent in them, and whether it could tell: no
+// tmux, or no tmux server, is an answer (none), but a failed listing is not.
+func (m *Manager) scanTmux() (map[string]bool, bool) {
+	found := map[string]bool{}
 	if !attach.TmuxAvailable() {
-		return
+		return found, true
 	}
 	panes, err := attach.FindAgentPanes()
 	if err != nil {
 		m.log.Debug("tmux scan failed", "err", err)
-		return
+		return found, false
 	}
 	for _, p := range panes {
 		agentID := m.identify(p.Command, nil)
 		if agentID == "" {
 			continue
 		}
+		found[p.PaneID] = true
 		// Key on pane_id (%N): it survives window renumbering, whereas
 		// session:window.pane does not.
 		natural := "tmux:" + p.PaneID
@@ -1278,7 +1348,9 @@ func (m *Manager) scanTmux() {
 		m.tmuxTargets[sess.ID] = p.PaneID
 		m.mu.Unlock()
 
-		if s, ok := m.reg.Get(sess.ID); ok && s.State == protocol.StateStarting {
+		// Starting, or ended before and running again: a pane outlives the
+		// agent in it, and a new one started there reuses its key.
+		if s, ok := m.reg.Get(sess.ID); ok && (s.State == protocol.StateStarting || s.State.Terminal()) {
 			m.reg.SetState(sess.ID, protocol.StateGuess{
 				State: protocol.StateUnknown, Confidence: 0.5,
 				Reason:   "adopted from tmux; no hook or transcript yet",
@@ -1294,6 +1366,7 @@ func (m *Manager) scanTmux() {
 			}
 		}
 	}
+	return found, true
 }
 
 func (m *Manager) hasWrappedPid(pid int) bool {
