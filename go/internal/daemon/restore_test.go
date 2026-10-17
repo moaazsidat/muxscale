@@ -93,6 +93,28 @@ func TestRestoreNativeSessionAwaitsHook(t *testing.T) {
 	}
 }
 
+// Regression: a hook-only session that ended without saying so -- a test hook
+// from months back -- came back as live on every restart, forever.
+func TestRestoreLongSilentNativeSessionAsDetached(t *testing.T) {
+	_, _, st := testManager(t)
+	old := time.Now().Add(-30 * 24 * time.Hour)
+	if err := st.SaveSession(&protocol.Session{
+		ID: "native-old", AgentID: "claude-code", NaturalKey: "n-old",
+		Attachment: protocol.AttachNative, State: protocol.StateUnknown,
+		StateSince: old, CreatedAt: old, LastEventAt: old,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reg := NewRegistry()
+	m := NewManager(reg, nil, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if _, err := m.Restore(); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := reg.Get("native-old"); got.State != protocol.StateDetached {
+		t.Errorf("state = %s, want DETACHED for a session silent for a month", got.State)
+	}
+}
+
 func TestRestoreSkipsTerminalSessions(t *testing.T) {
 	_, _, st := testManager(t)
 	if err := st.SaveSession(&protocol.Session{

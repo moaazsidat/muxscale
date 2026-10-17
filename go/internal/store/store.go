@@ -9,9 +9,12 @@ package store
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -177,6 +180,30 @@ ON CONFLICT(agent_id, natural_key) DO UPDATE SET
 	return err
 }
 
+// Setting reads a daemon setting, "" when it was never set.
+func (s *Store) Setting(key string) (string, error) {
+	var v string
+	err := s.db.QueryRow(`SELECT v FROM meta WHERE k = ?`, "setting:"+key).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return v, err
+}
+
+// SetSetting records a daemon setting, so it holds across restarts.
+func (s *Store) SetSetting(key, value string) error {
+	_, err := s.db.Exec(`INSERT INTO meta (k, v) VALUES (?, ?)
+ON CONFLICT(k) DO UPDATE SET v = excluded.v`, "setting:"+key, value)
+	return err
+}
+
+// DeleteSession forgets a session row, so a restart does not bring it back.
+// Its transcript stays: another row may be following the same file.
+func (s *Store) DeleteSession(id string) error {
+	_, err := s.db.Exec(`DELETE FROM sessions WHERE id = ?`, id)
+	return err
+}
+
 // LoadSessions returns persisted sessions, most recently active first.
 //
 // Sessions reloaded after a daemon restart cannot be assumed alive: the daemon
@@ -236,7 +263,30 @@ func (s *Store) AppendEvents(events []protocol.TranscriptEvent) error {
 		return err
 	}
 	defer tx.Rollback()
+	if err := insertEvents(tx, events); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
 
+// ReplaceTranscript swaps a session's stored events for these, in one
+// transaction: a reader sees the old transcript or the new one, never neither.
+func (s *Store) ReplaceTranscript(sessionID string, events []protocol.TranscriptEvent) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM transcript WHERE session_id = ?`, sessionID); err != nil {
+		return err
+	}
+	if err := insertEvents(tx, events); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func insertEvents(tx *sql.Tx, events []protocol.TranscriptEvent) error {
 	stmt, err := tx.Prepare(`
 INSERT INTO transcript (session_id, seq, event_id, parent_id, kind, at, is_sidechain, payload)
 VALUES (?,?,?,?,?,?,?,?)
@@ -260,7 +310,7 @@ ON CONFLICT(session_id, seq) DO NOTHING`)
 			return err
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 // RewriteEventsOnce passes every stored event of one kind, from one agent's
@@ -373,6 +423,59 @@ ORDER BY seq ASC LIMIT ?`, sessionID, sinceSeq, limit)
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+
+// TranscriptBefore returns up to limit of a session's events with seq below
+// before -- the newest ones when before is 0 -- in order, and whether older
+// ones remain.
+//
+// A conversation is read from its end. Reading it from the start, a page at
+// a time, gave a long session's first 500 events and stopped there: the
+// newest messages, the ones anyone opens a session to see, never arrived.
+func (s *Store) TranscriptBefore(sessionID string, before uint64, limit int) ([]protocol.TranscriptEvent, bool, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	if before == 0 {
+		before = math.MaxInt64
+	}
+	rows, err := s.db.Query(`
+SELECT payload FROM transcript
+WHERE session_id = ? AND seq < ?
+ORDER BY seq DESC LIMIT ?`, sessionID, int64(min(before, math.MaxInt64)), limit+1)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+
+	var out []protocol.TranscriptEvent
+	for rows.Next() {
+		var payload string
+		if err := rows.Scan(&payload); err != nil {
+			return nil, false, err
+		}
+		var e protocol.TranscriptEvent
+		if err := json.Unmarshal([]byte(payload), &e); err != nil {
+			continue
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	more := len(out) > limit
+	if more {
+		out = out[:limit]
+	}
+	slices.Reverse(out)
+	return out, more, nil
+}
+
+// DeleteTranscript forgets a session's stored events, for reading its file
+// again from the start.
+func (s *Store) DeleteTranscript(sessionID string) error {
+	_, err := s.db.Exec(`DELETE FROM transcript WHERE session_id = ?`, sessionID)
+	return err
 }
 
 // MaxSeq returns the highest seq stored for a session, so an ingester can

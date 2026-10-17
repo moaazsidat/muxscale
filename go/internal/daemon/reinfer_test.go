@@ -44,3 +44,32 @@ func TestQuietTranscriptIsReinferred(t *testing.T) {
 		t.Fatalf("state = %s, want the reported RUNNING kept", got.State)
 	}
 }
+
+// Regression: after a restart a hook-driven session was restored as a
+// certain "unknown", which shut out transcript inference, so an idle one read
+// as unknown until someone next prompted it.
+func TestRestoredHookSessionIsInferredUntilItsNextHook(t *testing.T) {
+	m, reg, st := testManager(t)
+	now := time.Now()
+	if err := st.SaveSession(&protocol.Session{ID: "h", AgentID: "claude-code", NaturalKey: "n",
+		Attachment: protocol.AttachNative, State: protocol.StateWaitingInput,
+		StateSince: now, CreatedAt: now, LastEventAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Restore(); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "s.jsonl")
+	if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := now.Add(-time.Minute)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	m.reinfer("h", claudecode.NewTailer(path, time.Second),
+		[]protocol.TranscriptEvent{{Kind: protocol.EventAssistantMessage, Text: "done"}})
+	if got, _ := reg.Get("h"); got.State != protocol.StateWaitingInput {
+		t.Fatalf("state = %s, want WAITING_INPUT inferred from the quiet transcript", got.State)
+	}
+}

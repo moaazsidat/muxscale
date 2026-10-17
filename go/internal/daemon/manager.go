@@ -27,10 +27,13 @@ type Manager struct {
 	store    *store.Store
 	log      *slog.Logger
 
-	mu      sync.RWMutex
-	wrapped map[string]*attach.Wrapped    // muxscale session id -> pty
-	tailers map[string]*claudecode.Tailer // muxscale session id -> transcript tailer
-	screens map[string]*vt.Emulator       // muxscale session id -> screen state
+	mu sync.RWMutex
+	// ingestMu orders storing a tailer's events against clearing them for a
+	// rebuild.
+	ingestMu sync.Mutex
+	wrapped  map[string]*attach.Wrapped    // muxscale session id -> pty
+	tailers  map[string]*claudecode.Tailer // muxscale session id -> transcript tailer
+	screens  map[string]*vt.Emulator       // muxscale session id -> screen state
 
 	// sampled is guarded by screenMu, not mu. See sampleScreen.
 	//
@@ -63,7 +66,7 @@ type Manager struct {
 	screenMu sync.Mutex
 
 	// scanMu serializes discovery passes. The loop runs one every few seconds
-	// and `muxscale adopt` runs one on demand; two at once would race to adopt
+	// and `muxscale status` runs one on demand; two at once would race to adopt
 	// the same pane and could double-match a transcript.
 	scanMu sync.Mutex
 }
@@ -102,10 +105,10 @@ func (m *Manager) persistLoop() {
 					m.log.Warn("persisting session failed", "err", err)
 				}
 			}
-		case ChangeTranscript:
-			if c.Event != nil {
-				if err := m.store.AppendEvents([]protocol.TranscriptEvent{*c.Event}); err != nil {
-					m.log.Warn("persisting transcript failed", "err", err)
+		case ChangeSessionRemove:
+			if c.Session != nil {
+				if err := m.store.DeleteSession(c.Session.ID); err != nil {
+					m.log.Warn("forgetting a merged session failed", "err", err)
 				}
 			}
 		case ChangeApprovalAsk:
@@ -120,6 +123,13 @@ func (m *Manager) persistLoop() {
 		}
 	}
 }
+
+// staleHookSession is how long a session known only from its hooks can go
+// unheard from and still be restored as live. Nothing else can say it ended:
+// a process the scan found is checked against the process table, but a
+// hook-only session that exits without a SessionEnd -- a crash, a test, a
+// machine that slept through it -- otherwise stayed in the list forever.
+const staleHookSession = 24 * time.Hour
 
 // Restore reloads persisted sessions after a daemon restart.
 //
@@ -139,18 +149,23 @@ func (m *Manager) Restore() (int, error) {
 		}
 		state := protocol.StateDetached
 		reason := "daemon restarted; attachment lost"
-		if s.Attachment == protocol.AttachNative {
+		confidence := 1.0
+		if s.Attachment == protocol.AttachNative && time.Since(s.LastEventAt) < staleHookSession {
 			// Hook-driven sessions re-announce themselves on their next event,
-			// so they are recoverable rather than lost.
+			// so they are recoverable rather than lost. Until then this is a
+			// guess, and says so: a certain "unknown" shut out the transcript
+			// inference that would have found an idle session waiting, and
+			// it read as unknown until someone next prompted it.
 			state = protocol.StateUnknown
 			reason = "daemon restarted; awaiting the next hook"
+			confidence = 0.3
 		}
 		// Insert under the persisted ID so notification threads and any saved
 		// deep links keep pointing at the same session across restarts.
 		s.State = state
 		s.StateSince = time.Now()
 		s.Guess = protocol.StateGuess{
-			State: state, Confidence: 1.0, Reason: reason,
+			State: state, Confidence: confidence, Reason: reason,
 			Evidence: "restore", At: time.Now(),
 		}
 		s.PendingApproval = nil // in-flight approvals did not survive
@@ -881,13 +896,77 @@ func (m *Manager) Reconcile(keepID, transcriptPath string) {
 		}
 		m.log.Debug("dropping a duplicate session",
 			"kept", keepID, "dropped", other.ID, "transcript", transcriptPath)
-		m.reg.Remove(other.ID)
-
-		m.mu.Lock()
-		delete(m.tailers, other.ID)
-		delete(m.termctlTargets, other.ID)
-		m.mu.Unlock()
+		m.Drop(other.ID)
 	}
+}
+
+// Merge folds a session found twice into the one being kept: the duplicate
+// goes, and the kept row's transcript is read again from the start of the
+// file.
+//
+// Each row had been recording the conversation only while it was the one
+// following the file, so after a merge the kept row's history had a hole
+// wherever the other had been recording instead -- an hour of a session
+// missing on the phone, with nothing to say so.
+func (m *Manager) Merge(keepID, dropID string) {
+	path := ""
+	if s, ok := m.reg.Get(dropID); ok {
+		path = s.TranscriptPath
+	}
+	if s, ok := m.reg.Get(keepID); ok && s.TranscriptPath != "" {
+		path = s.TranscriptPath
+	}
+	m.Drop(dropID)
+	if path != "" {
+		m.Retail(keepID, path)
+	}
+}
+
+// Retail forgets a session's stored transcript and follows its file again
+// from the beginning, telling clients to load it afresh.
+func (m *Manager) Retail(sessionID, path string) {
+	// Under ingestMu, so the old tailer cannot store one more batch after
+	// the clear.
+	m.ingestMu.Lock()
+	m.mu.Lock()
+	delete(m.tailers, sessionID) // the running loop sees it is replaced, and stops
+	m.mu.Unlock()
+	err := m.store.DeleteTranscript(sessionID)
+	m.ingestMu.Unlock()
+	if err != nil {
+		m.log.Warn("could not clear a transcript to read it again", "session", sessionID, "err", err)
+		return
+	}
+	m.reg.Update(sessionID, func(s *protocol.Session) { s.TranscriptPath = path })
+	m.reg.ResetTranscript(sessionID)
+	m.startTailer(sessionID, path, false)
+}
+
+// ingest stores a batch of a session's transcript events, unless tl has been
+// replaced as the session's tailer. It reports whether it stored them.
+func (m *Manager) ingest(sessionID string, tl *claudecode.Tailer, events []protocol.TranscriptEvent) bool {
+	m.ingestMu.Lock()
+	defer m.ingestMu.Unlock()
+	m.mu.RLock()
+	current := m.tailers[sessionID] == tl
+	m.mu.RUnlock()
+	if !current {
+		return false
+	}
+	if err := m.store.AppendEvents(events); err != nil {
+		m.log.Warn("storing transcript events failed", "session", sessionID, "err", err)
+	}
+	return true
+}
+
+// Drop removes a session that turned out to be another one found twice,
+// along with everything following it.
+func (m *Manager) Drop(id string) {
+	m.reg.Remove(id)
+	m.mu.Lock()
+	delete(m.tailers, id)
+	delete(m.termctlTargets, id)
+	m.mu.Unlock()
 }
 
 // attachRank orders attachments by capability, so a scan that finds a session
@@ -966,6 +1045,13 @@ func (m *Manager) EnsureTailer(sessionID, path string) {
 	// A hook-driven session and a scan-discovered one can both be following the
 	// same file. Collapse them before either starts streaming duplicates.
 	m.Reconcile(sessionID, path)
+	m.startTailer(sessionID, path, true)
+}
+
+// startTailer follows path for a session unless something already does.
+// resume picks up after what the store holds; otherwise the file is read from
+// its start.
+func (m *Manager) startTailer(sessionID, path string, resume bool) {
 	m.mu.Lock()
 	if _, running := m.tailers[sessionID]; running {
 		m.mu.Unlock()
@@ -977,6 +1063,10 @@ func (m *Manager) EnsureTailer(sessionID, path string) {
 
 	// Resume from what the store already has rather than re-reading a file
 	// that can be hundreds of megabytes.
+	if !resume {
+		go m.tailLoop(sessionID, tl)
+		return
+	}
 	if maxSeq, err := m.store.MaxSeq(sessionID); err == nil && maxSeq > 0 {
 		if err := tl.SeekEnd(maxSeq); err != nil {
 			m.log.Debug("tailer seek failed", "session", sessionID, "err", err)
@@ -990,7 +1080,11 @@ func (m *Manager) tailLoop(sessionID string, tl *claudecode.Tailer) {
 	defer t.Stop()
 	defer func() {
 		m.mu.Lock()
-		delete(m.tailers, sessionID)
+		// Only its own entry: a replacement started by Retail is not this
+		// loop's to remove.
+		if m.tailers[sessionID] == tl {
+			delete(m.tailers, sessionID)
+		}
 		m.mu.Unlock()
 	}()
 
@@ -1004,7 +1098,15 @@ func (m *Manager) tailLoop(sessionID string, tl *claudecode.Tailer) {
 
 	var misses int
 	for range t.C {
-		if s, ok := m.reg.Get(sessionID); ok && s.State.Terminal() {
+		// Ended, dropped as a duplicate, or replaced: nothing left to follow
+		// it for.
+		if s, ok := m.reg.Get(sessionID); !ok || s.State.Terminal() {
+			return
+		}
+		m.mu.RLock()
+		current := m.tailers[sessionID] == tl
+		m.mu.RUnlock()
+		if !current {
 			return
 		}
 		events, meta, err := tl.Poll()
@@ -1029,12 +1131,24 @@ func (m *Manager) tailLoop(sessionID string, tl *claudecode.Tailer) {
 
 		for i := range events {
 			events[i].SessionID = sessionID
+		}
+		// Stored here, whole, before anyone is told. They used to reach the
+		// store the way they reach phones, through the registry's change
+		// feed, which drops what a slow subscriber has no room for: a
+		// session's first read, thousands of events at once, kept a few
+		// hundred, and the conversation on the phone had holes nothing
+		// could fill.
+		if !m.ingest(sessionID, tl, events) {
+			return // replaced while reading; these belong to a transcript being rebuilt
+		}
+		for i := range events {
 			m.reg.AppendEvent(events[i])
 		}
 
-		// Only infer state for sessions with no authoritative hook source: a
-		// guess must never override what the agent told us directly.
-		if s, ok := m.reg.Get(sessionID); ok && s.Attachment != protocol.AttachNative {
+		// Never over a state the agent reported (confidence 1): a guess must
+		// not override what the agent told us directly. A hook session's
+		// state is a guess only until its first hook after a restart.
+		if s, ok := m.reg.Get(sessionID); ok && s.Guess.Confidence < 1 {
 			if fi, err := os.Stat(tl.Path()); err == nil {
 				guess := claudecode.InferState(events, fi.ModTime(), 6*time.Second)
 				m.reg.SetState(sessionID, guess)
@@ -1051,7 +1165,7 @@ func (m *Manager) reinfer(sessionID string, tl *claudecode.Tailer, last []protoc
 		return
 	}
 	s, ok := m.reg.Get(sessionID)
-	if !ok || s.Attachment == protocol.AttachNative || s.Guess.Confidence >= 1 {
+	if !ok || s.Guess.Confidence >= 1 {
 		return
 	}
 	fi, err := os.Stat(tl.Path())

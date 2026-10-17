@@ -186,6 +186,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	} else if n > 0 {
 		d.log.Info("reclassified stored transcript entries", "changed", n)
 	}
+	if n, err := rereadTranscriptsOnce(st); err != nil {
+		d.log.Warn("could not re-read stored transcripts", "err", err)
+	} else if n > 0 {
+		d.log.Info("re-read transcripts the daemon had stored only in part", "sessions", n)
+	}
 	d.mgr = NewManager(d.reg, d.cfg.Adapters, st, d.log)
 	d.stateDir = stateDir
 
@@ -251,6 +256,43 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.mgr.Shutdown(3 * time.Second)
 		return d.srv.Shutdown(shutCtx)
 	}
+}
+
+// rereadTranscriptsOnce rebuilds every stored Claude Code transcript from its
+// file, once.
+//
+// Until events were stored directly, they reached the store through a feed
+// that dropped whatever did not fit its buffer, so a session's history was
+// kept only in part -- a few hundred events of a few thousand. The files
+// still hold all of it. Run before any tailer starts, so none is appending
+// while a transcript is swapped.
+func rereadTranscriptsOnce(st *store.Store) (int, error) {
+	const flag = "once:transcripts-reread-v1"
+	if done, _ := st.Setting(flag); done != "" {
+		return 0, nil
+	}
+	sessions, err := st.LoadSessions()
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, s := range sessions {
+		if s.AgentID != "claude-code" || s.TranscriptPath == "" {
+			continue
+		}
+		events, _, err := claudecode.ParseTranscriptFile(s.TranscriptPath)
+		if err != nil {
+			continue // the file is gone; what is stored is all there is
+		}
+		for i := range events {
+			events[i].SessionID = s.ID
+		}
+		if err := st.ReplaceTranscript(s.ID, events); err != nil {
+			return n, err
+		}
+		n++
+	}
+	return n, st.SetSetting(flag, time.Now().UTC().Format(time.RFC3339))
 }
 
 // Addr is the bound address, valid after Run has started.
@@ -467,9 +509,26 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 	})
 
 	// GET /v1/sessions/transcript?session=ID&since=N
+	//
+	// GET /v1/sessions/transcript?session=ID&before=N
+	//
+	// With before, a page read backwards from the end instead: the newest
+	// events when N is 0, else those before seq N, and whether older remain.
+	// That is how a client opens a conversation, which it reads from its end.
 	d.handle(mux, "/v1/sessions/transcript", func(w http.ResponseWriter, r *http.Request) {
-		id := r.URL.Query().Get("session")
-		since, _ := strconv.ParseUint(r.URL.Query().Get("since"), 10, 64)
+		q := r.URL.Query()
+		id := q.Get("session")
+		if q.Has("before") {
+			before, _ := strconv.ParseUint(q.Get("before"), 10, 64)
+			events, more, err := d.store.TranscriptBefore(id, before, 500)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			writeJSON(w, map[string]any{"events": events, "more": more})
+			return
+		}
+		since, _ := strconv.ParseUint(q.Get("since"), 10, 64)
 		events, err := d.store.Transcript(id, since, 500)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)

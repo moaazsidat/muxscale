@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/muxscale/muxscale/go/internal/adapter/claudecode"
+	"github.com/muxscale/muxscale/go/internal/attach"
 	"github.com/muxscale/muxscale/go/internal/protocol"
 )
 
@@ -30,6 +33,14 @@ type HookServer struct {
 	token    string
 	log      *slog.Logger
 	holdTime time.Duration
+
+	// peerPID finds the process behind a hook request; a field so tests can
+	// stand in for lsof.
+	peerPID func(remoteAddr string) (int, error)
+	// linked holds the agent sessions already tied to their process, so the
+	// lookup runs once per session rather than on every hook.
+	linkMu sync.Mutex
+	linked map[string]bool
 }
 
 // SetManager attaches the manager, enabling transcript tailing for
@@ -39,7 +50,8 @@ func (h *HookServer) SetManager(m *Manager) { h.mgr = m }
 // NewHookServer builds the handler. holdTime is how long a decision hook waits
 // for a human before giving up and falling through.
 func NewHookServer(reg *Registry, token string, hold time.Duration, log *slog.Logger) *HookServer {
-	return &HookServer{reg: reg, token: token, holdTime: hold, log: log}
+	return &HookServer{reg: reg, token: token, holdTime: hold, log: log,
+		peerPID: attach.PeerPID, linked: map[string]bool{}}
 }
 
 // Routes registers handlers on a mux.
@@ -69,7 +81,9 @@ func (h *HookServer) handleClaudeCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	pid := h.link(&p, r.RemoteAddr)
 	sess := h.applyHook(&p)
+	h.linkNew(pid, sess.ID)
 
 	// Decision hooks block here while a human is asked. Everything else has
 	// already been recorded and returns immediately.
@@ -78,6 +92,70 @@ func (h *HookServer) handleClaudeCode(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, h.awaitDecision(r, sess, &p))
 	default:
 		writeJSON(w, claudecode.NoDecision())
+	}
+}
+
+// link ties a hook's agent session to the process that sent it, so the row
+// the process scan made for that process and the row the hooks make for the
+// session are one row, not two.
+//
+// The two paths key on different things -- the scan on the process, the hooks
+// on the agent's own session id -- and nothing else tied them reliably: the
+// transcript path, which used to, can be claimed by whichever path saw it
+// first and then never matches. Each showed as its own session, and the one
+// with the hooks' exact state could not be typed into, while the one that
+// could, from the scan, had no transcript.
+//
+// The scan's row wins a merge: it holds the terminal muxscale types into, and
+// is the one a phone has been showing.
+//
+// It returns the process id it found, 0 when it did not look or could not
+// tell.
+func (h *HookServer) link(p *claudecode.HookPayload, remoteAddr string) int {
+	if p.SessionID == "" || h.peerPID == nil {
+		return 0
+	}
+	h.linkMu.Lock()
+	done := h.linked[p.SessionID]
+	h.linked[p.SessionID] = true
+	h.linkMu.Unlock()
+	if done {
+		return 0
+	}
+	pid, err := h.peerPID(remoteAddr)
+	if err != nil {
+		h.log.Debug("could not tie a hook to its process", "session", p.SessionID, "err", err)
+		return 0
+	}
+	procKey := "pid:" + strconv.Itoa(pid)
+	hookID, hasHook := h.reg.IDFor("claude-code", p.SessionID)
+	procID, hasProc := h.reg.IDFor("claude-code", procKey)
+	switch {
+	case hasProc && !hasHook:
+		h.reg.Alias("claude-code", p.SessionID, procID)
+	case hasProc && hasHook && procID != hookID:
+		h.reg.Alias("claude-code", p.SessionID, procID)
+		if h.mgr != nil {
+			h.mgr.Merge(procID, hookID)
+		} else {
+			h.reg.Remove(hookID)
+		}
+		h.log.Info("merged a session found twice", "kept", procID, "dropped", hookID, "pid", pid)
+	case hasHook && !hasProc:
+		h.reg.Alias("claude-code", procKey, hookID)
+	}
+	return pid
+}
+
+// linkNew finishes link for a session the hook has only now created: there
+// was no row to alias the process to until applyHook made one.
+func (h *HookServer) linkNew(pid int, id string) {
+	if pid == 0 {
+		return
+	}
+	procKey := "pid:" + strconv.Itoa(pid)
+	if _, ok := h.reg.IDFor("claude-code", procKey); !ok {
+		h.reg.Alias("claude-code", procKey, id)
 	}
 }
 

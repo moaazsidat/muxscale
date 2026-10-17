@@ -37,7 +37,13 @@ type pendingApproval struct {
 type ChangeKind string
 
 const (
-	ChangeSessionUpsert   ChangeKind = "session_upsert"
+	ChangeSessionUpsert ChangeKind = "session_upsert"
+	// ChangeSessionRemove says a row is gone, folded into another that is
+	// the same agent session. Clients drop it; the store forgets it.
+	ChangeSessionRemove ChangeKind = "session_remove"
+	// ChangeTranscriptReset says a session's transcript is being read again
+	// from the start. Clients drop what they hold of it and load it afresh.
+	ChangeTranscriptReset ChangeKind = "transcript_reset"
 	ChangeStateChange     ChangeKind = "state_change"
 	ChangeTranscript      ChangeKind = "transcript"
 	ChangeApprovalAsk     ChangeKind = "approval_ask"
@@ -188,7 +194,47 @@ func (r *Registry) Remove(id string) bool {
 		return false
 	}
 	delete(r.sessions, id)
-	delete(r.byNatural, s.AgentID+"/"+s.NaturalKey)
+	// Every key that led here, aliases included.
+	for k, v := range r.byNatural {
+		if v == id {
+			delete(r.byNatural, k)
+		}
+	}
+	gone := *s
+	r.broadcast(Change{Kind: ChangeSessionRemove, Session: &gone})
+	return true
+}
+
+// ResetTranscript tells clients a session's transcript is being rebuilt.
+func (r *Registry) ResetTranscript(id string) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	s, ok := r.sessions[id]
+	if !ok {
+		return
+	}
+	cp := *s
+	r.broadcast(Change{Kind: ChangeTranscriptReset, Session: &cp})
+}
+
+// IDFor returns the session an agent's natural key leads to.
+func (r *Registry) IDFor(agentID, naturalKey string) (string, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	id, ok := r.byNatural[agentID+"/"+naturalKey]
+	return id, ok
+}
+
+// Alias makes a second natural key lead to an existing session, so that two
+// ways of finding one agent session -- its process, and its own id -- land on
+// the same row instead of making two.
+func (r *Registry) Alias(agentID, naturalKey, id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.sessions[id]; !ok {
+		return false
+	}
+	r.byNatural[agentID+"/"+naturalKey] = id
 	return true
 }
 
