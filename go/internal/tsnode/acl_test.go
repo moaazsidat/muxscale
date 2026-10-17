@@ -214,3 +214,19 @@ func TestDefaultHostnameIsAValidDNSLabel(t *testing.T) {
 	}
 	t.Logf("default tailnet hostname: %s", got)
 }
+
+func TestOwnerLogin(t *testing.T) {
+	a, err := LoadACL(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.OwnerLogin() != "" {
+		t.Fatal("a fresh ACL has an owner")
+	}
+	if err := a.SetOwner(" Me@Example.com "); err != nil {
+		t.Fatal(err)
+	}
+	if a.OwnerLogin() != "me@example.com" {
+		t.Fatalf("owner = %q", a.OwnerLogin())
+	}
+}

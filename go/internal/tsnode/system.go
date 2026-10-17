@@ -214,5 +214,6 @@ func (s *SystemNode) Status(ctx context.Context) (Status, error) {
 			out.TailnetIPs = append(out.TailnetIPs, ip.String())
 		}
 	}
+	out.Login = selfLogin(st)
 	return out, nil
 }

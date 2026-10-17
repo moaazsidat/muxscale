@@ -26,6 +26,7 @@ import (
 
 	"tailscale.com/client/local"
 	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tsnet"
 )
 
@@ -219,6 +220,21 @@ type Status struct {
 	BackendState string   `json:"backend_state"`
 	AuthURL      string   `json:"auth_url,omitempty"`
 	Port         int      `json:"port"`
+	// Login is the Tailscale user this node is logged in as: the person who
+	// set the daemon up, and so the one identity it can safely let in without
+	// being told.
+	Login string `json:"login,omitempty"`
+}
+
+// selfLogin is the login of the user a node belongs to.
+func selfLogin(st *ipnstate.Status) string {
+	if st == nil || st.Self == nil {
+		return ""
+	}
+	if u, ok := st.User[st.Self.UserID]; ok {
+		return u.LoginName
+	}
+	return ""
 }
 
 // Status reports the node's current state.
@@ -250,6 +266,7 @@ func (n *Node) Status(ctx context.Context) (Status, error) {
 			s.TailnetIPs = append(s.TailnetIPs, ip.String())
 		}
 	}
+	s.Login = selfLogin(st)
 	return s, nil
 }
 

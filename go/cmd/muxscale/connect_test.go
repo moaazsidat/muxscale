@@ -26,7 +26,7 @@ func TestConnectLinkRoundTrips(t *testing.T) {
 }
 
 func TestTailnetBaseURL(t *testing.T) {
-	if _, err := tailnetBaseURL(tailnetView{}); err == nil || !strings.Contains(err.Error(), "tailnet on") {
+	if _, err := tailnetBaseURL(tailnetView{}); err == nil || !strings.Contains(err.Error(), "muxscale connect") {
 		t.Fatalf("off: want a hint to turn it on, got %v", err)
 	}
 

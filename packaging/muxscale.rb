@@ -32,27 +32,21 @@ class Muxscale < Formula
   # Deliberately no service block.
   #
   # `brew services` would install and start a daemon at install time, before the
-  # user has agreed to hooks, shims, or a tailnet. `muxscale up` does that
-  # interactively and shows each change first, and installing should never be
-  # the moment something starts watching your agents.
+  # user has asked for it. `muxscale up` is that step, and installing should
+  # never be the moment something starts watching your agents.
 
   def caveats
     <<~EOS
-      muxscale is installed but not running. To set it up:
+      muxscale is installed but not running. To start it, now and at login:
 
         muxscale up
 
-      That will offer, one at a time and showing each change first:
-        - a login service, so the daemon starts with your machine
-        - Claude Code hooks, for exact blocked-state detection and approvals
-        - PATH shims, so sessions you start can accept replies
+      It sets up Claude Code's hooks as it starts, backing up
+      ~/.claude/settings.json first. To use it from your phone:
 
-      Nothing is installed or started without you agreeing to it.
+        muxscale connect
 
-      To see what is already running without changing anything:
-
-        muxscale daemon &
-        muxscale ls
+      `muxscale down` removes everything muxscale set up.
     EOS
   end
 

@@ -51,8 +51,8 @@ when. Adopting agents that are *already running* is specified and partly built i
   two agents in one project each get their own conversation.
 - A write is refused unless the adopted agent is still the process sitting in that pane —
   otherwise a reply would land on a shell prompt after the agent exited.
-- `muxscale adopt` reports what was adopted, what it can reply to, and what a terminal would
-  need to be adoptable at all.
+- `muxscale status` says how many sessions accept replies, and what a terminal would need
+  to make the rest adoptable.
 
 **Watching them work**
 
@@ -64,62 +64,50 @@ when. Adopting agents that are *already running* is specified and partly built i
 ```bash
 cd go && go build -o muxscale ./cmd/muxscale
 
-./muxscale daemon            # in one terminal
-./muxscale ls                # in another — your running agents appear immediately,
-                             #   with no hooks installed and nothing restarted
+./muxscale up                # start muxscale now and at every login
+./muxscale connect           # serve it to your phone, and show the QR code to scan
 ```
 
-That much works with zero setup. For blocked-state accuracy and remote approvals, install
-the hooks:
+That is the whole setup. Your running agents appear in `muxscale ls` within seconds, with
+nothing restarted. `muxscale status` says what is running and reachable, and how to fix
+what is not; `muxscale down` removes everything muxscale set up.
+
+**Claude Code hooks need no step of their own.** The daemon sets them up each time it
+starts (blocked-state accuracy and remote approvals): it adds muxscale's entries and the
+token they authenticate with to `~/.claude/settings.json`, backing the file up first and
+changing it only when something is missing or out of date. Every hook already there is
+preserved. Claude Code sessions started after that report their state exactly. Run the
+daemon with `--no-hooks` to leave `settings.json` alone.
 
 ```bash
-./muxscale doctor             # check your setup
-./muxscale hooks install      # shows the exact settings.json diff, then asks
-export MUXSCALE_HOOK_TOKEN=…  # printed by hooks install; add to your shell profile
-
-./muxscale watch              # live event stream
-./muxscale approvals          # pending approvals; answer with `approvals allow|deny ID`
-./muxscale run -- claude      # launch a session muxscale owns, so it accepts new prompts
+./muxscale ls                 # sessions, and pending approvals with their IDs
+./muxscale ls -w              # follow events live
+./muxscale approve ID         # or deny ID
 ./muxscale send ID "continue" # reply to a session
+./muxscale run -- claude      # start a session muxscale owns, so it accepts new prompts
 ./muxscale audit              # who did what, when
 ```
 
-`hooks install` writes a timestamped backup, preserves every existing hook, and is
-idempotent. `hooks uninstall` removes exactly muxscale's tagged entries.
+**`connect`** serves the daemon on the machine's own Tailscale when it has one, and
+otherwise on a node of muxscale's own, which logs in through a link it prints. The daemon
+remembers it across restarts; `muxscale connect off` stops it. The person whose Tailscale
+login the machine uses is permitted automatically; let anyone else in with
+`muxscale acl allow them@example.com`.
 
-To serve the daemon to your phone, turn the tailnet listener on — **without restarting
-anything**, including the daemon:
-
-```bash
-./muxscale tailnet on --system          # serve on the machine's existing Tailscale node
-./muxscale acl allow you@example.com    # the second gate; Tailscale identity is the first
-./muxscale adopt                        # what did it find, and can I reply to it?
-./muxscale qr                           # scan this with the phone to connect the app
-```
-
-`muxscale qr` encodes `muxscale://connect?url=https://<host>.ts.net:4443` — the address and
+The code encodes `muxscale://connect?url=https://<host>.ts.net:4443` — the address and
 nothing else. There is no secret in it to leak: who may connect is decided by Tailscale
-identity and the ACL, and it says so when the ACL is still empty. `--link` prints just the
-URL, `--json` both.
+identity and the ACL. `--link` prints just the URL, `--json` both.
 
-`muxscale tailnet on` (no `--system`) joins the tailnet as its own node instead, which gives
-up less but needs to register with Tailscale's control plane. Restarting the daemon is only
-ever necessary for `muxscale run` sessions — those are the ones it holds a PTY for. Sessions
-in iTerm2, tmux, or a plain terminal survive and are re-adopted.
+Restarting the daemon is only ever necessary for `muxscale run` sessions — those are the
+ones it holds a PTY for. Sessions in iTerm2, tmux, or a plain terminal survive and are
+re-adopted.
 
 ### Gotchas
 
-- **`muxscale up` will not give you `--use-system-ts`.** The unit it writes runs
-  `muxscale daemon` (or `muxscale daemon --tailnet` with `up --tailnet`), and `--tailnet`
-  means *a new tsnet node* (`muxscale-<host>.<tailnet>.ts.net`), not the machine's existing
-  Tailscale identity. Nothing writes `--use-system-ts` into a service unit. To serve on the
-  system node, start the daemon by hand with that flag, or start it plainly and run
-  `muxscale tailnet on --system`.
-
 - **A daemon you started by hand is supervised by nobody.** Nothing restarts it when it
   exits, and nothing replaces the binary when you rebuild — so an old build keeps running
-  silently, serving an old API. Check what is actually running, and with which flags, before
-  believing a feature exists:
+  silently, serving an old API. `muxscale up` runs it as a service instead. Check what is
+  actually running, and with which flags, before believing a feature exists:
 
   ```bash
   ps -o pid=,ppid=,lstart=,args= -ax | grep '[m]uxscale.*daemon'
@@ -127,12 +115,11 @@ in iTerm2, tmux, or a plain terminal survive and are re-adopted.
 
 - **A tailnet *node* being `Running` does not mean the listener is up.** The daemon can fail
   to bind its port (address changed, port taken, certificate trouble) and carry on serving
-  loopback only, because monitoring must never depend on the network. `muxscale status` shows
-  the node; `muxscale tailnet` shows whether anything is actually listening:
+  loopback only, because monitoring must never depend on the network. `muxscale status`
+  checks the listener, and the OS can confirm it:
 
   ```bash
-  muxscale tailnet                        # on [system] + URL, or off
-  lsof -nP -iTCP:4443 -sTCP:LISTEN        # the same answer, from the OS
+  lsof -nP -iTCP:4443 -sTCP:LISTEN
   ```
 
 - **Killing the daemon drops any approval it is holding open.** A `PermissionRequest` hook
@@ -144,13 +131,13 @@ in iTerm2, tmux, or a plain terminal survive and are re-adopted.
   not show the attachment, so check before you kill anything:
 
   ```bash
-  muxscale adopt | grep wrap                            # PTYs the daemon owns
+  muxscale ls --json | grep -o '"attachment":"wrap"'    # PTYs the daemon owns
   pgrep -P "$(pgrep -f 'muxscale.*daemon' | head -1)"   # its children; empty = nothing to lose
   ```
 
 > **Heads-up before installing globally.** The decision hooks hold a permission prompt open
 > for up to the configured hold window (default 120s) while waiting for an answer. Until the
-> phone app exists, answer from `muxscale approvals` or the prompt falls through to Claude
+> phone app exists, answer from `muxscale ls` and `muxscale approve` or the prompt falls through to Claude
 > Code's own after the timeout. Start with `--hold 10s` if that sounds annoying.
 
 ## Design commitments

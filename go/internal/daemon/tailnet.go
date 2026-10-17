@@ -29,7 +29,7 @@ func (d *Daemon) EnableTailnet(ctx context.Context, useSystem bool) (string, err
 	if d.tailnetCancel != nil {
 		return d.tailnetURL, fmt.Errorf(
 			"the tailnet listener is already running (%s at %s); "+
-				"turn it off first with `muxscale tailnet off`", d.tailnetMode, d.tailnetURL)
+				"turn it off first with `muxscale connect off`", d.tailnetMode, d.tailnetURL)
 	}
 	if d.mux == nil || d.stateDir == "" {
 		return "", fmt.Errorf("the daemon is not running yet")
@@ -58,7 +58,50 @@ func (d *Daemon) EnableTailnet(ctx context.Context, useSystem bool) (string, err
 		d.tailnetMode = "system"
 	}
 	_ = d.store.Audit("cli", "tailnet_enabled", "", d.tailnetMode)
+	go d.claimOwner(tctx)
 	return url, nil
+}
+
+// settingTailnet remembers whether the tailnet listener is on, and how, so a
+// restart -- or the background service starting at login -- brings it back
+// without flags. "system", "tsnet", or "off".
+const settingTailnet = "tailnet"
+
+// rememberTailnet records the listener's mode for the next start.
+func (d *Daemon) rememberTailnet(mode string) {
+	if err := d.store.SetSetting(settingTailnet, mode); err != nil {
+		d.log.Warn("could not remember the tailnet setting", "err", err)
+	}
+}
+
+// claimOwner makes the tailnet's own login the daemon's owner, if it has none.
+//
+// The person whose Tailscale login this machine uses is the person who set it
+// up, and permitting them is what anyone would do first -- by hand, as `acl
+// owner`, after a phone was refused with a 403. A node that is not logged in
+// yet has no login to read, so this waits for one, until the listener stops.
+func (d *Daemon) claimOwner(ctx context.Context) {
+	t := time.NewTicker(3 * time.Second)
+	defer t.Stop()
+	for {
+		if d.acl == nil || d.acl.OwnerLogin() != "" {
+			return
+		}
+		if st, ok := d.TailnetStatus(ctx); ok && st.Login != "" {
+			if err := d.acl.SetOwner(st.Login); err != nil {
+				d.log.Warn("could not record the owner", "err", err)
+				return
+			}
+			_ = d.store.Audit("muxscale", "acl_set_owner", "", st.Login)
+			d.log.Info("permitted this machine's Tailscale login to connect", "login", st.Login)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
 }
 
 // DisableTailnet stops the Tailscale listener. The loopback listener, the

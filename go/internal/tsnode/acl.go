@@ -62,6 +62,13 @@ func (a *ACL) save() error {
 	return os.Rename(tmp, a.path)
 }
 
+// OwnerLogin is the identity that set the daemon up, "" before anyone has.
+func (a *ACL) OwnerLogin() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.Owner
+}
+
 // SetOwner records the setup identity, which is permanently permitted.
 func (a *ACL) SetOwner(login string) error {
 	a.mu.Lock()

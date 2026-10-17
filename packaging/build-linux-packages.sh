@@ -7,8 +7,7 @@
 #
 # Both packages deliberately install *only* the binary, a man page and a
 # licence. No systemd unit, no postinst that starts anything. `muxscale up`
-# installs the service interactively after showing what it will do, and a
-# package manager is the wrong place to decide that something should start
+# installs the service when the user asks for it, and a package manager is the wrong place to decide that something should start
 # watching your coding agents.
 set -euo pipefail
 
@@ -70,24 +69,34 @@ waiting for a human, and lets you answer from elsewhere.
 .PP
 Installing this package does not start anything. Run
 .B muxscale up
-to set up a login service, agent hooks and PATH shims; each step is shown and
-confirmed separately.
+to start muxscale now and at every login, and
+.B muxscale connect
+to use it from your phone.
 .SH COMMANDS
 .TP
 .B up
-Set up the service, hooks and shims, asking about each.
+Start muxscale now and at every login. With \-\-shims, also wrap agents so
+sessions you start accept replies.
+.TP
+.B connect
+Serve muxscale to your phone over Tailscale and print the code to scan.
+.B connect off
+stops it.
+.TP
+.B status
+Say what is running and reachable, and how to fix what is not.
+.TP
+.B down
+Stop muxscale and remove everything it set up.
 .TP
 .B ls
-List agent sessions on this machine.
+List agent sessions and pending approvals. With \-w, follow events.
 .TP
-.B watch
-Stream session events.
+.B approve \fIID\fR, deny \fIID\fR
+Answer a pending approval.
 .TP
-.B approvals
-List and answer pending approval requests.
-.TP
-.B doctor
-Diagnose the local setup and say what to fix.
+.B send \fIID\fR \fITEXT\fR
+Reply to a session.
 .SH FILES
 .TP
 .I ~/.config/muxscale/config.toml
@@ -121,7 +130,7 @@ Description: Monitor and unblock your coding agents
  when one is blocked waiting for a human, and lets you answer from your phone.
  .
  Installing this package does not start a daemon or modify any agent's
- configuration. Run "muxscale up" to set that up interactively.
+ configuration. Run "muxscale up" to start it, then "muxscale connect".
 CONTROL
 
 # Checksums let dpkg detect local modification; a package without them is
@@ -227,7 +236,7 @@ muxscale watches the coding agent sessions running on your machine, detects
 when one is blocked waiting for a human, and lets you answer from your phone.
 
 Installing this package does not start a daemon or modify any agent's
-configuration. Run "muxscale up" to set that up interactively.
+configuration. Run "muxscale up" to start it, then "muxscale connect".
 
 %files
 %{_bindir}/muxscale

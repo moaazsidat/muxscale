@@ -96,7 +96,7 @@ func detectITerm2() TermCapability {
 	switch {
 	case err != nil && strings.Contains(err.Error(), "is not running"):
 		c.Reason = "iTerm2 is not running"
-		c.HowToFix = "open iTerm2, then run `muxscale adopt` to pick up its sessions"
+		c.HowToFix = "open iTerm2; muxscale picks up its sessions within a few seconds"
 	case err != nil:
 		c.Reason = err.Error()
 		c.HowToFix = "grant muxscale permission to control iTerm2 in " +

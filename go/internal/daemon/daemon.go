@@ -236,13 +236,27 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// The tailnet listener is what a phone connects to. It is optional so the
 	// daemon is fully usable locally without any Tailscale setup at all, and
-	// it can be turned on later with `muxscale tailnet on` -- see
+	// it can be turned on later with `muxscale connect` -- see
 	// EnableTailnet for why that matters.
-	if d.cfg.Tailnet {
-		if _, err := d.EnableTailnet(ctx, d.cfg.UseSystemTS); err != nil {
+	//
+	// With no flag, it comes back the way `muxscale connect` last left it.
+	tailnet, system := d.cfg.Tailnet, d.cfg.UseSystemTS
+	if !tailnet {
+		switch mode, _ := st.Setting(settingTailnet); mode {
+		case "system":
+			tailnet, system = true, true
+		case "tsnet":
+			tailnet = true
+		}
+	}
+	if tailnet {
+		if _, err := d.EnableTailnet(ctx, system); err != nil {
 			// A tailnet failure must not take down local monitoring, which is
 			// the part that works with no network at all.
 			d.log.Error("tailnet listener unavailable; local access still works", "err", err)
+		} else if d.cfg.Tailnet {
+			mode, _, _ := d.TailnetEnabled()
+			d.rememberTailnet(mode)
 		}
 	}
 
@@ -615,6 +629,7 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
+			d.rememberTailnet("off")
 			writeJSON(w, map[string]any{"enabled": false})
 			return
 		}
@@ -624,6 +639,7 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 			return
 		}
 		mode, _, _ := d.TailnetEnabled()
+		d.rememberTailnet(mode)
 		out := map[string]any{"enabled": true, "mode": mode, "url": url}
 		if st, ok := d.TailnetStatus(r.Context()); ok {
 			out["status"] = st
@@ -647,7 +663,7 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 	// be able to grant itself access.
 	d.handle(mux, "/v1/acl", func(w http.ResponseWriter, r *http.Request) {
 		if d.acl == nil {
-			http.Error(w, "tailnet is not enabled (run `muxscale tailnet on`)", http.StatusNotFound)
+			http.Error(w, "tailnet is not enabled (run `muxscale connect`)", http.StatusNotFound)
 			return
 		}
 		if r.Method == http.MethodGet {
@@ -695,7 +711,7 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 		writeJSON(w, map[string]any{"entries": entries})
 	})
 
-	// Server-sent events for `muxscale watch`.
+	// Server-sent events for `muxscale ls -w`, and the phone.
 	d.handle(mux, "/v1/events", func(w http.ResponseWriter, r *http.Request) {
 		flusher, ok := w.(http.Flusher)
 		if !ok {

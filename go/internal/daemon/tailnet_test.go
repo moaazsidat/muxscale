@@ -232,3 +232,34 @@ func TestAdoptRowsReportWritabilityByChannel(t *testing.T) {
 		t.Error("an exited session should not be in the adoption report")
 	}
 }
+
+// `muxscale connect` used to last only until the daemon restarted, so the
+// phone lost its machine every time the service came back up.
+func TestTailnetSettingIsRememberedThroughTheRoute(t *testing.T) {
+	d := tailnetDaemon(t, func(context.Context, string, http.Handler, bool) (string, error) {
+		return "https://studio.example.ts.net:4443", nil
+	})
+	d.cfg.LocalToken = testToken
+	mux := http.NewServeMux()
+	d.mux = mux
+	d.routes(mux)
+	post := func(body string) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/v1/tailnet", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+testToken)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: %d %s", body, rec.Code, rec.Body.String())
+		}
+	}
+
+	post(`{"enable":true,"system":true}`)
+	if got, _ := d.store.Setting(settingTailnet); got != "system" {
+		t.Fatalf("after on: setting = %q, want system", got)
+	}
+	post(`{"enable":false}`)
+	if got, _ := d.store.Setting(settingTailnet); got != "off" {
+		t.Fatalf("after off: setting = %q, want off", got)
+	}
+}

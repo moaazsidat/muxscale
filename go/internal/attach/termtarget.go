@@ -18,7 +18,7 @@ import (
 // neither joins a pane to a process by tty the way iTerm2 does -- kitty
 // reports foreground pids, WezTerm reports neither -- so adopting them needs a
 // different join and is not done here. DetectTerminals still reports their
-// capability, because `muxscale doctor` should say what a machine could do.
+// capability, because `muxscale status` should say what a machine could do.
 type TermTarget struct {
 	Kind TermKind
 	// ID is the emulator's own handle for the pane.
