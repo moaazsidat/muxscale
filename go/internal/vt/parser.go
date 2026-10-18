@@ -1,6 +1,7 @@
 package vt
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -58,6 +59,46 @@ type Emulator struct {
 	// encoders check this: sending paste markers to an app that has not asked
 	// for them makes the markers appear as literal text.
 	BracketedPaste bool
+
+	// AppCursor reports DECCKM, application cursor keys: an app that set it
+	// reads the arrow keys as ESC O A rather than ESC [ A. zsh's line editor
+	// sets it, and so do vim and less, so the key encoder asks.
+	AppCursor bool
+
+	// replies is what the terminal owes the program in answer to its
+	// queries: where the cursor is, what kind of terminal this is. A real
+	// terminal answers at once, and programs that ask -- fzf, vim, some
+	// prompts -- wait for it, so a terminal that never answers is one that
+	// hangs them. Collected rather than written from inside Write, so the
+	// caller can send them without holding the lock it fed the bytes under.
+	replies []byte
+}
+
+// shiftUp moves a grid's contents up n rows, the top ones going to
+// scrollback if it is the main screen.
+func (e *Emulator) shiftUp(g *Grid, n int) {
+	for i := 0; i < n; i++ {
+		if g == e.main {
+			e.scrollback = append(e.scrollback, g.RowText(0))
+		}
+		for y := 0; y < g.Rows-1; y++ {
+			copy(g.cells[y*g.Cols:(y+1)*g.Cols], g.cells[(y+1)*g.Cols:(y+2)*g.Cols])
+		}
+		for x := 0; x < g.Cols; x++ {
+			g.cells[(g.Rows-1)*g.Cols+x] = blank
+		}
+	}
+	if len(e.scrollback) > e.maxScroll {
+		e.scrollback = e.scrollback[len(e.scrollback)-e.maxScroll:]
+	}
+	g.CursorY -= n
+}
+
+// TakeReplies returns, and forgets, the answers to queries the program made.
+func (e *Emulator) TakeReplies() []byte {
+	r := e.replies
+	e.replies = nil
+	return r
 }
 
 // NewEmulator builds an emulator with a blank screen.
@@ -77,7 +118,20 @@ func (e *Emulator) Grid() *Grid { return e.grid }
 func (e *Emulator) Scrollback() []string { return e.scrollback }
 
 // Resize changes the screen size.
+//
+// Shrinking keeps the cursor's row on screen, as a real terminal does: the
+// lines above it go into scrollback. Cutting from the bottom instead lost the
+// line being typed on -- and a phone shrinks its terminal every time the
+// keyboard opens, which is exactly when that line matters.
 func (e *Emulator) Resize(cols, rows int) {
+	for _, g := range []*Grid{e.main, e.alt} {
+		if g == nil || rows <= 0 {
+			continue
+		}
+		if over := g.CursorY - (rows - 1); over > 0 {
+			e.shiftUp(g, over)
+		}
+	}
 	e.main.Resize(cols, rows)
 	if e.alt != nil {
 		e.alt.Resize(cols, rows)
@@ -387,6 +441,13 @@ func (e *Emulator) paramList() []int {
 
 func (e *Emulator) isPrivate() bool { return strings.HasPrefix(string(e.params), "?") }
 
+// marked reports a sequence whose parameters begin with a marker other than
+// "?": ESC [ > ... and ESC [ = ... are different commands from the unmarked
+// ones with the same final byte.
+func (e *Emulator) marked() bool {
+	return len(e.params) > 0 && (e.params[0] == '>' || e.params[0] == '=' || e.params[0] == '<')
+}
+
 func (e *Emulator) dispatchCSI(cmd byte) {
 	g := e.grid
 	ps := e.paramList()
@@ -459,7 +520,29 @@ func (e *Emulator) dispatchCSI(cmd byte) {
 		}
 		g.CursorX, g.CursorY = 0, e.scrollTop
 	case 'm': // SGR
-		e.applySGR(ps)
+		// ESC [ > 4 ; 2 m is xterm's modifyOtherKeys, which vim sends on
+		// start. Read as SGR it reset the rendition and turned on dim.
+		if !e.marked() && !e.isPrivate() {
+			e.applySGR(ps)
+		}
+	case 'n': // device status report
+		if e.marked() || e.isPrivate() {
+			break
+		}
+		switch e.params1(0) {
+		case 5: // are you ok
+			e.replies = append(e.replies, "\x1b[0n"...)
+		case 6: // where is the cursor
+			e.replies = append(e.replies, fmt.Sprintf("\x1b[%d;%dR", g.CursorY+1, g.CursorX+1)...)
+		}
+	case 'c': // device attributes
+		switch {
+		case strings.HasPrefix(string(e.params), ">"):
+			e.replies = append(e.replies, "\x1b[>0;10;1c"...)
+		case !e.marked() && !e.isPrivate() && e.params1(0) == 0:
+			// A VT220 with ANSI colour: what xterm-256color programs expect.
+			e.replies = append(e.replies, "\x1b[?62;22c"...)
+		}
 	case 'h':
 		e.setMode(ps, true)
 	case 'l':
@@ -477,6 +560,8 @@ func (e *Emulator) setMode(ps []int, on bool) {
 	}
 	for _, p := range ps {
 		switch p {
+		case 1: // application cursor keys
+			e.AppCursor = on
 		case 25: // cursor visibility
 			e.grid.CursorOff = !on
 		case 1049, 1047, 47: // alternate screen

@@ -434,6 +434,57 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 		writeJSON(w, sess)
 	})
 
+	// POST /v1/sessions/type {"session_id":"...","data":"..."} or
+	// {"session_id":"...","key":"up"}
+	//
+	// Keystrokes from a terminal, written as they are: no fence, no
+	// newline handling, no paste bracketing. /v1/sessions/input is for
+	// replying to an agent, where each of those matters; a terminal is
+	// someone typing, and the program on the other end decides what a key
+	// means.
+	d.handle(mux, "/v1/sessions/type", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST required", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			SessionID string `json:"session_id"`
+			Data      string `json:"data"`
+			// A key whose bytes depend on what the program asked for, like
+			// the arrows; the daemon encodes it. Sent after data.
+			Key string `json:"key"`
+			// Pasted text, bracketed if the program asked for that, so a
+			// pasted block is not run line by line as it arrives.
+			Paste string `json:"paste"`
+			By    string `json:"by"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.SessionID == "" {
+			http.Error(w, "bad request: session_id required", http.StatusBadRequest)
+			return
+		}
+		actor := body.By
+		if actor == "" {
+			actor = "cli"
+		}
+		data := []byte(body.Data)
+		if body.Paste != "" {
+			data = append(data, d.mgr.PasteBytes(body.SessionID, body.Paste)...)
+		}
+		if body.Key != "" {
+			b, err := attach.EncodeKeyMode(attach.NamedKey(body.Key), d.mgr.appCursor(body.SessionID))
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			data = append(data, b...)
+		}
+		if err := d.mgr.SendRaw(body.SessionID, data, actor); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
 	// POST /v1/sessions/input
 	d.handle(mux, "/v1/sessions/input", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {

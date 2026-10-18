@@ -441,3 +441,59 @@ func TestSnapshotKeepsColouredTrailingSpaces(t *testing.T) {
 		t.Error("coloured trailing spaces were trimmed; they are visible on screen")
 	}
 }
+
+// A program that asks where the cursor is waits for the answer. fzf does this
+// on start, and without a reply it sat on a blank screen.
+func TestQueriesAreAnswered(t *testing.T) {
+	e := NewEmulator(20, 5)
+	feed(e, "ab\r\nc\x1b[6n")
+	if got := string(e.TakeReplies()); got != "\x1b[2;2R" {
+		t.Errorf("cursor report = %q, want ESC[2;2R", got)
+	}
+	feed(e, "\x1b[5n\x1b[c\x1b[>c")
+	if got := string(e.TakeReplies()); got != "\x1b[0n\x1b[?62;22c\x1b[>0;10;1c" {
+		t.Errorf("replies = %q", got)
+	}
+	if got := e.TakeReplies(); len(got) != 0 {
+		t.Errorf("replies were not forgotten once taken: %q", got)
+	}
+}
+
+func TestApplicationCursorKeysAreTracked(t *testing.T) {
+	e := NewEmulator(20, 5)
+	feed(e, "\x1b[?1h")
+	if !e.AppCursor {
+		t.Fatal("ESC[?1h did not set application cursor keys")
+	}
+	feed(e, "\x1b[?1l")
+	if e.AppCursor {
+		t.Fatal("ESC[?1l did not clear application cursor keys")
+	}
+}
+
+// vim sends ESC[>4;2m on start. Read as SGR, everything after it was dim.
+func TestModifyOtherKeysIsNotARendition(t *testing.T) {
+	e := NewEmulator(20, 5)
+	feed(e, "\x1b[1m\x1b[>4;2mx")
+	a := e.Grid().At(0, 0).Attr
+	if a.Dim || !a.Bold {
+		t.Errorf("attr after ESC[>4;2m = %+v, want bold and not dim", a)
+	}
+}
+
+// The keyboard opening on a phone shrinks the terminal. The line being typed
+// on has to survive it.
+func TestShrinkingKeepsTheCursorsLine(t *testing.T) {
+	e := NewEmulator(20, 6)
+	feed(e, "one\r\ntwo\r\nthree\r\nfour\r\n$ typing")
+	e.Resize(20, 3)
+	if got := e.Grid().RowText(2); got != "$ typing" {
+		t.Errorf("bottom row after shrinking = %q, want the prompt", got)
+	}
+	if g := e.Grid(); g.CursorY != 2 || g.CursorX != 8 {
+		t.Errorf("cursor = %d,%d, want 8,2", g.CursorX, g.CursorY)
+	}
+	if sb := e.Scrollback(); len(sb) != 2 || sb[0] != "one" {
+		t.Errorf("scrollback = %q, want the lines pushed off the top", sb)
+	}
+}

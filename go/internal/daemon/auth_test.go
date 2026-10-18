@@ -53,6 +53,7 @@ func controlRoutes() []struct {
 		{http.MethodPost, "/v1/approvals/decide", `{"id":"x","behavior":"allow"}`},
 		{http.MethodPost, "/v1/sessions/run", `{"command":["true"]}`},
 		{http.MethodPost, "/v1/sessions/input", `{"session_id":"x","text":"y"}`},
+		{http.MethodPost, "/v1/sessions/type", `{"session_id":"x","data":"y"}`},
 		{http.MethodPost, "/v1/sessions/kill", `{"session_id":"x"}`},
 		{http.MethodPost, "/v1/sessions/rename", `{"session_id":"x","name":"y"}`},
 		{http.MethodGet, "/v1/sessions/transcript?session=x", ""},

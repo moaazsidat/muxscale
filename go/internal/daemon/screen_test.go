@@ -315,3 +315,58 @@ func TestAClosedShellReportsExitedNotCrashed(t *testing.T) {
 		t.Errorf("reason = %q, want %q", got.Guess.Reason, "closed")
 	}
 }
+
+// With no TERM, or "dumb", zsh turns off its line editor's extras --
+// autosuggestions, highlighting, completion menus -- and the phone's terminal
+// was a line printer. The daemon's own terminal is not the shell's.
+func TestTheShellIsToldItIsInATerminal(t *testing.T) {
+	env := terminalEnv([]string{"TERM=dumb", "TERM_PROGRAM=iTerm.app", "HOME=/h", "LANG=fr_FR.UTF-8"})
+	got := map[string]string{}
+	for _, kv := range env {
+		k, v, _ := strings.Cut(kv, "=")
+		if _, dup := got[k]; dup {
+			t.Errorf("%s is set twice", k)
+		}
+		got[k] = v
+	}
+	if got["TERM"] != "xterm-256color" {
+		t.Errorf("TERM = %q", got["TERM"])
+	}
+	if _, ok := got["TERM_PROGRAM"]; ok {
+		t.Error("the daemon's own terminal leaked into the shell")
+	}
+	if got["LANG"] != "fr_FR.UTF-8" || got["HOME"] != "/h" {
+		t.Errorf("the user's own settings were not kept: %v", got)
+	}
+	if got["COLORTERM"] != "truecolor" {
+		t.Errorf("COLORTERM = %q", got["COLORTERM"])
+	}
+	if l := terminalEnv(nil); !strings.Contains(strings.Join(l, " "), "LANG=en_US.UTF-8") {
+		t.Errorf("no UTF-8 locale was supplied: %v", l)
+	}
+}
+
+// Typing goes in as typed. Through /v1/sessions/input a carriage return
+// became a newline, and the shell never ran what was typed.
+func TestTypedKeysReachTheShellAsTyped(t *testing.T) {
+	m, reg, _ := testManager(t)
+	parent := agentSession(t, reg, t.TempDir())
+	sh, err := m.RunShell(parent.ID, 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { waitForShellExit(t, m, sh.ID) })
+
+	if err := m.SendRaw(sh.ID, []byte("echo typed-$((40+2))\r"), "test"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if g, ok := m.ScreenClone(sh.ID); ok && strings.Contains(g.Text(), "typed-42") {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	g, _ := m.ScreenClone(sh.ID)
+	t.Fatalf("the command did not run:\n%s", g.Text())
+}

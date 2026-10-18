@@ -64,6 +64,22 @@ func EncodeKey(k NamedKey) ([]byte, error) {
 	return []byte(b), nil
 }
 
+// EncodeKeyMode is EncodeKey for a program that may have asked for
+// application cursor keys (DECCKM), as zsh's line editor, vim and less do:
+// their arrow keys are ESC O A, not ESC [ A. Sent the wrong way, an arrow in
+// vim inserts "A" on a new line.
+func EncodeKeyMode(k NamedKey, appCursor bool) ([]byte, error) {
+	b, err := EncodeKey(k)
+	if err != nil || !appCursor {
+		return b, err
+	}
+	switch k {
+	case KeyUp, KeyDown, KeyRight, KeyLeft, KeyHome, KeyEnd:
+		return []byte("\x1bO" + string(b[len(b)-1])), nil
+	}
+	return b, nil
+}
+
 // KeyNames lists supported keys, for help text and client capability lists.
 func KeyNames() []string {
 	out := make([]string, 0, len(keyBytes))

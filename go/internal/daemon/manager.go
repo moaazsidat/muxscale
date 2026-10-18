@@ -43,6 +43,16 @@ type Manager struct {
 	// drives the stream still produces small deltas.
 	sampled map[string]*vt.Emulator
 
+	// screenChanged holds, for each session whose screen someone is
+	// watching, a channel closed the next time that screen changes. Guarded
+	// by screenMu. This is what lets the stream send a keystroke's echo the
+	// moment it arrives, rather than on the next tick of a poll.
+	screenChanged map[string]chan struct{}
+
+	// typedAudit is when each session last had typing recorded in the audit
+	// log. Guarded by mu. See SendRaw.
+	typedAudit map[string]time.Time
+
 	// closing records sessions a human asked to end, so their exit-by-signal is
 	// reported as "closed" rather than "crashed".
 	closing map[string]bool
@@ -86,6 +96,8 @@ func NewManager(reg *Registry, adapters *adapter.Registry, st *store.Store, log 
 		tmuxTargets:    map[string]string{},
 		termctlTargets: map[string]attach.TermTarget{},
 		sampled:        map[string]*vt.Emulator{},
+		screenChanged:  map[string]chan struct{}{},
+		typedAudit:     map[string]time.Time{},
 	}
 	go m.persistLoop()
 	return m
@@ -190,6 +202,8 @@ type RunOptions struct {
 	AgentID string
 	Cols    uint16
 	Rows    uint16
+	// Env is the process's environment; nil inherits the daemon's.
+	Env []string
 }
 
 // Run starts a wrapped session.
@@ -206,6 +220,7 @@ func (m *Manager) Run(opt RunOptions) (*protocol.Session, error) {
 
 	w, err := attach.Wrap(attach.WrapOptions{
 		Command: opt.Command, Dir: opt.Dir, Cols: opt.Cols, Rows: opt.Rows,
+		Env: opt.Env,
 	})
 	if err != nil {
 		return nil, err
@@ -261,7 +276,12 @@ func (m *Manager) RunShell(parentID string, cols, rows uint16) (*protocol.Sessio
 	}
 
 	sess, err := m.Run(RunOptions{
-		Command: []string{loginShell()},
+		// A login shell, as a terminal app opens: it reads .zprofile, which
+		// is where Homebrew and most version managers put themselves on PATH.
+		// Without it a daemon started at login, with launchd's bare PATH,
+		// opened a shell where half your commands were missing.
+		Command: []string{loginShell(), "-l"},
+		Env:     terminalEnv(os.Environ()),
 		Dir:     parent.Cwd,
 		Name:    "shell — " + filepath.Base(parent.Cwd),
 		AgentID: ShellAgentID,
@@ -299,6 +319,46 @@ func (m *Manager) liveShellFor(parentID string) (*protocol.Session, bool) {
 		}
 	}
 	return nil, false
+}
+
+// terminalEnv is the environment a terminal app gives the shell it opens,
+// filling in what a daemon may have been started without.
+//
+// TERM above all: with none, or "dumb", zsh's line editor and its plugins --
+// autosuggestions, syntax highlighting, completion menus -- turn themselves
+// off, and the phone's terminal is a line printer. The emulator speaks
+// xterm-256color, so that is what the shell is told. What the user set
+// themselves is kept.
+func terminalEnv(env []string) []string {
+	have := map[string]string{}
+	for _, kv := range env {
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			have[k] = v
+		}
+	}
+	out := make([]string, 0, len(env)+4)
+	for _, kv := range env {
+		k, _, _ := strings.Cut(kv, "=")
+		switch k {
+		case "TERM":
+			continue // set below, always
+		case "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "TERM_SESSION_ID", "ITERM_SESSION_ID", "KITTY_WINDOW_ID", "WEZTERM_PANE", "TMUX", "TMUX_PANE":
+			// The daemon's own terminal, if it was started in one. A shell
+			// told it is in iTerm2 sends iTerm2's private escapes.
+			continue
+		}
+		out = append(out, kv)
+	}
+	out = append(out, "TERM=xterm-256color")
+	if have["COLORTERM"] == "" {
+		out = append(out, "COLORTERM=truecolor")
+	}
+	if have["LANG"] == "" && have["LC_ALL"] == "" && have["LC_CTYPE"] == "" {
+		// Without a UTF-8 locale zsh draws every non-ASCII character as an
+		// escape, and prompts are full of them.
+		out = append(out, "LANG=en_US.UTF-8")
+	}
+	return out
 }
 
 // loginShell picks the shell to open. $SHELL is what the user chose; the
@@ -345,6 +405,7 @@ func (m *Manager) Resize(sessionID string, cols, rows uint16) error {
 	if em != nil {
 		m.screenMu.Lock()
 		em.Resize(int(cols), int(rows))
+		m.screenChangedLocked(sessionID)
 		m.screenMu.Unlock()
 	}
 	return nil
@@ -366,6 +427,43 @@ func (m *Manager) ScreenClone(sessionID string) (*vt.Grid, bool) {
 	return em.Grid().Clone(), true
 }
 
+// ScreenChanged returns a channel closed the next time a session's screen
+// changes or its process ends. Only sessions muxscale holds the PTY for
+// report changes; the others never close it, and are read by polling.
+func (m *Manager) ScreenChanged(sessionID string) <-chan struct{} {
+	m.screenMu.Lock()
+	defer m.screenMu.Unlock()
+	ch := m.screenChanged[sessionID]
+	if ch == nil {
+		ch = make(chan struct{})
+		m.screenChanged[sessionID] = ch
+	}
+	return ch
+}
+
+// HasLiveScreen reports whether muxscale holds the session's PTY, and so
+// whether ScreenChanged will ever fire for it.
+func (m *Manager) HasLiveScreen(sessionID string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.screens[sessionID] != nil
+}
+
+// screenChangedLocked wakes whoever is waiting on a session's screen. The
+// caller holds screenMu.
+func (m *Manager) screenChangedLocked(sessionID string) {
+	if ch := m.screenChanged[sessionID]; ch != nil {
+		close(ch)
+		delete(m.screenChanged, sessionID)
+	}
+}
+
+func (m *Manager) notifyScreen(sessionID string) {
+	m.screenMu.Lock()
+	m.screenChangedLocked(sessionID)
+	m.screenMu.Unlock()
+}
+
 // superviseWrapped feeds output into the VT emulator and records the exit.
 func (m *Manager) superviseWrapped(sessionID string, w *attach.Wrapped) {
 	// Draining is mandatory regardless of whether anyone is watching: an unread
@@ -383,7 +481,12 @@ func (m *Manager) superviseWrapped(sessionID string, w *attach.Wrapped) {
 		if n > 0 {
 			m.screenMu.Lock()
 			_, _ = em.Write(buf[:n])
+			replies := em.TakeReplies()
+			m.screenChangedLocked(sessionID)
 			m.screenMu.Unlock()
+			if len(replies) > 0 {
+				_, _ = w.Write(replies)
+			}
 			m.reg.NoteOutput(sessionID, n)
 		}
 		if err != nil {
@@ -391,6 +494,7 @@ func (m *Manager) superviseWrapped(sessionID string, w *attach.Wrapped) {
 		}
 	}
 	<-w.Exited()
+	defer m.notifyScreen(sessionID) // a watcher learns the screen is gone
 
 	m.mu.Lock()
 	asked := m.closing[sessionID]
@@ -549,7 +653,7 @@ func (m *Manager) SendInput(sessionID string, text string, key attach.NamedKey, 
 
 	var payload []byte
 	if key != "" {
-		b, err := attach.EncodeKey(key)
+		b, err := attach.EncodeKeyMode(key, m.appCursor(sessionID))
 		if err != nil {
 			return err
 		}
@@ -575,6 +679,72 @@ func (m *Manager) SendInput(sessionID string, text string, key attach.NamedKey, 
 	_ = m.store.Audit(actor, "input_sent", sessionID,
 		fmt.Sprintf("key=%s bytes=%d submit=%v", key, len(payload), submit))
 	return nil
+}
+
+// SendRaw writes bytes to a session's terminal exactly as given: a keystroke
+// from a terminal on the phone, which is not a reply to an agent and so is
+// neither fenced nor normalised. Arrow keys arrive as named keys through
+// SendInput instead, since only the daemon knows which encoding the program
+// asked for.
+//
+// Every keystroke is not an audit entry -- a typed command would be thirty
+// rows -- so typing is recorded once a minute per session at most.
+func (m *Manager) SendRaw(sessionID string, data []byte, actor string) error {
+	if _, ok := m.reg.Get(sessionID); !ok {
+		return fmt.Errorf("unknown session %s", sessionID)
+	}
+	if len(data) == 0 {
+		return nil
+	}
+	if err := m.deliver(sessionID, data); err != nil {
+		return err
+	}
+	now := time.Now()
+	m.mu.Lock()
+	due := now.Sub(m.typedAudit[sessionID]) >= time.Minute
+	if due {
+		m.typedAudit[sessionID] = now
+	}
+	m.mu.Unlock()
+	if due {
+		_ = m.store.Audit(actor, "input_typed", sessionID, "keystrokes from a terminal")
+	}
+	return nil
+}
+
+// PasteBytes encodes pasted text for a session's terminal: inside paste
+// brackets if the program enabled them, which is how a shell knows not to run
+// each line of a pasted block as it arrives. A program that has not asked for
+// them would show the brackets as text, so it gets the lines as typed.
+func (m *Manager) PasteBytes(sessionID, text string) []byte {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	m.mu.RLock()
+	em := m.screens[sessionID]
+	m.mu.RUnlock()
+	bracketed := false
+	if em != nil {
+		m.screenMu.Lock()
+		bracketed = em.BracketedPaste
+		m.screenMu.Unlock()
+	}
+	if bracketed {
+		return []byte("\x1b[200~" + text + "\x1b[201~")
+	}
+	return []byte(strings.ReplaceAll(text, "\n", "\r"))
+}
+
+// appCursor reports whether the program in a session asked for application
+// cursor keys, which changes the bytes an arrow key is.
+func (m *Manager) appCursor(sessionID string) bool {
+	m.mu.RLock()
+	em := m.screens[sessionID]
+	m.mu.RUnlock()
+	if em == nil {
+		return false
+	}
+	m.screenMu.Lock()
+	defer m.screenMu.Unlock()
+	return em.AppCursor
 }
 
 // submitDelay separates typed text from the return that submits it, long

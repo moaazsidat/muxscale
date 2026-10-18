@@ -22,6 +22,10 @@ const (
 	minFPS     = 4
 	maxFPS     = 20
 
+	// liveFrame is the shortest gap between frames for a screen that says
+	// when it changes: 60 a second, the most a phone can show.
+	liveFrame = time.Second / 60
+
 	// keyframeEvery re-sends a full snapshot periodically. A client that
 	// dropped a delta -- backgrounded, or on a flaky cellular link -- would
 	// otherwise render a subtly wrong screen forever with no way to notice.
@@ -133,52 +137,103 @@ func (d *Daemon) screenRoutes(mux *http.ServeMux) {
 			return
 		}
 
-		ticker := time.NewTicker(time.Second / time.Duration(clampFPS(r.URL.Query().Get("fps"))))
-		defer ticker.Stop()
+		// frame sends what changed since the last one: rows, or only the
+		// cursor -- an arrow key moves nothing else, and a phone that was not
+		// told saw the cursor stay put. It reports false once the stream is
+		// over.
+		frame := func() bool {
+			cur, ok := d.mgr.ScreenClone(id)
+			if sess, known := d.reg.Get(id); !ok || !known || sess.State.Terminal() {
+				// The session ended. Say so rather than leaving the client
+				// waiting on a stream that will never produce another frame.
+				send("closed", map[string]string{"session": id})
+				return false
+			}
+			lines := cur.Diff(shadow)
+			if len(lines) == 0 && cur.CursorX == shadow.CursorX &&
+				cur.CursorY == shadow.CursorY && cur.CursorOff == shadow.CursorOff {
+				return true
+			}
+			base := seq
+			seq++
+			snap := cur.Snapshot()
+			shadow = cur
+			return send("delta", vt.Delta{
+				BaseSeq: base, Seq: seq,
+				Cols: snap.Cols, Rows: snap.Rows,
+				CursorX: snap.CursorX, CursorY: snap.CursorY,
+				CursorOff: snap.CursorOff,
+				Lines:     lines,
+			})
+		}
+
 		keyframe := time.NewTicker(keyframeEvery)
 		defer keyframe.Stop()
+		resync := func() bool {
+			cur, ok := d.mgr.ScreenClone(id)
+			if !ok {
+				return false
+			}
+			seq++
+			shadow = cur
+			return snapshot(shadow)
+		}
 
+		// A screen muxscale holds the PTY for is sent the moment it changes:
+		// a keystroke's echo on the next frame, not the next tick of a poll,
+		// which is the difference between typing and typing into treacle.
+		// Changes closer together than liveFrame collapse into one, so a
+		// burst of output is still one frame, not a backlog.
+		if d.mgr.HasLiveScreen(id) {
+			// Closure is noticed through the change signal; this catches a
+			// session ended without its process exiting, which nothing
+			// signals.
+			check := time.NewTicker(time.Second)
+			defer check.Stop()
+			last := time.Time{}
+			for {
+				changed := d.mgr.ScreenChanged(id)
+				select {
+				case <-r.Context().Done():
+					return
+				case <-keyframe.C:
+					if !resync() {
+						return
+					}
+					continue
+				case <-check.C:
+				case <-changed:
+					if wait := liveFrame - time.Since(last); wait > 0 {
+						select {
+						case <-r.Context().Done():
+							return
+						case <-time.After(wait):
+						}
+					}
+				}
+				if !frame() {
+					return
+				}
+				last = time.Now()
+			}
+		}
+
+		// Anything else is a terminal muxscale reads the contents of and
+		// cannot be told about, so it is polled.
+		ticker := time.NewTicker(time.Second / time.Duration(clampFPS(r.URL.Query().Get("fps"))))
+		defer ticker.Stop()
 		for {
 			select {
 			case <-r.Context().Done():
 				return
-
 			case <-keyframe.C:
-				cur, ok := d.mgr.ScreenClone(id)
-				if !ok {
+				if !resync() {
 					return
 				}
-				seq++
-				shadow = cur
-				if !snapshot(shadow) {
-					return
-				}
-
 			case <-ticker.C:
-				cur, ok := d.mgr.ScreenClone(id)
-				if !ok {
-					// The session ended. Say so rather than leaving the client
-					// waiting on a stream that will never produce another frame.
-					send("closed", map[string]string{"session": id})
+				if !frame() {
 					return
 				}
-				lines := cur.Diff(shadow)
-				if len(lines) == 0 {
-					continue
-				}
-				base := seq
-				seq++
-				snap := cur.Snapshot()
-				if !send("delta", vt.Delta{
-					BaseSeq: base, Seq: seq,
-					Cols: snap.Cols, Rows: snap.Rows,
-					CursorX: snap.CursorX, CursorY: snap.CursorY,
-					CursorOff: snap.CursorOff,
-					Lines:     lines,
-				}) {
-					return
-				}
-				shadow = cur
 			}
 		}
 	})
