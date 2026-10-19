@@ -7,28 +7,34 @@ requirement, a failing test. You're away from the keyboard and the work is stran
 an SSH session you can't comfortably reach. muxscale watches every agent session on your
 machines, notifies you the moment one blocks, and lets you unblock it with a sentence.
 
-**Status: M0 complete, M1 mostly complete.** Claude Code only, terminal only — no phone app
-and no cloud yet. See [the technical spec](docs/20260729-technical-spec.md) for the full
-design and [§13 Milestones](docs/20260729-technical-spec.md#13-milestones) for what lands
-when. Adopting agents that are *already running* is specified and partly built in
+**Status: M0 complete, M1 mostly complete.** Claude Code and omp, terminal only — no phone
+app and no cloud yet. See [the technical spec](docs/20260729-technical-spec.md) for the full
+design, [§13 Milestones](docs/20260729-technical-spec.md#13-milestones) for what lands
+when, and [the omp adapter spec](docs/20261018-omp-adapter.md) for the second agent
+integration. Adopting agents that are *already running* is specified and partly built in
 [the adoption spec](docs/20260925-adopting-existing-sessions.md).
 
 ## What works today
 
 **Seeing your agents**
 
-- Every Claude Code session on the machine is discovered and tracked, **including ones
-  muxscale never launched and ones that started before it was installed** — via process
-  scan, tmux enumeration, and Claude Code's own session files.
+- Every Claude Code and omp session on the machine is discovered and tracked, **including
+  ones muxscale never launched and ones that started before it was installed** — via
+  process scan, tmux enumeration, terminal breadcrumbs, and the agents' own session files.
+  omp liveness is the writer lease it holds, so a session whose process is gone is reported
+  ended rather than guessed at from a file's age.
 - Full structured transcripts: turns, tool calls, results, diffs, token usage, subagent
-  threads — parsed straight from Claude Code's JSONL, which is verbatim Messages API shape.
+  threads — parsed straight from Claude Code's JSONL (verbatim Messages API shape) and
+  omp's session tree (`toolCall` blocks, `toolResult` messages, thinking, usage, forks).
 - Free metadata: AI-generated session title, git branch, model, agent version.
 - Everything persists to SQLite and survives a daemon restart with stable session IDs.
 
 **Knowing when they block**
 
-- Session state is **authoritative, not guessed**, when hooks are installed: `Stop` means
-  the turn ended and the agent is waiting on you. Confidence 1.0, no regexes.
+- Session state is **authoritative, not guessed**, when hooks or an extension are
+  installed: Claude Code's `Stop` and omp's `agent_end` mean the turn ended and the agent is
+  waiting on you. Confidence 1.0, no regexes. Without them, state is inferred from the
+  transcript and the omp writer lease, capped at 0.7.
 - Without hooks, state is inferred from the transcript and capped at 0.7 confidence, with
   the evidence recorded so `debug state` can explain itself.
 
@@ -72,12 +78,14 @@ That is the whole setup. Your running agents appear in `muxscale ls` within seco
 nothing restarted. `muxscale status` says what is running and reachable, and how to fix
 what is not; `muxscale down` removes everything muxscale set up.
 
-**Claude Code hooks need no step of their own.** The daemon sets them up each time it
-starts (blocked-state accuracy and remote approvals): it adds muxscale's entries and the
+**Claude Code hooks and the omp extension need no step of their own.** The daemon sets them
+up each time it starts (blocked-state accuracy and remote approvals): it adds muxscale's entries and the
 token they authenticate with to `~/.claude/settings.json`, backing the file up first and
 changing it only when something is missing or out of date. Every hook already there is
-preserved. Claude Code sessions started after that report their state exactly. Run the
-daemon with `--no-hooks` to leave `settings.json` alone.
+preserved. Claude Code sessions started after that report their state exactly. For omp it
+writes one file, `~/.omp/agent/extensions/muxscale.ts`; omp discovers it with no settings
+edit, and removing the file (or `muxscale down`) turns exact state back into inference.
+Run the daemon with `--no-hooks` to leave both alone.
 
 ```bash
 ./muxscale ls                 # sessions, and pending approvals with their IDs
@@ -155,6 +163,11 @@ These are constraints, not aspirations. Each has tests.
 - **Claude Code ≥ 2.1.196.** That's where `prompt_id` landed, and `prompt_id` is the fence
   token that stops a reply composed offline from answering a later question. Below the
   floor, muxscale refuses to install hooks rather than ship a weaker safety model.
+- **omp ≥ 18.12.2.** That is where the session tree, writer lease, and extension surface
+  were verified. Older sessions still parse; `muxscale status` says what is missing.
+- **omp approvals are local for now.** omp's extension API can report a turn boundary but
+  cannot answer its own approval dialog, so muxscale does not advertise remote approvals
+  for it. State is exact; a blocked `yolo`-off prompt is still answered in the terminal.
 
 ## Layout
 
@@ -162,6 +175,7 @@ These are constraints, not aspirations. Each has tests.
 proto/      wire protocol (source of truth; M2)
 go/         daemon + CLI
   internal/adapter/claudecode/   hooks, transcript parser + tailer, version gate, installer
+  internal/adapter/omp/          session parser + tailer, writer lease, extension installer
   internal/attach/               pty wrap, input encoding + fencing, discovery, tmux
   internal/daemon/               hook listener, registry, manager, state machine
   internal/store/                SQLite: sessions, transcripts, approvals, audit
@@ -185,7 +199,8 @@ Beyond the unit tests, three things are validated against reality rather than fi
 
 - The transcript parser runs against every real Claude Code session file on the host — 38
   files including a 143 MB / 5,372-event one, parsed in 1.4 s at 38 MB RSS, with tool calls
-  and results matching exactly.
+  and results matching exactly. The omp parser runs against real 18.12.2 files, and the
+  extension has been exercised end to end against a live omp process.
 - The VT emulator has a randomized property test: 400 rounds of arbitrary escape sequences,
   asserting that applying deltas to a client replica always reproduces the daemon's grid.
   It found a real wide-character bug on its first run.
