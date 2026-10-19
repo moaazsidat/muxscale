@@ -30,3 +30,6 @@ node_modules/
 *.p8
 *.p12
 *.pfx
+
+# The cf CLI's per-directory cache (account id and name).
+.cloudflare/
