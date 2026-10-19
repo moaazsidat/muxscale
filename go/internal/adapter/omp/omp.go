@@ -71,14 +71,21 @@ type entry struct {
 	Cwd         string `json:"cwd"`
 	TitleSource string `json:"titleSource"`
 
-	// model_change
-	Model string `json:"model"`
-	Role  string `json:"role"`
+	// model_change. omp writes model; pi writes provider and modelId.
+	Model   string `json:"model"`
+	ModelID string `json:"modelId"`
+	Role    string `json:"role"`
+
+	// session_info (pi): a person's name for the session, from /name.
+	Name string `json:"name"`
 
 	// message and custom_message
 	Message     *message        `json:"message"`
 	Content     json.RawMessage `json:"content"`
 	Attribution string          `json:"attribution"`
+	// Display is pi's flag on an extension's custom_message. omp's carry
+	// attribution instead.
+	Display *bool `json:"display"`
 
 	// custom
 	CustomType string          `json:"customType"`
@@ -223,8 +230,14 @@ func (p *parser) parseLine(line []byte) ([]protocol.TranscriptEvent, adapter.Met
 		return nil, meta
 
 	case "model_change":
-		if e.Model != "" {
-			meta.Model = e.Model
+		if m := firstNonEmpty(e.Model, e.ModelID); m != "" {
+			meta.Model = m
+		}
+		return nil, meta
+
+	case "session_info":
+		if name := strings.TrimSpace(e.Name); name != "" {
+			meta.CustomTitle = &name
 		}
 		return nil, meta
 
@@ -267,8 +280,11 @@ func (p *parser) parseLine(line []byte) ([]protocol.TranscriptEvent, adapter.Met
 		if text == "" {
 			return nil, meta
 		}
+		// omp attributes these; an unattributed one is the person's. pi's
+		// come from extensions, flagged with display rather than attributed,
+		// and are never the person speaking.
 		kind := protocol.EventNotice
-		if e.Attribution == "user" || e.Attribution == "" {
+		if e.Attribution == "user" || (e.Attribution == "" && e.Display == nil) {
 			kind = protocol.EventUserMessage
 		}
 		text, trunc := clip(text, excerptBytes)
@@ -718,7 +734,17 @@ type headerInfo struct {
 	Cwd     string
 	Title   string
 	Started time.Time
+	// Name is pi's session_info name, when one comes before the first prompt.
+	Name string
+	// FirstPrompt labels a session that has no title: pi writes none, and
+	// shows the first message in its own session picker.
+	FirstPrompt string
 }
+
+// headerScan bounds how far readHeader looks for a first prompt. The prompt
+// is normally within a few lines of the header; a session that opens some
+// other way goes untitled rather than costing a long read every discovery.
+const headerScan = 16
 
 // readHeader reads a session's opening records: an optional title slot, then
 // the session header. One small read per candidate, never a full parse.
@@ -732,7 +758,7 @@ func readHeader(path string) (headerInfo, bool) {
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 	var h headerInfo
-	for i := 0; i < 4 && sc.Scan(); i++ {
+	for i := 0; i < headerScan && sc.Scan(); i++ {
 		var e entry
 		if json.Unmarshal(sc.Bytes(), &e) != nil {
 			continue
@@ -751,8 +777,23 @@ func readHeader(path string) (headerInfo, bool) {
 			if t, err := time.Parse(time.RFC3339Nano, e.Timestamp); err == nil {
 				h.Started = t
 			}
-			return h, h.ID != ""
+			if h.Title != "" {
+				return h, h.ID != "" // titled: nothing further to read
+			}
+		case "session_info":
+			if name := strings.TrimSpace(e.Name); name != "" {
+				h.Name = name
+			}
+		case "message":
+			if e.Message != nil && e.Message.Role == "user" {
+				text, _ := clip(strings.Join(strings.Fields(contentText(e.Message.Content)), " "), 80)
+				h.FirstPrompt = text
+				return h, h.ID != ""
+			}
+		}
+		if i == 3 && h.ID == "" {
+			return h, false // no header where one must be: not a session
 		}
 	}
-	return h, false
+	return h, h.ID != ""
 }

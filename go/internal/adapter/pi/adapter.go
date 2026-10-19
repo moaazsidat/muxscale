@@ -5,12 +5,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/muxscale/muxscale/go/internal/adapter"
+	"github.com/muxscale/muxscale/go/internal/adapter/omp"
 	"github.com/muxscale/muxscale/go/internal/protocol"
 )
 
@@ -95,6 +94,7 @@ var (
 	_ adapter.Transcriber   = (*Adapter)(nil)
 	_ adapter.StateInferrer = (*Adapter)(nil)
 	_ adapter.Approver      = (*Adapter)(nil)
+	_ adapter.Locator       = (*Adapter)(nil)
 )
 
 func (*Adapter) Info() adapter.Info {
@@ -129,114 +129,58 @@ func (*Adapter) Detect(p adapter.Process) bool {
 	return len(p.Argv) > 0 && filepath.Base(p.Argv[0]) == "pi"
 }
 
-// Discover walks pi's session directories.
+// Layout is where pi keeps sessions: PI_CODING_AGENT_DIR, else ~/.pi/agent,
+// one --<cwd with slashes as hyphens>-- directory per project.
 //
-// pi names each directory after the working directory it was started in, so
-// unlike Codex the project is recoverable from the path alone, without opening
-// every file.
-func (*Adapter) Discover(context.Context) ([]adapter.Discovered, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, err
-	}
-	root := filepath.Join(home, ".pi", "agent", "sessions")
-	dirs, err := os.ReadDir(root)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil // pi isn't installed.
+// The format is the one omp inherited from pi -- verified against pi 0.83's
+// docs/session-format.md -- so pi reads its files with the same parser and
+// joins processes to them with the same rules. pi holds no writer lease, so a
+// session is live while its process is (the process scan) or, without one,
+// while its file has been written recently.
+var Layout = omp.Layout{
+	Agent: "pi",
+	AgentDir: func() (string, error) {
+		if d := os.Getenv("PI_CODING_AGENT_DIR"); d != "" {
+			return d, nil
 		}
-		return nil, err
-	}
-
-	var out []adapter.Discovered
-	for _, d := range dirs {
-		if !d.IsDir() {
-			continue
-		}
-		cwd := cwdFromSlug(d.Name())
-		files, err := os.ReadDir(filepath.Join(root, d.Name()))
+		home, err := os.UserHomeDir()
 		if err != nil {
-			continue
+			return "", err
 		}
-		for _, f := range files {
-			if f.IsDir() || !strings.HasSuffix(f.Name(), ".jsonl") {
-				continue
-			}
-			path := filepath.Join(root, d.Name(), f.Name())
-			info, statErr := f.Info()
-			out = append(out, adapter.Discovered{
-				NaturalKey: strings.TrimSuffix(f.Name(), ".jsonl"),
-				Cwd:        cwd,
-				Ref:        path,
-				Live:       statErr == nil && time.Since(info.ModTime()) < liveWindow,
-			})
+		return filepath.Join(home, ".pi", "agent"), nil
+	},
+	Bucket: func(cwd string) (string, error) {
+		if cwd == "" {
+			return "", fmt.Errorf("no working directory")
 		}
-	}
-	// Deterministic order; the filesystem gives none.
-	sort.Slice(out, func(i, j int) bool { return out[i].Ref < out[j].Ref })
-	return out, nil
+		return SessionSlug(cwd), nil
+	},
 }
 
-// liveWindow matches the Codex adapter's reasoning: a session blocked on a
-// human is idle by definition, so a short window would hide exactly the
-// sessions worth surfacing.
-const liveWindow = 12 * time.Hour
-
-// cwdFromSlug inverts SessionSlug: --Users-sam-dev-x-- -> /Users/sam/dev/x
-//
-// Lossy, and knowingly so: a directory whose own name contains a hyphen is
-// indistinguishable from a path separator once slugged. The result is used for
-// display and grouping, never to resolve a path on disk, so a wrong guess
-// mislabels a project rather than touching the wrong directory.
-func cwdFromSlug(slug string) string {
-	s := strings.Trim(slug, "-")
-	if s == "" {
-		return ""
-	}
-	return "/" + strings.ReplaceAll(s, "-", "/")
+// Discover walks pi's session directories.
+func (*Adapter) Discover(context.Context) ([]adapter.Discovered, error) {
+	return Layout.Discover()
 }
 
 func (*Adapter) OpenTranscript(_ context.Context, ref string) (adapter.TranscriptStream, error) {
-	return &stream{path: ref}, nil
+	return omp.NewStream(ref), nil
 }
 
-// stream re-reads the session file and emits what is new, for the same reason
-// the Codex stream does: pi entries are variable-length JSON lines and the
-// final one is frequently half-written.
-type stream struct {
-	path    string
-	emitted int
+// TranscriptForProcess has nothing to read: pi leaves no per-terminal record
+// of which session it is showing. MatchTranscript joins by start time instead.
+func (*Adapter) TranscriptForProcess(adapter.Process) string { return "" }
+
+func (*Adapter) MatchTranscript(cwd string, started time.Time, claimed map[string]bool) string {
+	return Layout.MatchTranscript(cwd, started, claimed)
 }
 
-func (s *stream) Poll(context.Context) ([]protocol.TranscriptEvent, error) {
-	f, err := os.Open(s.path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	defer f.Close()
-
-	events, _, err := ParseSession(f)
-	if err != nil {
-		return nil, err
-	}
-	if len(events) <= s.emitted {
-		return nil, nil
-	}
-	fresh := events[s.emitted:]
-	s.emitted = len(events)
-	return fresh, nil
-}
-
-func (s *stream) Close() error { return nil }
-
+// InferState takes pi's own event name when muxscale owns the session's pipe,
+// and otherwise reads the transcript, as for omp.
 func (*Adapter) InferState(in adapter.StateInput) (protocol.StateGuess, bool) {
-	if in.Event == "" {
-		return protocol.StateGuess{}, false
+	if in.Event != "" {
+		return InferState(in.Event)
 	}
-	return InferState(in.Event)
+	return omp.InferTreeState(in, "pi")
 }
 
 // Reply sends a human's decision back over pi's extension pipe.

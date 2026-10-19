@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -67,81 +66,9 @@ func base(s string) string {
 	return strings.TrimSuffix(filepath.Base(s), ".exe")
 }
 
-// Discover walks ~/.omp/agent/sessions.
-//
-// Only direct children of a bucket are sessions. Subagent transcripts live in
-// a directory named after their parent (<timestamp>_<id>/<name>.jsonl); they
-// are activity inside a session, not peers of it.
+// Discover walks ~/.omp/agent/sessions; see Layout.Discover.
 func (*Adapter) Discover(context.Context) ([]adapter.Discovered, error) {
-	root, err := SessionsRoot()
-	if err != nil {
-		return nil, err
-	}
-	buckets, err := os.ReadDir(root)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil // omp is not installed, or has never run.
-		}
-		return nil, err
-	}
-
-	// A copied session file keeps its id, so the same id can appear twice in a
-	// bucket. One row per id, newest file wins: two rows for one conversation
-	// would split its state and duplicate its transcript.
-	best := map[string]adapter.Discovered{}
-	bestMod := map[string]time.Time{}
-	for _, b := range buckets {
-		if !b.IsDir() {
-			continue
-		}
-		dir := filepath.Join(root, b.Name())
-		files, err := os.ReadDir(dir)
-		if err != nil {
-			continue
-		}
-		for _, f := range files {
-			if f.IsDir() || !strings.HasSuffix(f.Name(), ".jsonl") {
-				continue
-			}
-			path := filepath.Join(dir, f.Name())
-			id := SessionIDFromPath(path)
-			if id == "" {
-				continue // a subagent file placed beside its parent
-			}
-			h, ok := readHeader(path)
-			if !ok {
-				continue // not a session, or still being written
-			}
-			info, statErr := f.Info()
-			mod := time.Time{}
-			if statErr == nil {
-				mod = info.ModTime()
-			}
-			if prev, ok := bestMod[id]; ok && !mod.After(prev) {
-				continue
-			}
-			live := time.Since(mod) < 12*time.Hour
-			if held, known := Live(path); known {
-				live = held
-			}
-			best[id] = adapter.Discovered{
-				NaturalKey: id,
-				Cwd:        h.Cwd,
-				Title:      h.Title,
-				Ref:        path,
-				Live:       live,
-			}
-			bestMod[id] = mod
-		}
-	}
-
-	out := make([]adapter.Discovered, 0, len(best))
-	for _, d := range best {
-		out = append(out, d)
-	}
-	// Deterministic order; the filesystem gives none.
-	sort.Slice(out, func(i, j int) bool { return out[i].Ref < out[j].Ref })
-	return out, nil
+	return OmpLayout.Discover()
 }
 
 // OpenTranscript follows a session file. ref is the transcript path.
@@ -188,93 +115,9 @@ func (*Adapter) TranscriptForProcess(p adapter.Process) string {
 }
 
 // MatchTranscript joins a process to a project's session files when no
-// breadcrumb exists. Same rules as the Claude Code join: an exact start time
-// wins, one unclaimed file is unambiguous, and a resumed session falls back to
-// the file written after the process began. Never two equally plausible files.
+// breadcrumb exists; see Layout.MatchTranscript.
 func (*Adapter) MatchTranscript(cwd string, started time.Time, claimed map[string]bool) string {
-	if cwd == "" {
-		return ""
-	}
-	bucket, err := bucketName(cwd)
-	if err != nil {
-		return ""
-	}
-	root, err := SessionsRoot()
-	if err != nil {
-		return ""
-	}
-	dir := filepath.Join(root, bucket)
-	files, err := os.ReadDir(dir)
-	if err != nil {
-		return ""
-	}
-
-	type cand struct {
-		path    string
-		started time.Time
-		mod     time.Time
-	}
-	var cands []cand
-	for _, f := range files {
-		if f.IsDir() || !strings.HasSuffix(f.Name(), ".jsonl") {
-			continue
-		}
-		path := filepath.Join(dir, f.Name())
-		if claimed[path] || SessionIDFromPath(path) == "" {
-			continue
-		}
-		h, ok := readHeader(path)
-		if !ok {
-			continue
-		}
-		if h.Cwd != "" && filepath.Clean(h.Cwd) != filepath.Clean(cwd) {
-			continue
-		}
-		info, err := f.Info()
-		if err != nil {
-			continue
-		}
-		cands = append(cands, cand{path: path, started: h.Started, mod: info.ModTime()})
-	}
-	if len(cands) == 0 {
-		return ""
-	}
-
-	// A fresh session writes its header moments after the process starts.
-	const tolerance = 60 * time.Second
-	if !started.IsZero() {
-		for _, c := range cands {
-			if !c.started.IsZero() && absDuration(c.started.Sub(started)) <= tolerance {
-				return c.path
-			}
-		}
-	}
-	if len(cands) == 1 {
-		return cands[0].path
-	}
-	if started.IsZero() {
-		return ""
-	}
-	// Resumed: the session file predates the process, so the best available
-	// signal is the newest file written after the process began.
-	var pick string
-	var pickMod time.Time
-	for _, c := range cands {
-		if c.mod.Before(started.Add(-5 * time.Second)) {
-			continue
-		}
-		if c.mod.After(pickMod) {
-			pick, pickMod = c.path, c.mod
-		}
-	}
-	return pick
-}
-
-func absDuration(d time.Duration) time.Duration {
-	if d < 0 {
-		return -d
-	}
-	return d
+	return OmpLayout.MatchTranscript(cwd, started, claimed)
 }
 
 // canonical resolves symlinks when it can, falling back to a clean path. A
@@ -300,6 +143,12 @@ func DetectVersion() (adapter.Version, error) {
 // Confidence is deliberately below the extension's: this is inference, and
 // the product's credibility depends on not dressing a guess up as a fact.
 func (*Adapter) InferState(in adapter.StateInput) (protocol.StateGuess, bool) {
+	return InferTreeState(in, "omp")
+}
+
+// InferTreeState is InferState for any agent writing this session format;
+// agent names it in the evidence.
+func InferTreeState(in adapter.StateInput, agent string) (protocol.StateGuess, bool) {
 	if len(in.Recent) == 0 {
 		return protocol.StateGuess{}, false
 	}
@@ -335,19 +184,19 @@ func (*Adapter) InferState(in adapter.StateInput) (protocol.StateGuess, bool) {
 	}
 	switch last.Kind {
 	case protocol.EventToolCall:
-		return guess(protocol.StateRunning, 0.6, "a tool call is in flight", last, now), true
+		return guess(agent, protocol.StateRunning, 0.6, "a tool call is in flight", last, now), true
 	case protocol.EventToolResult:
-		return guess(protocol.StateRunning, 0.55, "a tool result just landed; the model speaks next", last, now), true
+		return guess(agent, protocol.StateRunning, 0.55, "a tool result just landed; the model speaks next", last, now), true
 	case protocol.EventUserMessage, protocol.EventCommand:
-		return guess(protocol.StateRunning, 0.5, "the last entry is input to the agent", last, now), true
+		return guess(agent, protocol.StateRunning, 0.5, "the last entry is input to the agent", last, now), true
 	case protocol.EventCompaction:
-		return guess(protocol.StateRunning, 0.5, "omp is compacting the conversation", last, now), true
+		return guess(agent, protocol.StateRunning, 0.5, "omp is compacting the conversation", last, now), true
 	case protocol.EventAssistantMessage, protocol.EventThinking, protocol.EventError:
 		if in.Idle >= in.Quiescence {
-			return guess(protocol.StateWaitingInput, 0.7,
+			return guess(agent, protocol.StateWaitingInput, 0.7,
 				"the assistant finished speaking and the transcript has been quiet", last, now), true
 		}
-		return guess(protocol.StateRunning, 0.65, "the assistant is mid-turn", last, now), true
+		return guess(agent, protocol.StateRunning, 0.65, "the assistant is mid-turn", last, now), true
 	}
 	return protocol.StateGuess{}, false
 }
@@ -369,9 +218,9 @@ func lastTurnEvent(recent []protocol.TranscriptEvent) (protocol.TranscriptEvent,
 	return protocol.TranscriptEvent{}, false
 }
 
-func guess(s protocol.SessionState, c float64, reason string, last protocol.TranscriptEvent, at time.Time) protocol.StateGuess {
+func guess(agent string, s protocol.SessionState, c float64, reason string, last protocol.TranscriptEvent, at time.Time) protocol.StateGuess {
 	return protocol.StateGuess{
 		State: s, Confidence: c, Reason: reason,
-		Evidence: "omp transcript: last event " + string(last.Kind), At: at,
+		Evidence: agent + " transcript: last event " + string(last.Kind), At: at,
 	}
 }

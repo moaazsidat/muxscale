@@ -1,11 +1,16 @@
 package pi
 
 import (
+	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/muxscale/muxscale/go/internal/adapter"
+	"github.com/muxscale/muxscale/go/internal/adapter/omp"
 	"github.com/muxscale/muxscale/go/internal/protocol"
 )
 
@@ -255,27 +260,37 @@ func TestSessionSlug(t *testing.T) {
 	}
 }
 
-func TestParseSessionTree(t *testing.T) {
-	file := strings.Join([]string{
-		`{"type":"session","version":"0.83.0","id":"sess-1","timestamp":"2026-08-04T10:00:00Z","cwd":"/home/dev/app"}`,
-		`{"type":"model_change","id":"m1","parentId":"sess-1","provider":"anthropic","modelId":"claude-opus-5"}`,
-		`{"type":"message","id":"e1","parentId":"sess-1","timestamp":"2026-08-04T10:00:01Z","message":{"role":"user","content":"add a health endpoint"}}`,
-		`{"type":"message","id":"e2","parentId":"e1","timestamp":"2026-08-04T10:00:02Z","message":{"role":"assistant","model":"claude-opus-5","content":[{"type":"thinking","thinking":"check the router"},{"type":"text","text":"On it."},{"type":"toolCall","id":"tc1","name":"read","input":{"path":"/app/router.ts"}}]}}`,
-		`{"type":"message","id":"e3","parentId":"e2","timestamp":"2026-08-04T10:00:03Z","message":{"role":"user","content":[{"type":"toolResult","toolCallId":"tc1","output":"export const router","isError":false}]}}`,
-		`{"type":"session_info","id":"i1","parentId":"e3","name":"Health endpoint"}`,
-		`{ malformed line`,
-		`{"type":"compaction","id":"c1","parentId":"e3","summary":"earlier work","tokensBefore":9000}`,
-	}, "\n")
+// A session in pi's documented format (docs/session-format.md, pi 0.83):
+// a numeric version, toolCall arguments, tool results as their own message,
+// bash executions, provider/modelId model changes, a /name, and an
+// extension's custom_message.
+var sessionFile = strings.Join([]string{
+	`{"type":"session","version":3,"id":"0f9c2b1e-sess","timestamp":"2026-08-04T10:00:00.000Z","cwd":"/home/dev/app"}`,
+	`{"type":"model_change","id":"m1","parentId":null,"timestamp":"2026-08-04T10:00:00.500Z","provider":"anthropic","modelId":"claude-opus-5"}`,
+	`{"type":"message","id":"e1","parentId":"m1","timestamp":"2026-08-04T10:00:01.000Z","message":{"role":"user","content":"add a health endpoint","timestamp":1785751201000}}`,
+	`{"type":"message","id":"e2","parentId":"e1","timestamp":"2026-08-04T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"check the router"},{"type":"text","text":"On it."},{"type":"toolCall","id":"tc1","name":"read","arguments":{"path":"/app/router.ts"}}],"provider":"anthropic","model":"claude-opus-5","usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":15},"stopReason":"toolUse"}}`,
+	`{"type":"message","id":"e3","parentId":"e2","timestamp":"2026-08-04T10:00:03.000Z","message":{"role":"toolResult","toolCallId":"tc1","toolName":"read","content":[{"type":"text","text":"export const router"}],"isError":false}}`,
+	`{"type":"message","id":"e4","parentId":"e3","timestamp":"2026-08-04T10:00:04.000Z","message":{"role":"bashExecution","command":"ls","output":"router.ts","exitCode":0,"cancelled":false,"truncated":false}}`,
+	`{"type":"custom_message","id":"x1","parentId":"e4","timestamp":"2026-08-04T10:00:05.000Z","customType":"my-extension","content":"Injected context","display":true}`,
+	`{"type":"session_info","id":"i1","parentId":"x1","timestamp":"2026-08-04T10:00:06.000Z","name":"Health endpoint"}`,
+	`{ malformed line`,
+	`{"type":"compaction","id":"c1","parentId":"i1","timestamp":"2026-08-04T10:00:07.000Z","summary":"earlier work","firstKeptEntryId":"e3","tokensBefore":9000}`,
+	`{"type":"message","id":"e5","parentId":"c1","timestamp":"2026-08-04T10:00:08.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Done."}],"provider":"anthropic","model":"claude-opus-5","stopReason":"stop"}}`,
+}, "\n") + "\n"
 
-	events, meta, err := ParseSession(strings.NewReader(file))
+func TestParseSessionTree(t *testing.T) {
+	events, meta, err := omp.ParseSession(strings.NewReader(sessionFile))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if meta.SessionID != "sess-1" || meta.Cwd != "/home/dev/app" {
-		t.Errorf("meta = %+v", meta)
+	if meta.SessionID != "0f9c2b1e-sess" || meta.Cwd != "/home/dev/app" {
+		t.Errorf("header lost: meta = %+v", meta)
 	}
-	if meta.Model != "claude-opus-5" || meta.Name != "Health endpoint" || meta.Version != "0.83.0" {
-		t.Errorf("meta = %+v", meta)
+	if meta.Model != "claude-opus-5" {
+		t.Errorf("model = %q", meta.Model)
+	}
+	if meta.CustomTitle == nil || *meta.CustomTitle != "Health endpoint" {
+		t.Errorf("session_info name lost: %+v", meta.CustomTitle)
 	}
 
 	counts := map[protocol.EventKind]int{}
@@ -283,16 +298,35 @@ func TestParseSessionTree(t *testing.T) {
 		counts[e.Kind]++
 	}
 	want := map[protocol.EventKind]int{
-		protocol.EventUserMessage:      1,
-		protocol.EventAssistantMessage: 1,
+		protocol.EventUserMessage:      1, // the extension's message is not the person's
+		protocol.EventAssistantMessage: 2,
 		protocol.EventThinking:         1,
 		protocol.EventToolCall:         1,
 		protocol.EventToolResult:       1,
+		protocol.EventCommand:          1,
+		protocol.EventCommandOutput:    1,
+		protocol.EventNotice:           1,
 		protocol.EventCompaction:       1,
 	}
 	for k, w := range want {
 		if counts[k] != w {
 			t.Errorf("count[%s] = %d, want %d", k, counts[k], w)
+		}
+	}
+	for _, e := range events {
+		switch e.Kind {
+		case protocol.EventToolCall:
+			if e.ToolName != "read" || e.ToolUseID != "tc1" || e.ToolInput["path"] != "/app/router.ts" {
+				t.Errorf("tool call = %+v", e)
+			}
+		case protocol.EventToolResult:
+			if e.ToolUseID != "tc1" || !strings.Contains(e.Text, "export const router") {
+				t.Errorf("tool result = %+v", e)
+			}
+		case protocol.EventAssistantMessage:
+			if strings.Contains(e.Text, "export const router") {
+				t.Error("a tool result was rendered as the assistant speaking")
+			}
 		}
 	}
 
@@ -307,11 +341,54 @@ func TestParseSessionTree(t *testing.T) {
 	if linked == 0 {
 		t.Error("parentId linkage lost; the session tree is flattened")
 	}
+}
 
-	for i, e := range events {
-		if e.Seq != uint64(i+1) {
-			t.Fatalf("event %d has seq %d, want %d", i, e.Seq, i+1)
-		}
+func TestDiscoverAndJoinPiSessions(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PI_CODING_AGENT_DIR", dir)
+	bucket := filepath.Join(dir, "sessions", SessionSlug("/home/dev/app"))
+	if err := os.MkdirAll(bucket, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(bucket, "2026-08-04T10-00-00-000Z_0f9c2b1e-sess.jsonl")
+	if err := os.WriteFile(path, []byte(sessionFile), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := (&Adapter{}).Discover(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("discovered %+v", got)
+	}
+	d := got[0]
+	if d.NaturalKey != "0f9c2b1e-sess" || d.Cwd != "/home/dev/app" || d.Ref != path || !d.Live {
+		t.Errorf("discovered = %+v", d)
+	}
+	// pi writes no title; its own picker shows the first message.
+	if d.Title != "add a health endpoint" {
+		t.Errorf("title = %q", d.Title)
+	}
+
+	started := time.Date(2026, 8, 4, 10, 0, 0, 0, time.UTC)
+	if m := (&Adapter{}).MatchTranscript("/home/dev/app", started, nil); m != path {
+		t.Errorf("join = %q, want %q", m, path)
+	}
+	if m := (&Adapter{}).MatchTranscript("/home/dev/app", started, map[string]bool{path: true}); m != "" {
+		t.Errorf("joined a claimed file: %q", m)
+	}
+}
+
+func TestInferStateFromTranscriptWithoutAPipe(t *testing.T) {
+	in := adapter.StateInput{
+		Recent:     []protocol.TranscriptEvent{{Kind: protocol.EventAssistantMessage, Text: "Done."}},
+		Idle:       time.Minute,
+		Quiescence: 6 * time.Second,
+	}
+	g, ok := (&Adapter{}).InferState(in)
+	if !ok || g.State != protocol.StateWaitingInput || !strings.HasPrefix(g.Evidence, "pi transcript") {
+		t.Fatalf("guess = %+v, ok=%v", g, ok)
 	}
 }
 
