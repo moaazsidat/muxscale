@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -24,6 +25,7 @@ import (
 	"time"
 
 	"github.com/muxscale/muxscale/go/internal/adapter"
+	"github.com/muxscale/muxscale/go/internal/adapter/bob"
 	"github.com/muxscale/muxscale/go/internal/adapter/builtin"
 	"github.com/muxscale/muxscale/go/internal/adapter/claudecode"
 	"github.com/muxscale/muxscale/go/internal/adapter/codex"
@@ -261,6 +263,19 @@ func ensureHooks(addr, token string, log *slog.Logger) {
 		path, _ := codex.HooksPath()
 		log.Info("set up Codex hooks; trust them once with /hooks in Codex",
 			"hooks", path)
+	}
+
+	// Bob Shell's hooks are its only report of state. Looked up rather than
+	// run: `bob` can stop to ask for its licence before printing a version.
+	// Its hooks run only in trusted workspaces, and a broken one fails open.
+	if _, err := exec.LookPath("bob"); err != nil {
+		log.Debug("bob not on PATH; skipping its hooks")
+	} else if changed, err := bob.EnsureHooks(bob.RelayCommand(exe, addr, tokenPath)); err != nil {
+		log.Warn("Bob hooks not set up", "reason", err)
+	} else if changed {
+		path, _ := bob.SettingsPath()
+		log.Info("set up Bob hooks; sessions in trusted workspaces report their state exactly",
+			"settings", path)
 	}
 }
 

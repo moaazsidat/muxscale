@@ -22,7 +22,7 @@ import (
 // silence and exit 0 -- a monitoring tool must never stall the agent it
 // monitors.
 func cmdHookRelay(args []string) error {
-	agent, addr, tokenFile := "", defaultAddr, ""
+	agent, addr, tokenFile, quiet := "", defaultAddr, "", false
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--agent":
@@ -40,6 +40,11 @@ func cmdHookRelay(args []string) error {
 				i++
 				tokenFile = args[i]
 			}
+		case "--quiet":
+			// For agents that read a hook's stdout as something else -- Bob
+			// adds it to the model's context -- and have no decision to take
+			// from it: deliver the event, print nothing.
+			quiet = true
 		default:
 			return fmt.Errorf("unknown option %q for `muxscale hook-relay`", args[i])
 		}
@@ -84,7 +89,7 @@ func cmdHookRelay(args []string) error {
 		return nil
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusOK || quiet {
 		return nil
 	}
 	_, _ = io.Copy(os.Stdout, resp.Body)

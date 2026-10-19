@@ -1,16 +1,19 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/muxscale/muxscale/go/internal/adapter"
+	"github.com/muxscale/muxscale/go/internal/adapter/bob"
 	"github.com/muxscale/muxscale/go/internal/adapter/claudecode"
 	"github.com/muxscale/muxscale/go/internal/adapter/codex"
 	"github.com/muxscale/muxscale/go/internal/adapter/omp"
@@ -175,6 +178,11 @@ func cmdDown(args []string) error {
 			fmt.Println("removed muxscale's Codex hooks")
 		}
 	}
+	if removed, err := bob.RemoveHooks(); err != nil {
+		fmt.Printf("bob hooks: %v\n", err)
+	} else if removed {
+		fmt.Println("removed muxscale's Bob hooks")
+	}
 	if len(shims) > 0 {
 		if removed, err := setup.UninstallShims(); err != nil {
 			fmt.Printf("shims: %v\n", err)
@@ -295,6 +303,16 @@ func cmdStatus(args []string) error {
 		} else {
 			line(" ok ", "codex", fmt.Sprintf("%s (%s)", v, s))
 			statusCodexHooks(line, fix)
+		}
+	}
+
+	// Bob Shell reports state only through its hooks.
+	if _, err := exec.LookPath("bob"); err == nil {
+		if ok, _ := bob.Installed(context.Background()); ok {
+			line(" ok ", "bob hooks", "installed; sessions in trusted workspaces report their state")
+		} else {
+			line("FAIL", "bob hooks", "not installed")
+			fix("restart the daemon; it installs Bob's hooks as it starts")
 		}
 	}
 
