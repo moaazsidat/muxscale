@@ -384,6 +384,7 @@ var eventsKeepalive = 15 * time.Second
 func (d *Daemon) routes(mux *http.ServeMux) {
 	// Terminal-shaped endpoints (shell, resize, grid stream) live in screen.go.
 	d.screenRoutes(mux)
+	d.uploadRoute(mux)
 
 	d.handle(mux, "/v1/sessions", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"sessions": d.reg.List()})
