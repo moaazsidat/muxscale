@@ -9,7 +9,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/muxscale/muxscale/go/internal/adapter"
 	"github.com/muxscale/muxscale/go/internal/adapter/claudecode"
+	"github.com/muxscale/muxscale/go/internal/adapter/omp"
 	"github.com/muxscale/muxscale/go/internal/attach"
 	"github.com/muxscale/muxscale/go/internal/protocol"
 	"github.com/muxscale/muxscale/go/internal/setup"
@@ -119,6 +121,9 @@ func cmdDown(args []string) error {
 	if len(hooks.Removing) > 0 {
 		removing = append(removing, "muxscale's hooks and token in "+hooks.SettingsPath)
 	}
+	if omp.ExtensionPresent() {
+		removing = append(removing, "the muxscale extension for omp")
+	}
 	shims, _ := setup.InstalledShims()
 	if len(shims) > 0 {
 		removing = append(removing, "shims for "+strings.Join(shims, ", "))
@@ -149,6 +154,13 @@ func cmdDown(args []string) error {
 			fmt.Printf("hooks: %v\n", err)
 		} else {
 			fmt.Printf("removed the hooks (backup: %s)\n", hooks.BackupPath)
+		}
+	}
+	if omp.ExtensionPresent() {
+		if removed, err := omp.RemoveExtension(); err != nil {
+			fmt.Printf("omp extension: %v\n", err)
+		} else if removed {
+			fmt.Println("removed the omp extension")
 		}
 	}
 	if len(shims) > 0 {
@@ -243,6 +255,20 @@ func cmdStatus(args []string) error {
 		} else {
 			line(" ok ", "claude", fmt.Sprintf("%s (%s)", v, s))
 			statusHooks(line, fix)
+		}
+	}
+
+	// omp, and the extension the daemon installs at startup.
+	if v, err := omp.DetectVersion(); err != nil {
+		line(" -- ", "omp", "not on PATH")
+	} else {
+		info := omp.New().Info()
+		s := info.ClassifyVersion(v)
+		if s == adapter.VersionTooOld {
+			line("FAIL", "omp", info.VersionMessage(v, s))
+		} else {
+			line(" ok ", "omp", fmt.Sprintf("%s (%s)", v, s))
+			statusOMPExtension(line, fix)
 		}
 	}
 
@@ -381,4 +407,16 @@ func statusReplies(line statusLine, fix func(string), live map[string]bool) {
 			fix(string(t.Kind) + ": " + t.HowToFix)
 		}
 	}
+}
+
+// statusOMPExtension checks the file the daemon writes on every start. The
+// read path works without it; this says whether state is exact or inferred.
+func statusOMPExtension(line statusLine, fix func(string)) {
+	token, _ := loadOrCreateToken()
+	if omp.ExtensionInstalled("http://"+apiAddr(), token) {
+		line(" ok ", "omp extension", "installed; state and turn boundaries are exact")
+		return
+	}
+	line("FAIL", "omp extension", "not installed or out of date")
+	fix("restart the daemon; it installs the extension as it starts")
 }

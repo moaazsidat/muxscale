@@ -23,8 +23,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/muxscale/muxscale/go/internal/adapter"
 	"github.com/muxscale/muxscale/go/internal/adapter/builtin"
 	"github.com/muxscale/muxscale/go/internal/adapter/claudecode"
+	"github.com/muxscale/muxscale/go/internal/adapter/omp"
 	"github.com/muxscale/muxscale/go/internal/daemon"
 	"github.com/muxscale/muxscale/go/internal/protocol"
 )
@@ -213,6 +215,27 @@ func ensureHooks(addr, token string, log *slog.Logger) {
 	case plan != nil:
 		log.Info("set up Claude Code hooks; sessions started from now on report their state exactly",
 			"settings", plan.SettingsPath, "backup", plan.BackupPath)
+	}
+
+	// omp discovers extensions from its agent directory, so this is one file
+	// and no settings edit. It is what turns a transcript guess into the
+	// agent's own account of a finished turn.
+	//
+	// Nothing is written when omp is not installed: creating ~/.omp for
+	// someone who has never run it is a side effect the daemon should not
+	// have. Below the verified floor, the read path still works and status
+	// explains why state is inferred.
+	if v, err := omp.DetectVersion(); err != nil {
+		log.Debug("omp not on PATH; skipping its extension")
+	} else if info := omp.New().Info(); info.ClassifyVersion(v) == adapter.VersionTooOld {
+		log.Warn("omp is below the supported floor; extension not installed",
+			"version", v, "floor", info.MinVersion)
+	} else if changed, err := omp.EnsureExtension("http://"+addr, token); err != nil {
+		log.Warn("omp extension not set up", "reason", err)
+	} else if changed {
+		path, _ := omp.ExtensionPath()
+		log.Info("set up the omp extension; sessions started from now on report their state exactly",
+			"extension", path)
 	}
 }
 
