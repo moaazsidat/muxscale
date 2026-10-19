@@ -7,34 +7,36 @@ requirement, a failing test. You're away from the keyboard and the work is stran
 an SSH session you can't comfortably reach. muxscale watches every agent session on your
 machines, notifies you the moment one blocks, and lets you unblock it with a sentence.
 
-**Status: M0 complete, M1 mostly complete.** Claude Code and omp, terminal only — no phone
-app and no cloud yet. See [the technical spec](docs/20260729-technical-spec.md) for the full
+**Status: M0 complete, M1 mostly complete.** Claude Code, omp, and Codex, terminal only —
+no phone app and no cloud yet. See [the technical spec](docs/20260729-technical-spec.md) for the full
 design, [§13 Milestones](docs/20260729-technical-spec.md#13-milestones) for what lands
-when, and [the omp adapter spec](docs/20261018-omp-adapter.md) for the second agent
-integration. Adopting agents that are *already running* is specified and partly built in
+when, [the omp adapter spec](docs/20261018-omp-adapter.md), and [the Codex adapter
+spec](docs/20261018-codex-adapter.md). Adopting agents that are *already running* is specified and partly built in
 [the adoption spec](docs/20260925-adopting-existing-sessions.md).
 
 ## What works today
 
 **Seeing your agents**
 
-- Every Claude Code and omp session on the machine is discovered and tracked, **including
-  ones muxscale never launched and ones that started before it was installed** — via
-  process scan, tmux enumeration, terminal breadcrumbs, and the agents' own session files.
+- Every Claude Code, omp, and Codex session on the machine is discovered and tracked,
+  **including ones muxscale never launched and ones that started before it was installed** —
+  via process scan, tmux enumeration, terminal breadcrumbs, and the agents' own session
+  indexes and files.
   omp liveness is the writer lease it holds, so a session whose process is gone is reported
   ended rather than guessed at from a file's age.
 - Full structured transcripts: turns, tool calls, results, diffs, token usage, subagent
-  threads — parsed straight from Claude Code's JSONL (verbatim Messages API shape) and
-  omp's session tree (`toolCall` blocks, `toolResult` messages, thinking, usage, forks).
+  threads — parsed straight from Claude Code's JSONL (verbatim Messages API shape), omp's
+  session tree (`toolCall` blocks, `toolResult` messages, thinking, usage, forks), and
+  Codex's rollouts (reasoning, `function_call`, patches, token counts).
 - Free metadata: AI-generated session title, git branch, model, agent version.
 - Everything persists to SQLite and survives a daemon restart with stable session IDs.
 
 **Knowing when they block**
 
 - Session state is **authoritative, not guessed**, when hooks or an extension are
-  installed: Claude Code's `Stop` and omp's `agent_end` mean the turn ended and the agent is
-  waiting on you. Confidence 1.0, no regexes. Without them, state is inferred from the
-  transcript and the omp writer lease, capped at 0.7.
+  installed: Claude Code's `Stop`, omp's `agent_end`, and Codex's `Stop` mean the turn ended
+  and the agent is waiting on you. Confidence 1.0, no regexes. Without them, state is
+  inferred from the transcript, capped below 1.0.
 - Without hooks, state is inferred from the transcript and capped at 0.7 confidence, with
   the evidence recorded so `debug state` can explain itself.
 
@@ -78,14 +80,17 @@ That is the whole setup. Your running agents appear in `muxscale ls` within seco
 nothing restarted. `muxscale status` says what is running and reachable, and how to fix
 what is not; `muxscale down` removes everything muxscale set up.
 
-**Claude Code hooks and the omp extension need no step of their own.** The daemon sets them
-up each time it starts (blocked-state accuracy and remote approvals): it adds muxscale's entries and the
+**Claude Code hooks, the omp extension, and Codex hooks need no step of their own.** The
+daemon sets them up each time it starts (blocked-state accuracy and remote approvals): it adds muxscale's entries and the
 token they authenticate with to `~/.claude/settings.json`, backing the file up first and
 changing it only when something is missing or out of date. Every hook already there is
 preserved. Claude Code sessions started after that report their state exactly. For omp it
 writes one file, `~/.omp/agent/extensions/muxscale.ts`; omp discovers it with no settings
 edit, and removing the file (or `muxscale down`) turns exact state back into inference.
-Run the daemon with `--no-hooks` to leave both alone.
+Codex has no HTTP hook transport, so the daemon installs command hooks in
+`~/.codex/hooks.json` that run `muxscale hook-relay`; Codex requires non-managed hooks to be
+trusted once with `/hooks` before they run. `muxscale status` says when that step is
+outstanding. Run the daemon with `--no-hooks` to leave all three alone.
 
 ```bash
 ./muxscale ls                 # sessions, and pending approvals with their IDs
@@ -168,6 +173,12 @@ These are constraints, not aspirations. Each has tests.
 - **omp approvals are local for now.** omp's extension API can report a turn boundary but
   cannot answer its own approval dialog, so muxscale does not advertise remote approvals
   for it. State is exact; a blocked `yolo`-off prompt is still answered in the terminal.
+- **Codex hooks need trust.** The daemon installs them, but Codex skips non-managed hooks
+  until you open `/hooks` in Codex and trust them. Until then Codex sessions still appear
+  with transcripts and a derived state; `muxscale status` says what is missing.
+- **Codex ≥ 0.163.0.** The thread index, rollout shape, and command-hook schema were
+  verified there. Older sessions still parse; the hook installer is skipped below the
+  floor.
 
 ## Layout
 
@@ -176,6 +187,7 @@ proto/      wire protocol (source of truth; M2)
 go/         daemon + CLI
   internal/adapter/claudecode/   hooks, transcript parser + tailer, version gate, installer
   internal/adapter/omp/          session parser + tailer, writer lease, extension installer
+  internal/adapter/codex/        thread index + rollout parser, process join, hook installer
   internal/attach/               pty wrap, input encoding + fencing, discovery, tmux
   internal/daemon/               hook listener, registry, manager, state machine
   internal/store/                SQLite: sessions, transcripts, approvals, audit
