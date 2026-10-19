@@ -171,6 +171,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 			return err
 		}
 	}
+	unlock, err := acquireStateLock(stateDir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	st, err := store.Open(stateDir)
 	if err != nil {
 		return err

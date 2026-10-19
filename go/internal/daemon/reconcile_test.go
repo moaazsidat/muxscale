@@ -3,7 +3,10 @@ package daemon
 import (
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/muxscale/muxscale/go/internal/protocol"
 	"github.com/muxscale/muxscale/go/internal/store"
@@ -122,5 +125,68 @@ func TestFidelityRankOrdering(t *testing.T) {
 	// reconciliation against a known-good attachment.
 	if fidelityRank(protocol.Fidelity("nonsense")) != 0 {
 		t.Error("an unknown fidelity should rank lowest")
+	}
+}
+
+// One conversation found by a process scan and by session discovery must be
+// one row. Equal fidelity used to keep both; the row carrying the person's
+// rename was the one that then disappeared. The name has to survive the fold.
+func TestReconcileFoldsEqualFidelityAndKeepsTheName(t *testing.T) {
+	m, reg, _ := testManager(t)
+	path := filepath.Join(t.TempDir(), "s.jsonl")
+	if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	keep := reg.Upsert("claude-code", "pid:50113", func(s *protocol.Session) {
+		s.Attachment = protocol.AttachTermctl
+		s.Fidelity = protocol.FidelityStructured
+		s.TranscriptPath = path
+	})
+	reg.Upsert("claude-code", "cdef6772", func(s *protocol.Session) {
+		s.Name = "focus"
+		s.Title = "Focus tool fixes"
+		s.Attachment = protocol.AttachTranscript
+		s.Fidelity = protocol.FidelityStructured
+		s.TranscriptPath = path
+	})
+
+	m.Reconcile(keep.ID, path)
+
+	if _, ok := reg.IDFor("claude-code", "cdef6772"); ok {
+		t.Fatal("duplicate row survived the reconcile")
+	}
+	got, ok := reg.Get(keep.ID)
+	if !ok {
+		t.Fatal("kept row disappeared")
+	}
+	if got.Name != "focus" || got.Title != "Focus tool fixes" {
+		t.Errorf("kept row lost the name: %+v", got)
+	}
+}
+
+// Only a wrapped session is certainly lost after a restart. Everything else
+// can be found again, and a certain DETACHED shut inference out permanently.
+func TestRestoreOnlyDetachesWrappedSessions(t *testing.T) {
+	m, _, st := testManager(t)
+	now := time.Now()
+	for _, s := range []*protocol.Session{
+		{ID: "wrap", AgentID: "claude-code", NaturalKey: "pid:1", State: protocol.StateRunning,
+			Attachment: protocol.AttachWrap, CreatedAt: now, LastEventAt: now},
+		{ID: "transcript", AgentID: "claude-code", NaturalKey: "uuid-1", State: protocol.StateRunning,
+			Attachment: protocol.AttachTranscript, CreatedAt: now, LastEventAt: now},
+	} {
+		if err := st.SaveSession(s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := m.Restore(); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := m.reg.Get("wrap"); got.State != protocol.StateDetached || got.Guess.Confidence != 1 {
+		t.Errorf("wrapped session = %s/%v", got.State, got.Guess.Confidence)
+	}
+	if got, _ := m.reg.Get("transcript"); got.State != protocol.StateUnknown || got.Guess.Confidence >= 1 {
+		t.Errorf("transcript session = %s/%v", got.State, got.Guess.Confidence)
 	}
 }

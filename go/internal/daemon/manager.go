@@ -182,17 +182,20 @@ func (m *Manager) Restore() (int, error) {
 		if s.State.Terminal() {
 			continue // keep terminal sessions in the DB, not in the live list
 		}
+		// Only a wrapped session is certainly lost: the daemon owned its PTY
+		// and that PTY died with it. Every other attachment can be found
+		// again -- by the process scan, a hook, a terminal, or the agent's
+		// own session files -- so call it unknown and let re-adoption say
+		// what it is. Marking those DETACHED with confidence 1 was a certain
+		// lie, and it was final: inference refuses to overwrite confidence 1,
+		// so a session whose process was still running stayed buried in the
+		// app's collapsed Detached section until it happened to fire a hook.
 		state := protocol.StateDetached
-		reason := "daemon restarted; attachment lost"
+		reason := "daemon restarted; the PTY it owned is gone"
 		confidence := 1.0
-		if s.Attachment == protocol.AttachNative && time.Since(s.LastEventAt) < staleHookSession {
-			// Hook-driven sessions re-announce themselves on their next event,
-			// so they are recoverable rather than lost. Until then this is a
-			// guess, and says so: a certain "unknown" shut out the transcript
-			// inference that would have found an idle session waiting, and
-			// it read as unknown until someone next prompted it.
+		if s.Attachment != protocol.AttachWrap {
 			state = protocol.StateUnknown
-			reason = "daemon restarted; awaiting the next hook"
+			reason = "daemon restarted; awaiting re-adoption"
 			confidence = 0.3
 		}
 		// Nothing can find this one again -- no process, no tmux pane -- and
@@ -1071,6 +1074,9 @@ func (m *Manager) adoptDiscovered(a adapter.Adapter, d adapter.Discovered) {
 					s.Model = d.Model
 				}
 			})
+			if d.Live {
+				m.reviveRestored(keep.ID)
+			}
 			m.EnsureTailer(keep.ID, d.Ref)
 			return
 		}
@@ -1106,14 +1112,43 @@ func (m *Manager) adoptDiscovered(a adapter.Adapter, d adapter.Discovered) {
 		s.Attachment = protocol.AttachTranscript
 		s.Fidelity = protocol.FidelityStructured
 	})
-	if existing, ok := m.reg.Get(sess.ID); ok && existing.State == protocol.StateStarting {
-		m.reg.SetState(sess.ID, protocol.StateGuess{
-			State: state, Confidence: confidence, Reason: reason,
-			Evidence: "adapter:" + info.ID, At: time.Now(),
-		})
+	if existing, ok := m.reg.Get(sess.ID); ok {
+		revive := existing.State == protocol.StateStarting ||
+			(d.Live && existing.State == protocol.StateDetached && existing.Guess.Evidence == "restore") ||
+			(d.Live && existing.State == protocol.StateUnknown && existing.Guess.Confidence < 1)
+		if revive {
+			m.reg.SetState(sess.ID, protocol.StateGuess{
+				State: state, Confidence: confidence, Reason: reason,
+				Evidence: "adapter:" + info.ID, At: time.Now(),
+			})
+		}
 	}
 	if d.Ref != "" {
 		m.EnsureTailer(sess.ID, d.Ref)
+	}
+}
+
+// reviveRestored gives a live session back to inference after a restart.
+//
+// Restore has to put something in the state column, and an older build put
+// DETACHED there with confidence 1 -- a claim inference is not allowed to
+// overwrite. Discovery seeing the agent still holds the session is the fact
+// that lifts it: unknown, at the confidence of a guess, so the transcript
+// can say what the session is actually doing.
+func (m *Manager) reviveRestored(sessionID string) {
+	s, ok := m.reg.Get(sessionID)
+	if !ok {
+		return
+	}
+	switch {
+	case s.State == protocol.StateDetached && s.Guess.Evidence == "restore",
+		s.State == protocol.StateStarting,
+		s.State == protocol.StateUnknown && s.Guess.Confidence < 1:
+		m.reg.SetState(sessionID, protocol.StateGuess{
+			State: protocol.StateUnknown, Confidence: 0.4,
+			Reason:   "found live in the agent's session files",
+			Evidence: "adapter-discovery", At: time.Now(),
+		})
 	}
 }
 
@@ -1297,13 +1332,24 @@ func (m *Manager) Reconcile(keepID, transcriptPath string) {
 		if other.ID == keepID {
 			continue
 		}
-		if fidelityRank(other.Fidelity) >= fidelityRank(keep.Fidelity) {
-			continue // the other one is at least as capable; leave it alone
+		if capabilityRank(other) > capabilityRank(keep) {
+			// A stronger row owns this conversation. The caller is a process
+			// scan or hook that should have found the stronger attachment;
+			// dropping the weaker row here would trade away write access.
+			continue
 		}
-		m.log.Debug("dropping a duplicate session",
+		m.log.Debug("folding a duplicate session",
 			"kept", keepID, "dropped", other.ID, "transcript", transcriptPath)
-		m.Drop(other.ID)
+		m.Merge(keepID, other.ID)
 	}
+}
+
+// capabilityRank orders two rows for the same conversation by what they can
+// do, attachment first. Fidelity alone is not enough: a transcript-only row
+// and a terminal-adopted row are both STRUCTURED, and the adopted one is the
+// row a reply can actually reach.
+func capabilityRank(s protocol.Session) int {
+	return attachRank(s.Attachment)*10 + fidelityRank(s.Fidelity)
 }
 
 // Merge folds a session found twice into the one being kept: the duplicate
@@ -1315,12 +1361,43 @@ func (m *Manager) Reconcile(keepID, transcriptPath string) {
 // wherever the other had been recording instead -- an hour of a session
 // missing on the phone, with nothing to say so.
 func (m *Manager) Merge(keepID, dropID string) {
+	drop, dropOK := m.reg.Get(dropID)
 	path := ""
-	if s, ok := m.reg.Get(dropID); ok {
-		path = s.TranscriptPath
+	if dropOK {
+		path = drop.TranscriptPath
 	}
-	if s, ok := m.reg.Get(keepID); ok && s.TranscriptPath != "" {
-		path = s.TranscriptPath
+	keep, keepOK := m.reg.Get(keepID)
+	if keepOK && keep.TranscriptPath != "" {
+		path = keep.TranscriptPath
+	}
+	// The duplicate may be the row carrying what a person set or read:
+	// a rename made while that row was the one on screen, a title recovered
+	// from the file. Dropping it without folding these in is how a session
+	// loses its name while still being the same conversation.
+	if keepOK && dropOK {
+		m.reg.Update(keepID, func(s *protocol.Session) {
+			if s.Name == "" {
+				s.Name = drop.Name
+			}
+			if s.Title == "" {
+				s.Title = drop.Title
+			}
+			if s.Cwd == "" {
+				s.Cwd = drop.Cwd
+			}
+			if s.Model == "" {
+				s.Model = drop.Model
+			}
+			if s.GitBranch == "" {
+				s.GitBranch = drop.GitBranch
+			}
+			if s.AgentVer == "" {
+				s.AgentVer = drop.AgentVer
+			}
+			if s.PromptID == "" {
+				s.PromptID = drop.PromptID
+			}
+		})
 	}
 	m.Drop(dropID)
 	if path != "" {
