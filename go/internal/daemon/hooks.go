@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -11,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/muxscale/muxscale/go/internal/adapter/claudecode"
+	"github.com/muxscale/muxscale/go/internal/adapter"
 	"github.com/muxscale/muxscale/go/internal/attach"
 	"github.com/muxscale/muxscale/go/internal/protocol"
 )
@@ -34,6 +35,14 @@ type HookServer struct {
 	log      *slog.Logger
 	holdTime time.Duration
 
+	// codecs holds one transport per adapter that can call muxscale, keyed by
+	// the path the agent POSTs to. The daemon speaks the normalized HookEvent;
+	// each adapter owns its own payload and reply shape.
+	codecs map[string]adapter.HookCodec
+	// infos is each codec adapter's static description, for the fidelity a
+	// hook-driven session can honestly claim.
+	infos map[string]adapter.Info
+
 	// peerPID finds the process behind a hook request; a field so tests can
 	// stand in for lsof.
 	peerPID func(remoteAddr string) (int, error)
@@ -49,49 +58,81 @@ func (h *HookServer) SetManager(m *Manager) { h.mgr = m }
 
 // NewHookServer builds the handler. holdTime is how long a decision hook waits
 // for a human before giving up and falling through.
-func NewHookServer(reg *Registry, token string, hold time.Duration, log *slog.Logger) *HookServer {
-	return &HookServer{reg: reg, token: token, holdTime: hold, log: log,
-		peerPID: attach.PeerPID, linked: map[string]bool{}}
+//
+// adapters may be nil in tests that only exercise storage and auth; no codec
+// means no hook routes, which is an honest empty daemon.
+func NewHookServer(reg *Registry, adapters *adapter.Registry, token string, hold time.Duration, log *slog.Logger) *HookServer {
+	h := &HookServer{reg: reg, token: token, holdTime: hold, log: log,
+		peerPID: attach.PeerPID, linked: map[string]bool{},
+		codecs: map[string]adapter.HookCodec{}, infos: map[string]adapter.Info{}}
+	if adapters != nil {
+		for _, a := range adapters.All() {
+			if c, ok := a.(adapter.HookCodec); ok {
+				h.codecs[c.HookPath()] = c
+				h.infos[a.Info().ID] = a.Info()
+			}
+		}
+	}
+	return h
 }
 
 // Routes registers handlers on a mux.
 func (h *HookServer) Routes(mux *http.ServeMux) {
-	mux.HandleFunc("/v1/hook/claude-code", h.handleClaudeCode)
+	for path, codec := range h.codecs {
+		path, codec := path, codec
+		mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+			h.handleHook(w, r, codec)
+		})
+	}
 	mux.HandleFunc("/v1/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]string{"status": "ok"})
 	})
 }
 
-func (h *HookServer) handleClaudeCode(w http.ResponseWriter, r *http.Request) {
-	// Every early return is a 200 with an empty object: "no decision".
+// noDecision is the fail-open body a codec returns for a transport that has
+// nothing to decide. It is also every error path's answer.
+func noDecision(codec adapter.HookCodec, e adapter.HookEvent) any {
+	return codec.EncodeHookReply(e, nil)
+}
+
+func (h *HookServer) handleHook(w http.ResponseWriter, r *http.Request, codec adapter.HookCodec) {
+	var empty adapter.HookEvent
+	// Every early return is a 200 with the agent's own "no decision": daemon
+	// down, bad token, malformed body, or an agent build we have not seen.
 	if r.Method != http.MethodPost {
-		writeJSON(w, claudecode.NoDecision())
+		writeJSON(w, noDecision(codec, empty))
 		return
 	}
 	if !h.authorized(r) {
-		h.log.Warn("hook request rejected: bad token", "remote", r.RemoteAddr)
-		writeJSON(w, claudecode.NoDecision())
+		h.log.Warn("hook request rejected: bad token", "remote", r.RemoteAddr, "path", r.URL.Path)
+		writeJSON(w, noDecision(codec, empty))
 		return
 	}
 
-	var p claudecode.HookPayload
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<20)).Decode(&p); err != nil {
-		h.log.Warn("hook payload decode failed", "err", err)
-		writeJSON(w, claudecode.NoDecision())
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 8<<20))
+	if err != nil {
+		h.log.Warn("hook body read failed", "err", err)
+		writeJSON(w, noDecision(codec, empty))
+		return
+	}
+	e, err := codec.DecodeHook(body)
+	if err != nil {
+		h.log.Warn("hook payload decode failed", "path", r.URL.Path, "err", err)
+		writeJSON(w, noDecision(codec, empty))
 		return
 	}
 
-	pid := h.link(&p, r.RemoteAddr)
-	sess := h.applyHook(&p)
-	h.linkNew(pid, sess.ID)
+	pid := h.link(&e, r.RemoteAddr)
+	sess := h.applyHook(&e)
+	h.linkNew(pid, e.AgentID, sess.ID)
 
 	// Decision hooks block here while a human is asked. Everything else has
 	// already been recorded and returns immediately.
-	switch p.HookEventName {
-	case claudecode.HookPermissionRequest, claudecode.HookElicitation:
-		writeJSON(w, h.awaitDecision(r, sess, &p))
+	switch e.Kind {
+	case adapter.HookApproval, adapter.HookElicit:
+		writeJSON(w, h.awaitDecision(r, sess, &e, codec))
 	default:
-		writeJSON(w, claudecode.NoDecision())
+		writeJSON(w, noDecision(codec, e))
 	}
 }
 
@@ -111,30 +152,30 @@ func (h *HookServer) handleClaudeCode(w http.ResponseWriter, r *http.Request) {
 //
 // It returns the process id it found, 0 when it did not look or could not
 // tell.
-func (h *HookServer) link(p *claudecode.HookPayload, remoteAddr string) int {
-	if p.SessionID == "" || h.peerPID == nil {
+func (h *HookServer) link(e *adapter.HookEvent, remoteAddr string) int {
+	if e.SessionID == "" || h.peerPID == nil {
 		return 0
 	}
 	h.linkMu.Lock()
-	done := h.linked[p.SessionID]
-	h.linked[p.SessionID] = true
+	done := h.linked[e.AgentID+"/"+e.SessionID]
+	h.linked[e.AgentID+"/"+e.SessionID] = true
 	h.linkMu.Unlock()
 	if done {
 		return 0
 	}
 	pid, err := h.peerPID(remoteAddr)
 	if err != nil {
-		h.log.Debug("could not tie a hook to its process", "session", p.SessionID, "err", err)
+		h.log.Debug("could not tie a hook to its process", "session", e.SessionID, "err", err)
 		return 0
 	}
 	procKey := "pid:" + strconv.Itoa(pid)
-	hookID, hasHook := h.reg.IDFor("claude-code", p.SessionID)
-	procID, hasProc := h.reg.IDFor("claude-code", procKey)
+	hookID, hasHook := h.reg.IDFor(e.AgentID, e.SessionID)
+	procID, hasProc := h.reg.IDFor(e.AgentID, procKey)
 	switch {
 	case hasProc && !hasHook:
-		h.reg.Alias("claude-code", p.SessionID, procID)
+		h.reg.Alias(e.AgentID, e.SessionID, procID)
 	case hasProc && hasHook && procID != hookID:
-		h.reg.Alias("claude-code", p.SessionID, procID)
+		h.reg.Alias(e.AgentID, e.SessionID, procID)
 		if h.mgr != nil {
 			h.mgr.Merge(procID, hookID)
 		} else {
@@ -142,20 +183,22 @@ func (h *HookServer) link(p *claudecode.HookPayload, remoteAddr string) int {
 		}
 		h.log.Info("merged a session found twice", "kept", procID, "dropped", hookID, "pid", pid)
 	case hasHook && !hasProc:
-		h.reg.Alias("claude-code", procKey, hookID)
+		h.reg.Alias(e.AgentID, procKey, hookID)
 	}
 	return pid
 }
 
 // linkNew finishes link for a session the hook has only now created: there
 // was no row to alias the process to until applyHook made one.
-func (h *HookServer) linkNew(pid int, id string) {
+func (h *HookServer) linkNew(pid int, agentID, id string) {
+	// The caller already aliased the agent's own session key; this covers the
+	// process key for the first hook of a session.
 	if pid == 0 {
 		return
 	}
 	procKey := "pid:" + strconv.Itoa(pid)
-	if _, ok := h.reg.IDFor("claude-code", procKey); !ok {
-		h.reg.Alias("claude-code", procKey, id)
+	if _, ok := h.reg.IDFor(agentID, procKey); !ok {
+		h.reg.Alias(agentID, procKey, id)
 	}
 }
 
@@ -168,116 +211,128 @@ func (h *HookServer) authorized(r *http.Request) bool {
 }
 
 // applyHook records the event and updates session state. Returns the session.
-func (h *HookServer) applyHook(p *claudecode.HookPayload) *protocol.Session {
-	sess := h.reg.Upsert("claude-code", p.SessionID, func(s *protocol.Session) {
-		if p.Cwd != "" {
-			s.Cwd = p.Cwd
+func (h *HookServer) applyHook(e *adapter.HookEvent) *protocol.Session {
+	fidelity := protocol.FidelityFull
+	if info, ok := h.infos[e.AgentID]; ok {
+		fidelity = info.MaxFidelity()
+	}
+	sess := h.reg.Upsert(e.AgentID, e.SessionID, func(s *protocol.Session) {
+		if e.Cwd != "" {
+			s.Cwd = e.Cwd
 		}
-		if p.TranscriptPath != "" {
-			s.TranscriptPath = p.TranscriptPath
+		if e.SessionFile != "" {
+			s.TranscriptPath = e.SessionFile
 		}
-		if p.PromptID != "" {
-			s.PromptID = p.PromptID
+		if e.PromptID != "" {
+			s.PromptID = e.PromptID
+		}
+		if e.Model != "" {
+			s.Model = e.Model
+		}
+		if e.AgentVersion != "" {
+			s.AgentVer = e.AgentVersion
 		}
 		s.Attachment = protocol.AttachNative
-		s.Fidelity = protocol.FidelityNativeFull
+		s.Fidelity = fidelity
 	})
 
-	// Every hook payload carries transcript_path, so a hook-driven session gets
-	// its full structured transcript with no path guessing at all.
-	if p.TranscriptPath != "" && h.mgr != nil {
-		h.mgr.EnsureTailer(sess.ID, p.TranscriptPath)
+	// An event payload usually names the transcript, so a hook-driven session
+	// gets its full structured transcript with no path guessing at all.
+	if e.SessionFile != "" && h.mgr != nil {
+		h.mgr.EnsureTailer(sess.ID, e.SessionFile)
 	}
 
 	now := time.Now()
 	guess := func(st protocol.SessionState, reason string) protocol.StateGuess {
-		// Hook-sourced state is authoritative: the agent told us, so there is
+		// Event-sourced state is authoritative: the agent told us, so there is
 		// nothing to infer and confidence is exactly 1.
 		return protocol.StateGuess{State: st, Confidence: 1.0, Reason: reason,
-			Evidence: "hook:" + p.HookEventName, At: now}
+			Evidence: "hook:" + e.EventName, At: now}
 	}
 
-	switch p.HookEventName {
-	case claudecode.HookSessionStart:
+	switch e.Kind {
+	case adapter.HookSessionStart:
 		h.reg.SetState(sess.ID, guess(protocol.StateRunning, "session started"))
 
-	case claudecode.HookUserPromptSubmit:
+	case adapter.HookTurnStart:
+		h.reg.SetState(sess.ID, guess(protocol.StateRunning, "agent started working"))
+
+	case adapter.HookUserPrompt:
 		h.reg.SetState(sess.ID, guess(protocol.StateRunning, "user submitted a prompt"))
 
-	case claudecode.HookPreToolUse:
+	case adapter.HookToolCall:
 		h.reg.AppendEvent(protocol.TranscriptEvent{
 			SessionID: sess.ID, Kind: protocol.EventToolCall, At: now,
-			ToolName: p.ToolName, ToolUseID: p.ToolUseID, ToolInput: p.ToolInput,
-			IsSidechain: p.AgentID != "",
+			ToolName: e.ToolName, ToolUseID: e.ToolUseID, ToolInput: e.ToolInput,
+			IsSidechain: e.IsSidechain,
 		})
-		h.reg.SetState(sess.ID, guess(protocol.StateRunning, "running "+p.ToolName))
+		h.reg.SetState(sess.ID, guess(protocol.StateRunning, "running "+e.ToolName))
 
-	case claudecode.HookPostToolUse, claudecode.HookPostToolUseFail:
+	case adapter.HookToolResult:
 		h.reg.AppendEvent(protocol.TranscriptEvent{
 			SessionID: sess.ID, Kind: protocol.EventToolResult, At: now,
-			ToolName: p.ToolName, ToolUseID: p.ToolUseID,
-			IsError:     p.HookEventName == claudecode.HookPostToolUseFail,
-			ToolOutput:  p.ToolError,
-			IsSidechain: p.AgentID != "",
+			ToolName: e.ToolName, ToolUseID: e.ToolUseID,
+			IsError: e.IsError, ToolOutput: e.ToolOutput,
+			IsSidechain: e.IsSidechain,
 		})
 
-	case claudecode.HookStop, claudecode.HookStopFailure:
+	case adapter.HookStop:
 		// The single highest-value signal in the product: the turn is over and
 		// the agent is waiting on a human.
 		h.reg.SetState(sess.ID, guess(protocol.StateWaitingInput, "turn complete"))
 
-	case claudecode.HookTeammateIdle:
+	case adapter.HookIdle:
 		h.reg.SetState(sess.ID, guess(protocol.StateWaitingInput, "agent idle"))
 
-	case claudecode.HookNotification:
+	case adapter.HookNotification:
 		h.reg.SetState(sess.ID, guess(protocol.StateWaitingInput, "agent requested attention"))
 
-	case claudecode.HookSessionEnd:
-		// SessionEnd shares a ~1.5s budget across hooks, so this path must stay
-		// trivial. Record and return.
+	case adapter.HookSessionEnd:
+		// SessionEnd has a short budget on every transport, so this path must
+		// stay trivial. Record and return.
 		h.reg.SetState(sess.ID, guess(protocol.StateExited, "session ended"))
 
-	case claudecode.HookPreCompact, claudecode.HookPostCompact:
+	case adapter.HookCompaction:
 		h.reg.AppendEvent(protocol.TranscriptEvent{
 			SessionID: sess.ID, Kind: protocol.EventCompaction, At: now,
-			Text: p.HookEventName,
+			Text: e.EventName,
 		})
 
-	case claudecode.HookSubagentStart, claudecode.HookSubagentStop:
+	case adapter.HookSubagentStart, adapter.HookSubagentStop:
 		// Recorded for the nested-thread view; does not change parent state.
 
 	default:
-		// An event we do not handle yet. Log and move on -- Claude Code adds
-		// events regularly and an unknown one is not an error.
-		h.log.Debug("unhandled hook event", "event", p.HookEventName)
+		// An event we do not handle yet. Log and move on -- agents add events
+		// regularly and an unknown one is not an error.
+		h.log.Debug("unhandled hook event", "agent", e.AgentID, "event", e.EventName)
 	}
 
 	return sess
 }
 
 // awaitDecision parks the request while a human is asked.
-func (h *HookServer) awaitDecision(r *http.Request, sess *protocol.Session, p *claudecode.HookPayload) claudecode.HookResponse {
+func (h *HookServer) awaitDecision(r *http.Request, sess *protocol.Session, e *adapter.HookEvent, codec adapter.HookCodec) any {
 	req := &protocol.ApprovalRequest{
 		ID:        newID(),
 		SessionID: sess.ID,
 		Source:    protocol.ApprovalNative,
 		Kind:      "tool_use",
-		ToolName:  p.ToolName,
-		ToolInput: p.ToolInput,
-		ToolUseID: p.ToolUseID,
-		Subject:   p.Subject(),
+		ToolName:  e.ToolName,
+		ToolInput: e.ToolInput,
+		ToolUseID: e.ToolUseID,
+		Subject:   e.Subject(),
 		Options:   []string{"allow", "deny"},
-		PromptID:  p.PromptID,
+		PromptID:  e.PromptID,
 		AskedAt:   time.Now(),
 		Deadline:  time.Now().Add(h.holdTime),
 	}
-	if p.HookEventName == claudecode.HookElicitation {
+	if e.Kind == adapter.HookElicit {
 		req.Kind = "elicitation"
 	}
 
 	h.reg.SetState(sess.ID, protocol.StateGuess{
 		State: protocol.StateWaitingApproval, Confidence: 1.0,
-		Reason: "approval required: " + req.Subject, Evidence: "hook:" + p.HookEventName,
+		Reason: "approval required: " + req.Subject, Evidence: "hook:" + e.EventName,
 		At: time.Now(),
 	})
 
@@ -295,24 +350,24 @@ func (h *HookServer) awaitDecision(r *http.Request, sess *protocol.Session, p *c
 			State: protocol.StateRunning, Confidence: 1.0,
 			Reason: "approval " + d.Behavior, At: time.Now(),
 		})
-		return claudecode.PermissionDecision(d.Behavior, d.Reason)
+		return codec.EncodeHookReply(*e, &d)
 
 	case <-timer.C:
-		// Nobody answered. Return no decision so Claude Code asks locally.
-		// This is the correct outcome, not a failure: the human at the keyboard
-		// is still a human.
+		// Nobody answered. Return no decision so the agent asks locally. This
+		// is the correct outcome, not a failure: the human at the keyboard is
+		// still a human.
 		h.reg.ResolveApproval(req.ID, protocol.ApprovalDecision{Behavior: "", Reason: "timeout"})
 		h.clearApprovalState(sess.ID, "approval timed out; agent is asking locally")
 		h.log.Info("approval timed out, falling through to local prompt", "session", sess.ID)
-		return claudecode.NoDecision()
+		return codec.EncodeHookReply(*e, nil)
 
 	case <-r.Context().Done():
-		// Claude Code hung up -- typically because the person at the keyboard
+		// The agent hung up -- typically because the person at the keyboard
 		// answered first. Withdraw the phone's pending approval.
 		h.reg.ResolveApproval(req.ID, protocol.ApprovalDecision{Behavior: "", Reason: "answered at the keyboard"})
 		h.clearApprovalState(sess.ID, "answered at the keyboard")
 		h.log.Info("approval withdrawn: agent hung up", "session", sess.ID)
-		return claudecode.NoDecision()
+		return codec.EncodeHookReply(*e, nil)
 	}
 }
 

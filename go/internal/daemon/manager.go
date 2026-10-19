@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -31,9 +32,9 @@ type Manager struct {
 	// ingestMu orders storing a tailer's events against clearing them for a
 	// rebuild.
 	ingestMu sync.Mutex
-	wrapped  map[string]*attach.Wrapped    // muxscale session id -> pty
-	tailers  map[string]*claudecode.Tailer // muxscale session id -> transcript tailer
-	screens  map[string]*vt.Emulator       // muxscale session id -> screen state
+	wrapped  map[string]*attach.Wrapped // muxscale session id -> pty
+	tailers  map[string]*tailHandle     // muxscale session id -> transcript tailer
+	screens  map[string]*vt.Emulator    // muxscale session id -> screen state
 
 	// sampled is guarded by screenMu, not mu. See sampleScreen.
 	//
@@ -79,7 +80,18 @@ type Manager struct {
 	// and `muxscale status` runs one on demand; two at once would race to adopt
 	// the same pane and could double-match a transcript.
 	scanMu sync.Mutex
+
+	// lastAdapterScan throttles adapter enumeration. The process scan is one
+	// `ps`; an adapter's Discover reads session directories and sometimes
+	// every file header, and running that for every agent every three seconds
+	// would make an idle daemon the busiest thing on the machine.
+	lastAdapterScan time.Time
 }
+
+// adapterScanEvery is how often adapters enumerate their own sessions. Slow
+// enough to be free, fast enough that a session started while the phone is
+// open appears without a refresh.
+const adapterScanEvery = 30 * time.Second
 
 // NewManager wires a registry to durable storage.
 //
@@ -90,7 +102,7 @@ func NewManager(reg *Registry, adapters *adapter.Registry, st *store.Store, log 
 	m := &Manager{
 		reg: reg, adapters: adapters, store: st, log: log,
 		wrapped:        map[string]*attach.Wrapped{},
-		tailers:        map[string]*claudecode.Tailer{},
+		tailers:        map[string]*tailHandle{},
 		screens:        map[string]*vt.Emulator{},
 		closing:        map[string]bool{},
 		tmuxTargets:    map[string]string{},
@@ -102,6 +114,17 @@ func NewManager(reg *Registry, adapters *adapter.Registry, st *store.Store, log 
 	go m.persistLoop()
 	return m
 }
+
+// tailHandle is one session's transcript stream, wrapped so the manager can
+// tell a replacement from the stream it started without relying on interface
+// identity (which panics for a non-comparable dynamic type).
+type tailHandle struct {
+	stream adapter.TranscriptStream
+	ref    string
+}
+
+// defaultPoll is the transcript cadence for adapters that do not declare one.
+const defaultPoll = 750 * time.Millisecond
 
 // persistLoop mirrors registry changes into SQLite. It runs in its own
 // goroutine so a slow disk cannot stall a hook handler that is holding an
@@ -934,36 +957,41 @@ func (m *Manager) scanOnceLocked() {
 				s.CreatedAt = p.Started
 			}
 		})
-		// Discovered Claude Code sessions get their transcript followed, which
-		// is what turns a bare process listing into a readable session.
-		if agentID == "claude-code" {
-			if s, ok := m.reg.Get(sess.ID); ok {
-				path := s.TranscriptPath
-				if own := claudecode.ProcessTranscript(p.Pid, p.Started, p.Cwd); own != "" && own != path {
-					// The process says which file is its own. Either the
-					// match was a guess that picked a neighbour's, or the
-					// session moved to another with /resume or /clear; the
-					// history read so far is someone else's, so read again.
-					if path != "" {
-						m.log.Info("following the transcript a session says is its own",
-							"session", sess.ID, "pid", p.Pid, "was", path, "now", own)
-						m.Retail(sess.ID, own)
-					} else {
-						m.reg.Upsert(agentID, natural, func(t *protocol.Session) {
-							t.TranscriptPath = own
-						})
+		// An adapter that can join a process to a transcript gets its
+		// transcript followed, which is what turns a bare process listing
+		// into a readable session. The join itself is the adapter's: Claude
+		// Code has a pid record, omp a terminal breadcrumb, and neither
+		// belongs in the daemon.
+		if a, ok := m.adapterByID(agentID); ok {
+			if loc, ok := a.(adapter.Locator); ok {
+				if s, ok := m.reg.Get(sess.ID); ok {
+					path := s.TranscriptPath
+					if own := loc.TranscriptForProcess(p.ForAdapter()); own != "" && own != path {
+						// The process says which file is its own. Either the
+						// match was a guess that picked a neighbour's, or the
+						// session moved to another with /resume or /clear; the
+						// history read so far is someone else's, so read again.
+						if path != "" {
+							m.log.Info("following the transcript a session says is its own",
+								"session", sess.ID, "pid", p.Pid, "was", path, "now", own)
+							m.Retail(sess.ID, own)
+						} else {
+							m.reg.Update(sess.ID, func(t *protocol.Session) {
+								t.TranscriptPath = own
+							})
+						}
+						path = own
 					}
-					path = own
-				}
-				if path == "" && p.Cwd != "" {
-					path = m.matchTranscript(p)
-					if path != "" {
-						m.reg.Upsert(agentID, natural, func(t *protocol.Session) {
-							t.TranscriptPath = path
-						})
+					if path == "" && p.Cwd != "" {
+						path = loc.MatchTranscript(p.Cwd, p.Started, m.claimedTranscripts())
+						if path != "" {
+							m.reg.Update(sess.ID, func(t *protocol.Session) {
+								t.TranscriptPath = path
+							})
+						}
 					}
+					m.EnsureTailer(sess.ID, path)
 				}
-				m.EnsureTailer(sess.ID, path)
 			}
 		}
 
@@ -976,6 +1004,116 @@ func (m *Manager) scanOnceLocked() {
 				Evidence: "scan:pid=" + strconv.Itoa(p.Pid), At: time.Now(),
 			})
 		}
+	}
+	m.discoverAdapters()
+}
+
+// discoverAdapters asks every adapter to enumerate its own sessions.
+//
+// This is the path the process scan by construction cannot take: a session
+// whose process is not in this process table -- another host's, a remote
+// workspace, one that ended while the daemon was down -- is still a file the
+// agent wrote. Discovery is throttled because it is the most expensive thing
+// in the scan, and a session file does not appear every three seconds.
+func (m *Manager) discoverAdapters() {
+	if m.adapters == nil || time.Since(m.lastAdapterScan) < adapterScanEvery {
+		return
+	}
+	m.lastAdapterScan = time.Now()
+
+	for _, a := range m.adapters.All() {
+		d, ok := a.(adapter.Discoverer)
+		if !ok {
+			continue
+		}
+		found, err := d.Discover(context.Background())
+		if err != nil {
+			m.log.Debug("adapter discovery failed", "agent", a.Info().ID, "err", err)
+			continue
+		}
+		for _, s := range found {
+			// History is not a live session. The process scan and the store
+			// already keep what ended; inserting every file an agent ever
+			// wrote would put months of old conversations in `ls` on first
+			// run. A discovered session is adopted only while its agent still
+			// considers it alive.
+			if !s.Live {
+				continue
+			}
+			m.adoptDiscovered(a, s)
+		}
+	}
+}
+
+// adoptDiscovered adds or refreshes one session an adapter enumerated.
+//
+// The same conversation can already be present under a process key. The
+// transcript path is the identity that survives that: if another row is
+// already following this file, the new natural key is an alias for it rather
+// than a second row for one session.
+func (m *Manager) adoptDiscovered(a adapter.Adapter, d adapter.Discovered) {
+	info := a.Info()
+	if d.NaturalKey == "" {
+		return
+	}
+	if d.Ref != "" {
+		if others := m.reg.FindByTranscript(d.Ref); len(others) > 0 {
+			keep := others[0]
+			m.reg.Alias(info.ID, d.NaturalKey, keep.ID)
+			m.reg.Update(keep.ID, func(s *protocol.Session) {
+				if s.Cwd == "" {
+					s.Cwd = d.Cwd
+				}
+				if s.Title == "" {
+					s.Title = d.Title
+				}
+				if s.Model == "" {
+					s.Model = d.Model
+				}
+			})
+			m.EnsureTailer(keep.ID, d.Ref)
+			return
+		}
+	}
+
+	state := protocol.StateUnknown
+	reason := "found in the agent's session files; awaiting a transcript"
+	confidence := 0.4
+	if !d.Live {
+		// Historical sessions are kept (the store retains them) but are not
+		// live rows. Claiming otherwise would put every conversation this
+		// machine ever had at the top of someone's phone.
+		state = protocol.StateExited
+		reason = "the session's process is no longer running"
+		confidence = 0.8
+	}
+	sess := m.reg.Upsert(info.ID, d.NaturalKey, func(s *protocol.Session) {
+		if attachRank(s.Attachment) > attachRank(protocol.AttachTranscript) {
+			return
+		}
+		if d.Cwd != "" {
+			s.Cwd = d.Cwd
+		}
+		if d.Title != "" {
+			s.Title = d.Title
+		}
+		if d.Model != "" {
+			s.Model = d.Model
+		}
+		if d.Ref != "" {
+			s.TranscriptPath = d.Ref
+		}
+		s.Attachment = protocol.AttachTranscript
+		s.Fidelity = protocol.FidelityStructured
+	})
+	if existing, ok := m.reg.Get(sess.ID); ok && existing.State == protocol.StateStarting {
+		m.reg.SetState(sess.ID, protocol.StateGuess{
+			State: state, Confidence: confidence, Reason: reason,
+			Evidence: "adapter:" + info.ID, At: time.Now(),
+		})
+	}
+	if d.Ref != "" {
+		m.EnsureTailer(sess.ID, d.Ref)
 	}
 }
 
@@ -991,8 +1129,24 @@ func helperProcess(argv []string) bool {
 		if a == "mcp" && i+1 < len(argv) && argv[i+1] == "serve" {
 			return true
 		}
+		// omp runs long-lived worker processes under its own binary
+		// (__omp_worker_daemon_broker, __omp_worker_text_predict). They hold no
+		// session and have nothing to read or answer, but the process scan sees
+		// the same argv[0] as an agent and would list them forever.
+		if strings.HasPrefix(a, "__omp_worker_") {
+			return true
+		}
 	}
 	return false
+}
+
+// adapterByID returns the registered adapter for an id, or nil in tests that
+// run without a registry.
+func (m *Manager) adapterByID(id string) (adapter.Adapter, bool) {
+	if m.adapters == nil {
+		return nil, false
+	}
+	return m.adapters.Get(id)
 }
 
 // markEnded marks the sessions the scan found earlier, whose process is now
@@ -1194,13 +1348,13 @@ func (m *Manager) Retail(sessionID, path string) {
 	m.startTailer(sessionID, path, false)
 }
 
-// ingest stores a batch of a session's transcript events, unless tl has been
+// ingest stores a batch of a session's transcript events, unless h has been
 // replaced as the session's tailer. It reports whether it stored them.
-func (m *Manager) ingest(sessionID string, tl *claudecode.Tailer, events []protocol.TranscriptEvent) bool {
+func (m *Manager) ingest(sessionID string, h *tailHandle, events []protocol.TranscriptEvent) bool {
 	m.ingestMu.Lock()
 	defer m.ingestMu.Unlock()
 	m.mu.RLock()
-	current := m.tailers[sessionID] == tl
+	current := m.tailers[sessionID] == h
 	m.mu.RUnlock()
 	if !current {
 		return false
@@ -1255,22 +1409,22 @@ func fidelityRank(f protocol.Fidelity) int {
 	return 0
 }
 
-// matchTranscript finds the transcript belonging to a discovered process.
-//
-// The join is on start time, not on "newest file in the project directory":
-// two agents can share one project, and picking the most recently written file
-// would hand a freshly discovered session its neighbour's conversation -- which
-// looks like success until someone reads the transcript on their phone.
-func (m *Manager) matchTranscript(p attach.Process) string {
-	if p.Cwd == "" {
+// matchTranscript finds the transcript belonging to a process whose start time
+// is unknown -- a tmux pane, whose scan reports only a path. The adapter's
+// join still refuses to guess between two equally plausible files.
+func (m *Manager) matchTranscript(agentID, cwd string) string {
+	if cwd == "" {
 		return ""
 	}
-	cands, err := claudecode.TranscriptCandidates(p.Cwd)
-	if err != nil {
-		m.log.Debug("listing transcript candidates failed", "cwd", p.Cwd, "err", err)
+	a, ok := m.adapterByID(agentID)
+	if !ok {
 		return ""
 	}
-	return claudecode.PickTranscript(cands, p.Started, m.claimedTranscripts())
+	loc, ok := a.(adapter.Locator)
+	if !ok {
+		return ""
+	}
+	return loc.MatchTranscript(cwd, time.Time{}, m.claimedTranscripts())
 }
 
 // claimedTranscripts is every transcript file a live session already owns.
@@ -1304,37 +1458,61 @@ func (m *Manager) EnsureTailer(sessionID, path string) {
 // resume picks up after what the store holds; otherwise the file is read from
 // its start.
 func (m *Manager) startTailer(sessionID, path string, resume bool) {
+	s, ok := m.reg.Get(sessionID)
+	if !ok {
+		return
+	}
+	a, ok := m.adapterByID(s.AgentID)
+	if !ok {
+		return
+	}
+	tr, ok := a.(adapter.Transcriber)
+	if !ok {
+		return
+	}
+	stream, err := tr.OpenTranscript(context.Background(), path)
+	if err != nil {
+		m.log.Debug("opening transcript failed", "session", sessionID, "agent", s.AgentID, "err", err)
+		return
+	}
+	h := &tailHandle{stream: stream, ref: path}
+
 	m.mu.Lock()
 	if _, running := m.tailers[sessionID]; running {
 		m.mu.Unlock()
+		_ = stream.Close()
 		return
 	}
-	tl := claudecode.NewTailer(path, 750*time.Millisecond)
-	m.tailers[sessionID] = tl
+	m.tailers[sessionID] = h
 	m.mu.Unlock()
 
 	// Resume from what the store already has rather than re-reading a file
 	// that can be hundreds of megabytes.
-	if !resume {
-		go m.tailLoop(sessionID, tl)
-		return
-	}
-	if maxSeq, err := m.store.MaxSeq(sessionID); err == nil && maxSeq > 0 {
-		if err := tl.SeekEnd(maxSeq); err != nil {
-			m.log.Debug("tailer seek failed", "session", sessionID, "err", err)
+	if resume {
+		if maxSeq, err := m.store.MaxSeq(sessionID); err == nil && maxSeq > 0 {
+			if seeker, ok := stream.(adapter.SeekableStream); ok {
+				if err := seeker.SeekEnd(maxSeq); err != nil {
+					m.log.Debug("tailer seek failed", "session", sessionID, "err", err)
+				}
+			}
 		}
 	}
-	go m.tailLoop(sessionID, tl)
+	go m.tailLoop(sessionID, h)
 }
 
-func (m *Manager) tailLoop(sessionID string, tl *claudecode.Tailer) {
-	t := time.NewTicker(tl.Interval())
+func (m *Manager) tailLoop(sessionID string, h *tailHandle) {
+	interval := defaultPoll
+	if paced, ok := h.stream.(adapter.PacedStream); ok {
+		interval = paced.Interval()
+	}
+	t := time.NewTicker(interval)
 	defer t.Stop()
 	defer func() {
+		_ = h.stream.Close()
 		m.mu.Lock()
 		// Only its own entry: a replacement started by Retail is not this
 		// loop's to remove.
-		if m.tailers[sessionID] == tl {
+		if m.tailers[sessionID] == h {
 			delete(m.tailers, sessionID)
 		}
 		m.mu.Unlock()
@@ -1350,19 +1528,27 @@ func (m *Manager) tailLoop(sessionID string, tl *claudecode.Tailer) {
 
 	var misses int
 	for range t.C {
-		// Ended, dropped as a duplicate, or replaced: nothing left to follow
-		// it for.
-		if s, ok := m.reg.Get(sessionID); !ok || s.State.Terminal() {
+		// Dropped as a duplicate, or replaced: nothing left to follow it for.
+		s, ok := m.reg.Get(sessionID)
+		if !ok {
 			return
 		}
 		m.mu.RLock()
-		current := m.tailers[sessionID] == tl
+		current := m.tailers[sessionID] == h
 		m.mu.RUnlock()
 		if !current {
 			return
 		}
-		events, meta, err := tl.Poll()
+		// A terminal session gets one more poll before the loop stops. The
+		// agent may have ended before the file was flushed (a short print-mode
+		// run does exactly this), and stopping on the state alone left a
+		// finished session with a hook-recorded state and no transcript.
+		terminal := s.State.Terminal()
+		events, err := h.stream.Poll(context.Background())
 		if err != nil {
+			if terminal {
+				return
+			}
 			misses++
 			if misses > 20 { // file gone for ~15s; stop following it
 				return
@@ -1370,13 +1556,18 @@ func (m *Manager) tailLoop(sessionID string, tl *claudecode.Tailer) {
 			continue
 		}
 		misses = 0
-		m.applyMeta(sessionID, meta)
+		if ms, ok := h.stream.(adapter.MetaSource); ok {
+			m.applyMeta(sessionID, ms.Meta())
+		}
 		if len(events) == 0 {
+			if terminal {
+				return
+			}
 			// Nothing new, which is itself news: inference said "running"
 			// when the last line landed, and only a later look can see that it
 			// went quiet. Without this a session stayed Working forever after
 			// its turn ended, unless a hook happened to correct it.
-			m.reinfer(sessionID, tl, last)
+			m.reinfer(sessionID, h, last)
 			continue
 		}
 		last = events[len(events)-1:]
@@ -1390,7 +1581,7 @@ func (m *Manager) tailLoop(sessionID string, tl *claudecode.Tailer) {
 		// session's first read, thousands of events at once, kept a few
 		// hundred, and the conversation on the phone had holes nothing
 		// could fill.
-		if !m.ingest(sessionID, tl, events) {
+		if !m.ingest(sessionID, h, events) {
 			return // replaced while reading; these belong to a transcript being rebuilt
 		}
 		for i := range events {
@@ -1400,11 +1591,13 @@ func (m *Manager) tailLoop(sessionID string, tl *claudecode.Tailer) {
 		// Never over a state the agent reported (confidence 1): a guess must
 		// not override what the agent told us directly. A hook session's
 		// state is a guess only until its first hook after a restart.
-		if s, ok := m.reg.Get(sessionID); ok && s.Guess.Confidence < 1 {
-			if fi, err := os.Stat(tl.Path()); err == nil {
-				guess := claudecode.InferState(events, fi.ModTime(), 6*time.Second)
+		if !terminal {
+			if guess, ok := m.infer(sessionID, h.ref, events); ok {
 				m.reg.SetState(sessionID, guess)
 			}
+		}
+		if terminal {
+			return
 		}
 	}
 }
@@ -1412,7 +1605,7 @@ func (m *Manager) tailLoop(sessionID string, tl *claudecode.Tailer) {
 // reinfer re-runs state inference for a quiet transcript, and records the
 // result only when it changes the state. It never replaces a state the agent
 // reported (confidence 1) -- a hook's word outranks a guess from silence.
-func (m *Manager) reinfer(sessionID string, tl *claudecode.Tailer, last []protocol.TranscriptEvent) {
+func (m *Manager) reinfer(sessionID string, h *tailHandle, last []protocol.TranscriptEvent) {
 	if len(last) == 0 {
 		return
 	}
@@ -1420,25 +1613,63 @@ func (m *Manager) reinfer(sessionID string, tl *claudecode.Tailer, last []protoc
 	if !ok || s.Guess.Confidence >= 1 {
 		return
 	}
-	fi, err := os.Stat(tl.Path())
-	if err != nil {
-		return
-	}
-	if guess := claudecode.InferState(last, fi.ModTime(), 6*time.Second); guess.State != s.State {
+	if guess, ok := m.infer(sessionID, h.ref, last); ok && guess.State != s.State {
 		m.reg.SetState(sessionID, guess)
 	}
+}
+
+// infer asks the session's adapter what the transcript means.
+//
+// The daemon knows the evidence -- the recent events, how long the file has
+// been quiet, whether the agent's runtime still holds the session -- and the
+// adapter knows how to read it. An adapter with no opinion returns false, and
+// the session keeps whatever state it had rather than being guessed at by a
+// generic heuristic that knows nothing about the agent.
+func (m *Manager) infer(sessionID, path string, events []protocol.TranscriptEvent) (protocol.StateGuess, bool) {
+	if len(events) == 0 {
+		return protocol.StateGuess{}, false
+	}
+	s, ok := m.reg.Get(sessionID)
+	if !ok || s.Guess.Confidence >= 1 {
+		return protocol.StateGuess{}, false
+	}
+	a, ok := m.adapterByID(s.AgentID)
+	if !ok {
+		return protocol.StateGuess{}, false
+	}
+	si, ok := a.(adapter.StateInferrer)
+	if !ok {
+		return protocol.StateGuess{}, false
+	}
+	if path == "" {
+		path = s.TranscriptPath
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return protocol.StateGuess{}, false
+	}
+	in := adapter.StateInput{
+		Ref: path, Recent: events,
+		Idle: time.Since(fi.ModTime()), Quiescence: 6 * time.Second,
+	}
+	if lv, ok := a.(adapter.Liveness); ok {
+		if live, known := lv.Live(path); known {
+			in.Live = &live
+		}
+	}
+	return si.InferState(in)
 }
 
 // applyMeta copies what a transcript says about its session onto the row:
 // title, name, branch and model, for free, without asking the agent anything.
 // Applied whether or not the chunk held any conversation, since a /rename is a
 // line of its own.
-func (m *Manager) applyMeta(sessionID string, meta claudecode.Meta) {
+func (m *Manager) applyMeta(sessionID string, meta adapter.Meta) {
 	if meta.Title == "" && meta.CustomTitle == nil && meta.GitBranch == "" &&
-		meta.Model == "" && meta.Version == "" {
+		meta.Model == "" && meta.Version == "" && meta.Cwd == "" {
 		return
 	}
-	m.reg.Upsert("claude-code", naturalOf(m.reg, sessionID), func(s *protocol.Session) {
+	m.reg.Update(sessionID, func(s *protocol.Session) {
 		if meta.Title != "" {
 			s.Title = meta.Title
 		}
@@ -1453,6 +1684,9 @@ func (m *Manager) applyMeta(sessionID string, meta claudecode.Meta) {
 		}
 		if meta.Version != "" {
 			s.AgentVer = meta.Version
+		}
+		if meta.Cwd != "" {
+			s.Cwd = meta.Cwd
 		}
 	})
 }
@@ -1492,14 +1726,6 @@ func (m *Manager) Rename(sessionID, name, actor string) (*protocol.Session, erro
 	}
 	_ = m.store.Audit(actor, "session_renamed", sessionID, "")
 	return updated, nil
-}
-
-// naturalOf looks up a session's natural key so Upsert targets the right row.
-func naturalOf(reg *Registry, sessionID string) string {
-	if s, ok := reg.Get(sessionID); ok {
-		return s.NaturalKey
-	}
-	return sessionID
 }
 
 // scanTmux adopts agent panes so already-running sessions accept input. It
@@ -1543,12 +1769,14 @@ func (m *Manager) scanTmux() (map[string]bool, bool) {
 				Evidence: "tmux:" + p.PaneID, At: time.Now(),
 			})
 		}
-		if agentID == "claude-code" && p.Path != "" {
-			if path := m.matchTranscript(attach.Process{Cwd: p.Path}); path != "" {
-				m.reg.Upsert(agentID, natural, func(t *protocol.Session) {
-					t.TranscriptPath = path
-				})
-				m.EnsureTailer(sess.ID, path)
+		if a, ok := m.adapterByID(agentID); ok && p.Path != "" {
+			if _, locates := a.(adapter.Locator); locates {
+				if path := m.matchTranscript(agentID, p.Path); path != "" {
+					m.reg.Upsert(agentID, natural, func(t *protocol.Session) {
+						t.TranscriptPath = path
+					})
+					m.EnsureTailer(sess.ID, path)
+				}
 			}
 		}
 	}

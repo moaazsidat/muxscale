@@ -177,7 +177,7 @@ func (p Process) ForAdapter() adapter.Process {
 	}
 	return adapter.Process{
 		PID: p.Pid, PPID: p.PPid,
-		Argv: argv, Cwd: p.Cwd, TTY: p.TTY,
+		Argv: argv, Cwd: p.Cwd, TTY: p.TTY, Started: p.Started,
 		Ancestry: ancestry,
 	}
 }

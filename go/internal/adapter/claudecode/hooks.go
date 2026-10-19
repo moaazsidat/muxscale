@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/muxscale/muxscale/go/internal/adapter"
+	"github.com/muxscale/muxscale/go/internal/protocol"
 )
 
 // MinVersion is the supported floor. 2.1.196 is where prompt_id landed, and
@@ -126,8 +129,14 @@ func NoDecision() HookResponse { return HookResponse{} }
 
 // PermissionDecision builds a structured allow/deny for a held PermissionRequest.
 func PermissionDecision(behavior, reason string) HookResponse {
+	return PermissionDecisionFor(HookPermissionRequest, behavior, reason)
+}
+
+// PermissionDecisionFor answers a named decision hook. Elicitation shares the
+// shape but must echo its own event name, or Claude Code ignores the answer.
+func PermissionDecisionFor(eventName, behavior, reason string) HookResponse {
 	r := HookResponse{HookSpecificOutput: &hookSpecificOutput{
-		HookEventName: HookPermissionRequest,
+		HookEventName: eventName,
 		Decision:      &decision{Behavior: behavior},
 	}}
 	if reason != "" {
@@ -153,4 +162,78 @@ func shortenPath(p string) string {
 		return p
 	}
 	return ".../" + strings.Join(parts[len(parts)-2:], "/")
+}
+
+// ---- normalized hook transport ----
+
+var _ adapter.HookCodec = (*Adapter)(nil)
+
+// HookPath is where Claude Code's http hooks POST.
+func (*Adapter) HookPath() string { return "/v1/hook/claude-code" }
+
+// DecodeHook translates a Claude Code payload into the daemon's vocabulary.
+// The payload struct is unchanged, so installed hooks keep working.
+func (*Adapter) DecodeHook(body []byte) (adapter.HookEvent, error) {
+	var p HookPayload
+	if err := json.Unmarshal(body, &p); err != nil {
+		return adapter.HookEvent{}, err
+	}
+	if p.SessionID == "" {
+		return adapter.HookEvent{}, fmt.Errorf("claude-code hook payload has no session_id")
+	}
+	e := adapter.HookEvent{
+		AgentID: "claude-code", SessionID: p.SessionID,
+		SessionFile: p.TranscriptPath, Cwd: p.Cwd,
+		PromptID: p.PromptID, EventName: p.HookEventName,
+		ToolName: p.ToolName, ToolUseID: p.ToolUseID, ToolInput: p.ToolInput,
+		ToolOutput: p.ToolError,
+		IsSidechain: p.AgentID != "",
+	}
+	switch p.HookEventName {
+	case HookSessionStart:
+		e.Kind = adapter.HookSessionStart
+	case HookUserPromptSubmit:
+		e.Kind = adapter.HookUserPrompt
+	case HookPreToolUse:
+		e.Kind = adapter.HookToolCall
+	case HookPostToolUse:
+		e.Kind = adapter.HookToolResult
+	case HookPostToolUseFail:
+		e.Kind = adapter.HookToolResult
+		e.IsError = true
+	case HookPermissionRequest:
+		e.Kind = adapter.HookApproval
+	case HookElicitation:
+		e.Kind = adapter.HookElicit
+	case HookStop, HookStopFailure:
+		e.Kind = adapter.HookStop
+	case HookTeammateIdle:
+		e.Kind = adapter.HookIdle
+	case HookNotification:
+		e.Kind = adapter.HookNotification
+	case HookSessionEnd:
+		e.Kind = adapter.HookSessionEnd
+	case HookPreCompact, HookPostCompact:
+		e.Kind = adapter.HookCompaction
+	case HookSubagentStart:
+		e.Kind = adapter.HookSubagentStart
+	case HookSubagentStop:
+		e.Kind = adapter.HookSubagentStop
+	default:
+		e.Kind = adapter.HookNotice
+	}
+	return e, nil
+}
+
+// EncodeHookReply returns the shape Claude Code reads: an empty object for "no
+// decision", or a structured allow/deny for a held decision hook.
+func (*Adapter) EncodeHookReply(e adapter.HookEvent, d *protocol.ApprovalDecision) any {
+	if d == nil || d.Behavior == "" {
+		return NoDecision()
+	}
+	name := HookPermissionRequest
+	if e.Kind == adapter.HookElicit {
+		name = HookElicitation
+	}
+	return PermissionDecisionFor(name, d.Behavior, d.Reason)
 }

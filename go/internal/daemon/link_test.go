@@ -15,7 +15,7 @@ import (
 func linkServer(t *testing.T) (*httptest.Server, *Registry) {
 	t.Helper()
 	reg := NewRegistry()
-	h := NewHookServer(reg, "secret-token", time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h := NewHookServer(reg, hookAdapters(), "secret-token", time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	h.peerPID = func(string) (int, error) { return 4242, nil }
 	mux := http.NewServeMux()
 	h.Routes(mux)

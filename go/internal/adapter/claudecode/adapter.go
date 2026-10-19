@@ -29,6 +29,7 @@ var (
 	_ adapter.Transcriber   = (*Adapter)(nil)
 	_ adapter.StateInferrer = (*Adapter)(nil)
 	_ adapter.Installer     = (*Adapter)(nil)
+	_ adapter.Locator       = (*Adapter)(nil)
 )
 
 func (*Adapter) Info() adapter.Info {
@@ -174,16 +175,52 @@ func (*Adapter) OpenTranscript(_ context.Context, ref string) (adapter.Transcrip
 
 // stream adapts the existing Tailer, which already holds exactly the state the
 // interface needs: a byte offset and the remainder of any partial final line.
-type stream struct{ t *Tailer }
+type stream struct {
+	t *Tailer
+	// pending is what the last Poll observed, handed to Meta once. A delta,
+	// not a running total: the manager applies each observation as it arrives,
+	// and a quiet poll must not look like a change.
+	pending adapter.Meta
+}
 
 func (s *stream) Poll(context.Context) ([]protocol.TranscriptEvent, error) {
-	ev, _, err := s.t.Poll()
+	ev, meta, err := s.t.Poll()
+	if err == nil {
+		s.pending.Merge(meta)
+	}
 	return ev, err
 }
+
+func (s *stream) Meta() adapter.Meta {
+	m := s.pending
+	s.pending = adapter.Meta{}
+	return m
+}
+
+func (s *stream) Interval() time.Duration { return s.t.Interval() }
+
+func (s *stream) SeekEnd(fromSeq uint64) error { return s.t.SeekEnd(fromSeq) }
 
 // Close is a no-op: the Tailer opens the file per poll rather than holding a
 // descriptor, so a transcript can be rotated or deleted underneath it.
 func (s *stream) Close() error { return nil }
+
+// TranscriptForProcess returns the transcript a running Claude Code process is
+// writing, as that process itself recorded it. See ProcessTranscript.
+func (*Adapter) TranscriptForProcess(p adapter.Process) string {
+	return ProcessTranscript(p.PID, p.Started, p.Cwd)
+}
+
+// MatchTranscript joins a process to a project's session files by start time,
+// for a session that has no pid record -- one started before the record was
+// written, or by a build that does not write it.
+func (*Adapter) MatchTranscript(cwd string, started time.Time, claimed map[string]bool) string {
+	cands, err := TranscriptCandidates(cwd)
+	if err != nil {
+		return ""
+	}
+	return PickTranscript(cands, started, claimed)
+}
 
 // InferState derives state from the transcript, for sessions with no hooks --
 // started before muxscale, or on a version below the floor. The hook path does

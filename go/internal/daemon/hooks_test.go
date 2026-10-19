@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/muxscale/muxscale/go/internal/adapter"
 	"github.com/muxscale/muxscale/go/internal/adapter/claudecode"
 	"github.com/muxscale/muxscale/go/internal/protocol"
 )
@@ -19,7 +20,7 @@ func testServer(t *testing.T, hold time.Duration) (*httptest.Server, *Registry) 
 	reg := NewRegistry()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	mux := http.NewServeMux()
-	NewHookServer(reg, "secret-token", hold, log).Routes(mux)
+	NewHookServer(reg, hookAdapters(), "secret-token", hold, log).Routes(mux)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv, reg
@@ -329,4 +330,12 @@ func TestLoopbackOnlyBindEnforced(t *testing.T) {
 			t.Errorf("New(%q) failed: %v", addr, err)
 		}
 	}
+}
+
+// hookAdapters is the built-in codecs a hook test needs. Passing the real
+// adapters rather than a fake keeps the payload translation in the test.
+func hookAdapters() *adapter.Registry {
+	r := adapter.NewRegistry()
+	r.MustRegister(claudecode.New())
+	return r
 }

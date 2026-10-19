@@ -207,7 +207,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	mux := http.NewServeMux()
 	d.mux = mux
 	d.runCtx = ctx
-	hookSrv := NewHookServer(d.reg, d.cfg.LocalToken, d.cfg.HoldTime, d.log)
+	hookSrv := NewHookServer(d.reg, d.cfg.Adapters, d.cfg.LocalToken, d.cfg.HoldTime, d.log)
 	hookSrv.SetManager(d.mgr)
 	hookSrv.Routes(mux)
 	d.routes(mux)

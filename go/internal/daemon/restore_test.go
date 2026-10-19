@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/muxscale/muxscale/go/internal/adapter"
+	"github.com/muxscale/muxscale/go/internal/adapter/claudecode"
 	"github.com/muxscale/muxscale/go/internal/protocol"
 	"github.com/muxscale/muxscale/go/internal/store"
 )
@@ -19,7 +21,11 @@ func testManager(t *testing.T) (*Manager, *Registry, *store.Store) {
 	t.Cleanup(func() { st.Close() })
 	reg := NewRegistry()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return NewManager(reg, nil, st, log), reg, st
+	// A real registry with the litmus adapter: state inference now asks the
+	// session's adapter rather than assuming every transcript is Claude Code's.
+	adapters := adapter.NewRegistry()
+	adapters.MustRegister(claudecode.New())
+	return NewManager(reg, adapters, st, log), reg, st
 }
 
 // Regression: Upsert mints a fresh ID, so restoring through it left the map key

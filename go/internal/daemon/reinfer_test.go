@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/muxscale/muxscale/go/internal/adapter/claudecode"
 	"github.com/muxscale/muxscale/go/internal/protocol"
 )
 
@@ -24,7 +23,7 @@ func TestQuietTranscriptIsReinferred(t *testing.T) {
 	if err := os.Chtimes(path, old, old); err != nil {
 		t.Fatal(err)
 	}
-	tl := claudecode.NewTailer(path, time.Second)
+	h := &tailHandle{ref: path}
 
 	s := reg.Upsert("claude-code", "k", func(s *protocol.Session) {
 		s.Attachment = protocol.AttachTermctl
@@ -32,14 +31,14 @@ func TestQuietTranscriptIsReinferred(t *testing.T) {
 	reg.SetState(s.ID, protocol.StateGuess{State: protocol.StateRunning, Confidence: 0.65})
 	last := []protocol.TranscriptEvent{{Kind: protocol.EventAssistantMessage, Text: "done"}}
 
-	m.reinfer(s.ID, tl, last)
+	m.reinfer(s.ID, h, last)
 	if got, _ := reg.Get(s.ID); got.State != protocol.StateWaitingInput {
 		t.Fatalf("state = %s, want WAITING_INPUT once the transcript has been quiet", got.State)
 	}
 
 	// What an agent reported is never replaced by a guess from silence.
 	reg.SetState(s.ID, protocol.StateGuess{State: protocol.StateRunning, Confidence: 1})
-	m.reinfer(s.ID, tl, last)
+	m.reinfer(s.ID, h, last)
 	if got, _ := reg.Get(s.ID); got.State != protocol.StateRunning {
 		t.Fatalf("state = %s, want the reported RUNNING kept", got.State)
 	}
@@ -67,7 +66,7 @@ func TestRestoredHookSessionIsInferredUntilItsNextHook(t *testing.T) {
 	if err := os.Chtimes(path, old, old); err != nil {
 		t.Fatal(err)
 	}
-	m.reinfer("h", claudecode.NewTailer(path, time.Second),
+	m.reinfer("h", &tailHandle{ref: path},
 		[]protocol.TranscriptEvent{{Kind: protocol.EventAssistantMessage, Text: "done"}})
 	if got, _ := reg.Get("h"); got.State != protocol.StateWaitingInput {
 		t.Fatalf("state = %s, want WAITING_INPUT inferred from the quiet transcript", got.State)

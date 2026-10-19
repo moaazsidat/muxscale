@@ -23,6 +23,7 @@ package adapter
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/muxscale/muxscale/go/internal/protocol"
@@ -153,6 +154,13 @@ type Process struct {
 	Argv     []string // full argv, argv[0] included
 	Cwd      string   // may be empty if unreadable
 	TTY      string   // controlling terminal, may be empty
+
+	// Started is when the process began, as the process table reports it. A
+	// transcript join needs it because resuming a session reuses a file that
+	// predates the process; without the start time a resumed session and a
+	// fresh one in the same project are indistinguishable.
+	Started time.Time
+
 	Ancestry []string // executable names from parent to session leader
 }
 
@@ -208,6 +216,114 @@ type TranscriptStream interface {
 	Close() error
 }
 
+// Meta is session-level metadata recovered from a transcript.
+//
+// It lives here rather than in one adapter because every agent's file says
+// some subset of the same things, and the daemon copying a title or a model
+// onto a session is not Claude Code's business. Adapters leave a field empty
+// when their format does not carry it.
+type Meta struct {
+	SessionID string
+	Cwd       string
+	GitBranch string
+	Model     string
+	Version   string
+	Title     string
+
+	// CustomTitle is the last name a person set (Claude Code's /rename,
+	// omp's title_change with source "user"), nil when the transcript holds
+	// none. A pointer because clearing a name has to be told apart from
+	// never having had one.
+	CustomTitle *string
+	LastPrompt  string
+}
+
+// Merge folds an observation into m, keeping fields the observation omitted.
+// Every transcript format reports a subset per line, so a chunk that carried
+// only a tool result must not erase the title an earlier chunk established.
+func (m *Meta) Merge(o Meta) {
+	if o.SessionID != "" {
+		m.SessionID = o.SessionID
+	}
+	if o.Cwd != "" {
+		m.Cwd = o.Cwd
+	}
+	if o.GitBranch != "" {
+		m.GitBranch = o.GitBranch
+	}
+	if o.Model != "" {
+		m.Model = o.Model
+	}
+	if o.Version != "" {
+		m.Version = o.Version
+	}
+	if o.Title != "" {
+		m.Title = o.Title
+	}
+	if o.CustomTitle != nil {
+		m.CustomTitle = o.CustomTitle
+	}
+	if o.LastPrompt != "" {
+		m.LastPrompt = o.LastPrompt
+	}
+}
+
+// Empty reports whether the observation carries nothing to apply.
+func (m Meta) Empty() bool {
+	return m.Title == "" && m.CustomTitle == nil && m.GitBranch == "" &&
+		m.Model == "" && m.Version == "" && m.Cwd == "" && m.SessionID == ""
+}
+
+// MetaSource is implemented by transcript streams that recover metadata.
+//
+// Separate from TranscriptStream because reading a session's title does not
+// require its conversation, and because not every format has one. Meta reports
+// what changed since the previous call, not the cumulative value: a quiet
+// session must produce no row updates, and a chunk that carried only a tool
+// result must not erase a title observed earlier.
+type MetaSource interface {
+	Meta() Meta
+}
+
+// PacedStream is implemented by streams with a preferred poll cadence. The
+// manager falls back to its own default when it is absent.
+type PacedStream interface {
+	Interval() time.Duration
+}
+
+// SeekableStream is implemented by streams that can skip to the end of what
+// the store already holds, so a restart does not re-read a large transcript.
+type SeekableStream interface {
+	SeekEnd(fromSeq uint64) error
+}
+
+// Locator joins a running process to its transcript.
+//
+// This is two questions with different answers, kept apart on purpose:
+//
+//   - TranscriptForProcess asks for a fact the agent's own runtime recorded --
+//     Claude Code's pid file, omp's terminal breadcrumb. It follows /resume and
+//     /clear inside a live process and cannot pick a neighbour's conversation.
+//   - MatchTranscript is a guess when no such fact exists. It takes the set of
+//     paths already claimed by other live sessions so two agents in one project
+//     do not both adopt the same file.
+//
+// Returning "" from either is valid and means "no transcript", not an error.
+type Locator interface {
+	TranscriptForProcess(Process) string
+	MatchTranscript(cwd string, started time.Time, claimed map[string]bool) string
+}
+
+// Liveness reports whether the agent's own runtime still owns a session, when
+// that can be known without a process: omp's writer lease, for example.
+//
+// The second return says whether the answer is known at all. An adapter with a
+// transcript but no liveness signal returns false, false -- and the manager
+// then relies on the process table, as it always has.
+type Liveness interface {
+	Live(ref string) (live bool, known bool)
+}
+
 // StateInferrer derives a session's state. Adapters declaring
 // Signals.State == SupportExact still implement this: the difference is the
 // confidence they return, not whether the method exists.
@@ -247,6 +363,11 @@ type StateInput struct {
 	// as meaningful. Passed in rather than baked into each adapter so it stays
 	// one tunable rather than five.
 	Quiescence time.Duration
+
+	// Live is whether the agent's own runtime still owns the session, when an
+	// adapter can answer that without the process table (see Liveness). Nil
+	// means unknown; adapters must not read nil as "dead".
+	Live *bool
 }
 
 // Approver is implemented by adapters that can carry a human's answer back to
@@ -257,6 +378,131 @@ type StateInput struct {
 // a timeout can produce an "allow".
 type Approver interface {
 	Reply(ctx context.Context, req protocol.ApprovalRequest, d protocol.ApprovalDecision) error
+}
+
+// HookKind is a normalized event an agent's installed integration reports.
+//
+// The daemon's state machine speaks these, not any one agent's event names.
+// Claude Code calls a finished turn `Stop`; omp calls it `turn_end`; the
+// session is WAITING_INPUT either way. Keeping the translation in the adapter
+// is what lets a second event channel exist without a second state machine.
+type HookKind string
+
+const (
+	HookSessionStart  HookKind = "session_start"
+	HookTurnStart     HookKind = "turn_start"
+	HookUserPrompt    HookKind = "user_prompt"
+	HookToolCall      HookKind = "tool_call"
+	HookToolResult    HookKind = "tool_result"
+	HookStop          HookKind = "stop"
+	HookIdle          HookKind = "idle"
+	HookNotification  HookKind = "notification"
+	HookSessionEnd    HookKind = "session_end"
+	HookCompaction    HookKind = "compaction"
+	HookSubagentStart HookKind = "subagent_start"
+	HookSubagentStop  HookKind = "subagent_stop"
+	// HookApproval is a blocking question the agent is waiting on. The
+	// daemon holds the HTTP request open while a human answers.
+	HookApproval HookKind = "approval"
+	// HookElicit is the same, for a typed form rather than a yes/no.
+	HookElicit HookKind = "elicitation"
+	// HookNotice is a valid event with no state consequence. It is accepted
+	// and logged rather than rejected: agents add events without warning, and
+	// an unknown event is not an error.
+	HookNotice HookKind = "notice"
+)
+
+// HookEvent is an agent event translated into muxscale's vocabulary.
+type HookEvent struct {
+	AgentID string
+	Kind    HookKind
+
+	// SessionID is the agent's own session identifier (its NaturalKey).
+	SessionID string
+	// SessionFile is the transcript, when the transport names one. It is the
+	// strongest join there is: Claude Code sends it in every payload, omp's
+	// extension reads it from its session manager.
+	SessionFile string
+	Cwd         string
+
+	PromptID     string
+	EventName    string // the agent's own name, for evidence and debugging
+	AgentVersion string
+	Model        string
+
+	ToolName   string
+	ToolUseID  string
+	ToolInput  map[string]any
+	ToolOutput string
+	IsError    bool
+
+	IsSidechain bool
+	EndReason   string
+}
+
+// Subject renders a short human-readable summary for a notification body.
+// It must be terse: this lands on a lock screen.
+//
+// The literal arguments are what is shown, never the agent's description of
+// them -- the structural defence against a repo persuading an agent to ask
+// for something harmless-sounding.
+func (e HookEvent) Subject() string {
+	switch e.ToolName {
+	case "":
+		return e.EventName
+	case "bash", "Bash":
+		if cmd, ok := e.ToolInput["command"].(string); ok {
+			return "bash: " + collapseWS(cmd, 80)
+		}
+	case "edit", "Edit", "write", "Write", "NotebookEdit":
+		path, _ := e.ToolInput["path"].(string)
+		if path == "" {
+			path, _ = e.ToolInput["file_path"].(string)
+		}
+		if path != "" {
+			return e.ToolName + " " + shortenPath(path)
+		}
+	case "read", "Read":
+		path, _ := e.ToolInput["path"].(string)
+		if path == "" {
+			path, _ = e.ToolInput["file_path"].(string)
+		}
+		if path != "" {
+			return "read " + shortenPath(path)
+		}
+	}
+	return e.ToolName
+}
+
+func collapseWS(s string, n int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) <= n {
+		return s
+	}
+	return s[:n-1] + "…"
+}
+
+// shortenPath keeps the last two segments, which is what identifies a file to
+// a human glancing at a phone.
+func shortenPath(p string) string {
+	parts := strings.Split(strings.TrimSuffix(p, "/"), "/")
+	if len(parts) <= 2 {
+		return p
+	}
+	return ".../" + strings.Join(parts[len(parts)-2:], "/")
+}
+
+// HookCodec is implemented by adapters whose agent can call muxscale directly
+// -- HTTP hooks, a locally installed extension POSTing events.
+//
+// Decode translates the agent's payload; EncodeReply translates a human's
+// decision back. EncodeReply is called with a nil decision when there is
+// nothing to decide, and must return whatever that agent reads as "no
+// decision" (fail open). Every error path in the daemon uses that same value.
+type HookCodec interface {
+	HookPath() string
+	DecodeHook(body []byte) (HookEvent, error)
+	EncodeHookReply(e HookEvent, d *protocol.ApprovalDecision) any
 }
 
 // Installer is implemented by adapters that configure the agent to talk to

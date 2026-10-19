@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/muxscale/muxscale/go/internal/adapter"
 	"github.com/muxscale/muxscale/go/internal/protocol"
 )
 
@@ -80,20 +81,11 @@ type contentBlock struct {
 	IsError   bool            `json:"is_error"`
 }
 
-// Meta is session-level metadata recovered from a transcript.
-type Meta struct {
-	SessionID string
-	Cwd       string
-	GitBranch string
-	Model     string
-	Version   string
-	Title     string
-	// CustomTitle is the last name set by /rename (or by muxscale on its
-	// behalf), nil when the transcript holds none. Last one wins, as in
-	// Claude Code itself.
-	CustomTitle *string
-	LastPrompt  string
-}
+// Meta is the shared transcript metadata, aliased so this package's existing
+// call sites and tests keep their spelling. The shape lives in adapter because
+// every agent's file carries some subset of the same fields (see the omp
+// adapter, which fills the same struct from a different format).
+type Meta = adapter.Meta
 
 // excerptBytes caps how much of any single text or tool output we retain
 // inline. The full body is fetched on demand (spec §5.3) -- shipping a 2 MB
