@@ -329,7 +329,10 @@ func (*Adapter) InferState(in adapter.StateInput) (protocol.StateGuess, bool) {
 		}, true
 	}
 
-	last := in.Recent[len(in.Recent)-1]
+	last, ok := lastTurnEvent(in.Recent)
+	if !ok {
+		return protocol.StateGuess{}, false
+	}
 	switch last.Kind {
 	case protocol.EventToolCall:
 		return guess(protocol.StateRunning, 0.6, "a tool call is in flight", last, now), true
@@ -347,6 +350,23 @@ func (*Adapter) InferState(in adapter.StateInput) (protocol.StateGuess, bool) {
 		return guess(protocol.StateRunning, 0.65, "the assistant is mid-turn", last, now), true
 	}
 	return protocol.StateGuess{}, false
+}
+
+// lastTurnEvent is the newest event that says whose turn it is.
+//
+// omp follows the end of a turn with bookkeeping -- a mode change after the
+// final reply, a goal or todo record, a usage tally -- and judged on that
+// alone, a session that had finished answering kept the state of its last
+// tool result: Working, for as long as it waited for its person.
+func lastTurnEvent(recent []protocol.TranscriptEvent) (protocol.TranscriptEvent, bool) {
+	for i := len(recent) - 1; i >= 0; i-- {
+		switch recent[i].Kind {
+		case protocol.EventNotice, protocol.EventTokenUsage, protocol.EventStateChange:
+			continue
+		}
+		return recent[i], true
+	}
+	return protocol.TranscriptEvent{}, false
 }
 
 func guess(s protocol.SessionState, c float64, reason string, last protocol.TranscriptEvent, at time.Time) protocol.StateGuess {

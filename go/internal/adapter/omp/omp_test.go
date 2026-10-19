@@ -174,6 +174,23 @@ func TestInferState(t *testing.T) {
 	}
 }
 
+// omp writes a mode change after its final reply. The turn is still over.
+func TestInferStateLooksPastBookkeeping(t *testing.T) {
+	in := adapter.StateInput{Recent: []protocol.TranscriptEvent{
+		{Kind: protocol.EventToolResult, ToolName: "bash"},
+		{Kind: protocol.EventThinking, Text: "final response"},
+		{Kind: protocol.EventAssistantMessage, Text: "done"},
+		{Kind: protocol.EventNotice, Text: "mode: none"},
+	}, Idle: 10 * time.Second, Quiescence: 6 * time.Second, Live: new(true)}
+	if g, ok := (&Adapter{}).InferState(in); !ok || g.State != protocol.StateWaitingInput {
+		t.Fatalf("guess = %+v, ok=%v; want waiting for input", g, ok)
+	}
+	only := adapter.StateInput{Recent: []protocol.TranscriptEvent{{Kind: protocol.EventNotice, Text: "mode: none"}}}
+	if _, ok := (&Adapter{}).InferState(only); ok {
+		t.Fatal("inferred a state from bookkeeping alone")
+	}
+}
+
 func TestDiscoverSkipsSubagentFiles(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("PI_CODING_AGENT_DIR", filepath.Join(root, "agent"))

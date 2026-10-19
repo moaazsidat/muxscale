@@ -1611,12 +1611,15 @@ func (m *Manager) tailLoop(sessionID string, h *tailHandle) {
 		m.mu.Unlock()
 	}()
 
-	// The newest event seen, for inferring state while the file is quiet.
+	// The newest few events seen, for inferring state while the file is
+	// quiet. Several rather than one: an agent can follow the end of a turn
+	// with bookkeeping (omp writes a mode change after its final reply), and
+	// an adapter that saw only that would have nothing to say about the turn.
 	// Seeded from the store, since a tailer resumed after a restart starts at
 	// the end of the file and would otherwise know nothing until the next line.
 	var last []protocol.TranscriptEvent
 	if maxSeq, err := m.store.MaxSeq(sessionID); err == nil && maxSeq > 0 {
-		last, _ = m.store.Transcript(sessionID, maxSeq-1, 1)
+		last, _ = m.store.Transcript(sessionID, maxSeq-min(maxSeq, inferWindow), inferWindow)
 	}
 
 	var misses int
@@ -1663,7 +1666,10 @@ func (m *Manager) tailLoop(sessionID string, h *tailHandle) {
 			m.reinfer(sessionID, h, last)
 			continue
 		}
-		last = events[len(events)-1:]
+		last = append(last, events...)
+		if len(last) > inferWindow {
+			last = append([]protocol.TranscriptEvent(nil), last[len(last)-inferWindow:]...)
+		}
 
 		for i := range events {
 			events[i].SessionID = sessionID
@@ -1685,7 +1691,7 @@ func (m *Manager) tailLoop(sessionID string, h *tailHandle) {
 		// not override what the agent told us directly. A hook session's
 		// state is a guess only until its first hook after a restart.
 		if !terminal {
-			if guess, ok := m.infer(sessionID, h, events); ok {
+			if guess, ok := m.infer(sessionID, h, last); ok {
 				m.reg.SetState(sessionID, guess)
 			}
 		}
@@ -1694,6 +1700,10 @@ func (m *Manager) tailLoop(sessionID string, h *tailHandle) {
 		}
 	}
 }
+
+// inferWindow is how many of a transcript's newest events state inference
+// is shown.
+const inferWindow = 8
 
 // reinfer re-runs state inference for a quiet transcript, and records the
 // result only when it changes the state. It never replaces a state the agent
