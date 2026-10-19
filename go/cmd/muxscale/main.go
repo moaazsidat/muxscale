@@ -396,7 +396,137 @@ func cmdDebug(args []string) error {
 	if len(args) >= 2 && args[0] == "transcript" {
 		return debugTranscript(args[1:])
 	}
-	return fmt.Errorf("usage: muxscale debug transcript PATH [--json]")
+	if len(args) >= 2 && args[0] == "adapter" {
+		return debugAdapter(args[1:])
+	}
+	return fmt.Errorf("usage: muxscale debug transcript PATH [--json] | debug adapter AGENT [REF]")
+}
+
+// debugAdapter runs one adapter's read path against this machine's real
+// files: what it discovers, and what it makes of a transcript. It is how an
+// adapter is checked against an agent's actual on-disk format, which is the
+// only check that counts -- fixtures are written from what we believe the
+// format is.
+func debugAdapter(args []string) error {
+	reg := builtin.Registry(builtin.Options{})
+	a, ok := reg.Get(args[0])
+	if !ok {
+		var ids []string
+		for _, x := range reg.All() {
+			ids = append(ids, x.Info().ID)
+		}
+		return fmt.Errorf("no adapter %q (have: %s)", args[0], strings.Join(ids, ", "))
+	}
+	info := a.Info()
+	fmt.Printf("%s (%s)  discovery=%s state=%s transcript=%s approvals=%s\n\n", info.DisplayName, info.ID,
+		info.Signals.Discovery, info.Signals.State, info.Signals.Transcript, info.Signals.Approvals)
+
+	ref := ""
+	if len(args) >= 2 {
+		ref = args[1]
+	}
+	if d, ok := a.(adapter.Discoverer); ok {
+		found, err := d.Discover(context.Background())
+		if err != nil {
+			return fmt.Errorf("discover: %w", err)
+		}
+		live := 0
+		for _, s := range found {
+			if s.Live {
+				live++
+			}
+		}
+		fmt.Printf("discovered %d session(s), %d live\n", len(found), live)
+		for i, s := range found {
+			if i == 10 {
+				fmt.Printf("  … %d more\n", len(found)-i)
+				break
+			}
+			mark := " "
+			if s.Live {
+				mark = "*"
+			}
+			fmt.Printf("  %s %-38s %-28s %s\n", mark, clipText(s.NaturalKey, 38), clipText(s.Cwd, 28), clipText(firstOf(s.Name, s.Title), 40))
+		}
+		if ref == "" && len(found) > 0 {
+			ref = found[0].Ref
+		}
+	} else {
+		fmt.Println("no discovery: this adapter only finds sessions through the process scan")
+	}
+	if ref == "" {
+		return nil
+	}
+	tr, ok := a.(adapter.Transcriber)
+	if !ok {
+		fmt.Println("\nno transcript reader")
+		return nil
+	}
+	stream, err := tr.OpenTranscript(context.Background(), ref)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", ref, err)
+	}
+	defer stream.Close()
+	var events []protocol.TranscriptEvent
+	for range 50 { // a stream may page; stop once it is drained
+		batch, err := stream.Poll(context.Background())
+		if err != nil {
+			return fmt.Errorf("poll %s: %w", ref, err)
+		}
+		if len(batch) == 0 {
+			break
+		}
+		events = append(events, batch...)
+	}
+	fmt.Printf("\ntranscript %s\n  %d event(s)\n", ref, len(events))
+	counts := map[protocol.EventKind]int{}
+	var order []protocol.EventKind
+	for _, e := range events {
+		if counts[e.Kind] == 0 {
+			order = append(order, e.Kind)
+		}
+		counts[e.Kind]++
+	}
+	for _, k := range order {
+		fmt.Printf("  %-20s %d\n", k, counts[k])
+	}
+	for i := max(0, len(events)-3); i < len(events); i++ {
+		e := events[i]
+		fmt.Printf("  last: %-18s %s %s\n", e.Kind, e.ToolName, clipText(strings.ReplaceAll(e.Text, "\n", " "), 60))
+	}
+	if si, ok := a.(adapter.StateInferrer); ok && len(events) > 0 {
+		in := adapter.StateInput{Ref: ref, Recent: events[max(0, len(events)-8):], Idle: time.Since(events[len(events)-1].At), Quiescence: 6 * time.Second}
+		if er, ok := stream.(adapter.EventReporter); ok {
+			in.Event = er.LastEvent()
+		}
+		if lv, ok := a.(adapter.Liveness); ok {
+			if live, known := lv.Live(ref); known {
+				in.Live = &live
+			}
+		}
+		if g, ok := si.InferState(in); ok {
+			fmt.Printf("\nstate %s (%.2f): %s [%s]\n", g.State, g.Confidence, g.Reason, g.Evidence)
+		} else {
+			fmt.Println("\nstate: no opinion")
+		}
+	}
+	return nil
+}
+
+func clipText(s string, n int) string {
+	if r := []rune(s); len(r) > n {
+		return string(r[:n-1]) + "…"
+	}
+	return s
+}
+
+func firstOf(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // debugTranscript parses a Claude Code JSONL transcript and summarises it.
