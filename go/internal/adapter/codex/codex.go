@@ -30,13 +30,13 @@ import (
 )
 
 // MinVersion is the floor the adapter was verified against.
-const MinVersion = "0.100.0"
+const MinVersion = "0.163.0"
 
 // newestKnownProfile is the highest Codex version this build has fixtures for.
 // 0.130.0 is where the session_meta.source drift was observed and pinned (see
 // drift_test.go). Versions above it use this profile and are badged, never
 // rejected.
-const newestKnownProfile = "0.130.0"
+const newestKnownProfile = "0.163.0"
 
 // record is one line of a rollout file.
 type record struct {
@@ -54,7 +54,10 @@ type record struct {
 // field silently discarded the entire header -- session id, cwd and all. Any
 // field that might drift belongs in this category.
 type sessionMeta struct {
-	ID            string          `json:"id"`
+	ID string `json:"id"`
+	// SessionID is the same value under a second name in 0.163. Read both:
+	// whichever a build omits, the session keeps its identity.
+	SessionID     string          `json:"session_id"`
 	Timestamp     string          `json:"timestamp"`
 	Cwd           string          `json:"cwd"`
 	Originator    string          `json:"originator"`
@@ -161,6 +164,18 @@ type Meta struct {
 	// session belongs nested under its parent, not as a peer in the list.
 	Source   string
 	Subagent string
+
+	// Title and Name are set by the thread index, not by a rollout record:
+	// Codex keeps the human-readable title and the person's rename in
+	// state_5.sqlite. GitBranch is there for the same reason.
+	Title     string
+	Name      string
+	GitBranch string
+
+	// LastEventType is the last lifecycle record in the rollouts, which is
+	// the evidence state inference needs: task_complete is the turn boundary,
+	// and it is not a rendered transcript event.
+	LastEventType string
 }
 
 // IsSubagent reports whether Codex started this session on its own behalf.
@@ -210,7 +225,11 @@ func ParseRollout(r io.Reader) ([]protocol.TranscriptEvent, Meta, error) {
 		case "session_meta":
 			var sm sessionMeta
 			if err := json.Unmarshal(rec.Payload, &sm); err == nil {
-				meta.SessionID, meta.Cwd = sm.ID, sm.Cwd
+				meta.SessionID = sm.ID
+				if meta.SessionID == "" {
+					meta.SessionID = sm.SessionID
+				}
+				meta.Cwd = sm.Cwd
 				meta.Version, meta.Provider = sm.CLIVersion, sm.ModelProvider
 				meta.Source, meta.Subagent = decodeSource(sm.Source)
 			}
@@ -235,6 +254,15 @@ func ParseRollout(r io.Reader) ([]protocol.TranscriptEvent, Meta, error) {
 			}
 
 		case "event_msg":
+			var em eventMsg
+			if json.Unmarshal(rec.Payload, &em) == nil {
+				switch em.Type {
+				case "task_started", "task_complete",
+					"exec_approval_request", "apply_patch_approval_request",
+					"error", "stream_error":
+					meta.LastEventType = em.Type
+				}
+			}
 			for _, e := range eventMsgEvents(rec.Payload, at) {
 				add(e)
 			}
@@ -283,22 +311,12 @@ func responseItemEvents(payload json.RawMessage, at time.Time) []protocol.Transc
 		return []protocol.TranscriptEvent{base}
 
 	case "message":
-		text := flattenText(ri.Content)
-		if strings.TrimSpace(text) == "" {
-			return nil
-		}
-		switch ri.Role {
-		case "user":
-			base.Kind = protocol.EventUserMessage
-		case "developer", "system":
-			// System prompts and permission preambles are machinery, not
-			// conversation. Showing them would bury the actual exchange.
-			return nil
-		default:
-			base.Kind = protocol.EventAssistantMessage
-		}
-		base.Text, base.Truncated = clip(text)
-		return []protocol.TranscriptEvent{base}
+		// Both roles duplicate another record, and one of them is dangerous
+		// to show: response_item role "user" is the model-visible input,
+		// including environment_context and developer preambles, while the
+		// human's actual prompt is event_msg.user_message. The assistant role
+		// repeats event_msg.agent_message. Conversation comes from event_msg.
+		return nil
 
 	case "web_search_call":
 		base.Kind = protocol.EventToolCall
@@ -394,6 +412,24 @@ func InferStateFromRollout(lastEventType string, idle time.Duration, quiescence 
 			Reason:   "rollout ends with task_complete",
 			Evidence: "codex:rollout tail", At: now,
 		}
+	case lastEventType == "exec_approval_request" || lastEventType == "apply_patch_approval_request":
+		return protocol.StateGuess{
+			State: protocol.StateWaitingApproval, Confidence: 0.85,
+			Reason:   "rollout ends with an approval request",
+			Evidence: "codex:" + lastEventType, At: now,
+		}
+	case lastEventType == "task_started":
+		return protocol.StateGuess{
+			State: protocol.StateRunning, Confidence: 0.7,
+			Reason:   "rollout starts a task and has no completion yet",
+			Evidence: "codex:task_started", At: now,
+		}
+	case lastEventType == "error" || lastEventType == "stream_error":
+		return protocol.StateGuess{
+			State: protocol.StateRunning, Confidence: 0.7,
+			Reason:   "Codex is recovering from an error",
+			Evidence: "codex:" + lastEventType, At: now,
+		}
 	case idle < quiescence:
 		return protocol.StateGuess{
 			State: protocol.StateRunning, Confidence: 0.65,
@@ -411,13 +447,25 @@ func InferStateFromRollout(lastEventType string, idle time.Duration, quiescence 
 
 // ---- session discovery ----
 
-// SessionsRoot is ~/.codex/sessions.
-func SessionsRoot() (string, error) {
+// CodexHome is CODEX_HOME when set, else ~/.codex.
+func CodexHome() (string, error) {
+	if h := os.Getenv("CODEX_HOME"); h != "" {
+		return h, nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, ".codex", "sessions"), nil
+	return filepath.Join(home, ".codex"), nil
+}
+
+// SessionsRoot is <CodexHome>/sessions.
+func SessionsRoot() (string, error) {
+	home, err := CodexHome()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, "sessions"), nil
 }
 
 // FindRollouts returns rollout files, newest first.

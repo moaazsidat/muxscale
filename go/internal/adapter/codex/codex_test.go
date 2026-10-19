@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/muxscale/muxscale/go/internal/adapter"
 	"github.com/muxscale/muxscale/go/internal/protocol"
 )
 
@@ -317,4 +318,39 @@ func TestRolloutCwdReadsOnlyTheHeader(t *testing.T) {
 		t.Errorf("cwd=%q id=%q; the header should yield both", cwd, id)
 	}
 	t.Logf("newest rollout: cwd=%s id=%s", cwd, id)
+}
+
+// 0.163 writes both session_meta.session_id and response_item messages. The
+// message records are the model-visible input (environment context included)
+// and repeat agent_message; the conversation must come from event_msg.
+func TestRollout163DoesNotDuplicateMessages(t *testing.T) {
+	input := strings.Join([]string{
+		`{"timestamp":"2026-10-19T02:40:11.809Z","type":"session_meta","payload":{"id":"01a15207-e400-7180-ad11-0bd4405a75e7","session_id":"01a15207-e400-7180-ad11-0bd4405a75e7","timestamp":"2026-10-19T02:40:11.705Z","cwd":"/Users/sam/dev/muxscale","cli_version":"0.163.0","source":"exec"}}`,
+		`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>cwd</environment_context>"}]}}`,
+		`{"type":"event_msg","payload":{"type":"user_message","message":"Reply with exactly OK"}}`,
+		`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"OK"}]}}`,
+		`{"type":"event_msg","payload":{"type":"agent_message","message":"OK"}}`,
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"t1"}}`,
+	}, "\n")
+
+	events, meta, err := ParseRollout(strings.NewReader(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("events = %d, want user + assistant only: %+v", len(events), events)
+	}
+	if events[0].Text != "Reply with exactly OK" || events[1].Text != "OK" {
+		t.Errorf("events = %+v", events)
+	}
+	if meta.SessionID != "01a15207-e400-7180-ad11-0bd4405a75e7" {
+		t.Errorf("session id = %q", meta.SessionID)
+	}
+	if meta.LastEventType != "task_complete" {
+		t.Fatalf("last event = %q", meta.LastEventType)
+	}
+	g, ok := (&Adapter{}).InferState(adapter.StateInput{Event: meta.LastEventType})
+	if !ok || g.State != protocol.StateWaitingInput || g.Confidence != 0.9 {
+		t.Fatalf("state = %+v, ok=%v", g, ok)
+	}
 }

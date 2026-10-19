@@ -148,12 +148,12 @@ type Adapter interface {
 // Deliberately not the OS-specific struct: an adapter that reaches for a pid
 // to poke at is doing something the seam should not allow.
 type Process struct {
-	PID      int
-	PPID     int
-	Exe      string   // resolved executable path, may be empty
-	Argv     []string // full argv, argv[0] included
-	Cwd      string   // may be empty if unreadable
-	TTY      string   // controlling terminal, may be empty
+	PID  int
+	PPID int
+	Exe  string   // resolved executable path, may be empty
+	Argv []string // full argv, argv[0] included
+	Cwd  string   // may be empty if unreadable
+	TTY  string   // controlling terminal, may be empty
 
 	// Started is when the process began, as the process table reports it. A
 	// transcript join needs it because resuming a session reuses a file that
@@ -174,6 +174,10 @@ type Discovered struct {
 
 	Cwd   string
 	Title string
+	// Name is a person's own label for the session, when the agent's index
+	// has one. Wars over Title: an automatic title may change, a rename must
+	// not be overwritten by it.
+	Name  string
 	Model string
 
 	// Ref is an adapter-private handle -- a transcript path, a rollout file, a
@@ -289,6 +293,18 @@ type MetaSource interface {
 // manager falls back to its own default when it is absent.
 type PacedStream interface {
 	Interval() time.Duration
+}
+
+// EventReporter is implemented by transcript streams that can name the agent's
+// own most recent event.
+//
+// Some formats carry the state evidence in records that are not themselves
+// transcript events -- Codex writes task_started and task_complete, which are
+// lifecycle, not conversation. State inference needs the name of the last
+// such record; without this it sees only rendered events and can never match
+// "task_complete", which is the one signal that matters.
+type EventReporter interface {
+	LastEvent() string
 }
 
 // SeekableStream is implemented by streams that can skip to the end of what

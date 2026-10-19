@@ -27,6 +27,8 @@ var (
 	_ adapter.Discoverer    = (*Adapter)(nil)
 	_ adapter.Transcriber   = (*Adapter)(nil)
 	_ adapter.StateInferrer = (*Adapter)(nil)
+	_ adapter.EventReporter = (*stream)(nil)
+	_ adapter.Installer     = (*Adapter)(nil)
 )
 
 func (*Adapter) Info() adapter.Info {
@@ -37,19 +39,22 @@ func (*Adapter) Info() adapter.Info {
 		NewestTested: newestKnownProfile,
 		Signals: adapter.Signals{
 			Discovery: adapter.SupportExact,
-			// Derived, not exact: the rollout is written as the turn proceeds,
-			// so "waiting" is inferred from a trailing task_complete or from
-			// silence, never from Codex telling us it is blocked.
-			State:      adapter.SupportDerived,
+			// Hooks report the turn boundary and approval requests; without
+			// them the rollout's task_complete is a 0.9 inference. Same shape
+			// as Claude Code before its hooks are installed.
+			State:      adapter.SupportExact,
 			Transcript: adapter.SupportExact,
-			Approvals:  adapter.SupportNone,
+			// PermissionRequest is held open by the relay until a human
+			// answers. The hooks must be trusted once in /hooks; until then
+			// the read path still works and state is inferred.
+			Approvals: adapter.SupportExact,
 		},
 		Attachments: []protocol.Attachment{
 			protocol.AttachWrap, protocol.AttachTmux, protocol.AttachTermctl,
 		},
-		ReadOnlyReason: "Codex has no local API to answer an approval; " +
-			"remote input needs the session to be wrapped, in tmux, or in a " +
-			"terminal with remote control.",
+		ReadOnlyReason: "Codex approvals and state need its lifecycle hooks " +
+			"installed and trusted; remote input needs the session to be " +
+			"wrapped, in tmux, or in a terminal with remote control.",
 	}
 }
 
@@ -64,6 +69,12 @@ func (*Adapter) Detect(p adapter.Process) bool {
 // each file's header. The scan is capped for that reason -- it is proportional
 // to files opened, not to sessions that matter.
 func (*Adapter) Discover(context.Context) ([]adapter.Discovered, error) {
+	// The thread index knows titles, renames and projects without opening a
+	// rollout. Fall back to the files when it is absent or from a schema this
+	// build does not know.
+	if out, ok := discoveredFromThreads(discoverScanLimit); ok {
+		return out, nil
+	}
 	paths, err := FindRollouts(discoverScanLimit)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -114,6 +125,10 @@ type stream struct {
 	lastEvt string
 }
 
+// LastEvent is the Codex lifecycle record that state inference keys on. It is
+// not a rendered event: task_complete produces no transcript event.
+func (s *stream) LastEvent() string { return s.lastEvt }
+
 func (s *stream) Poll(context.Context) ([]protocol.TranscriptEvent, error) {
 	f, err := os.Open(s.path)
 	if err != nil {
@@ -124,9 +139,12 @@ func (s *stream) Poll(context.Context) ([]protocol.TranscriptEvent, error) {
 	}
 	defer f.Close()
 
-	events, _, err := ParseRollout(f)
+	events, meta, err := ParseRollout(f)
 	if err != nil {
 		return nil, err
+	}
+	if meta.LastEventType != "" {
+		s.lastEvt = meta.LastEventType
 	}
 	if len(events) <= s.emitted {
 		return nil, nil
@@ -138,17 +156,30 @@ func (s *stream) Poll(context.Context) ([]protocol.TranscriptEvent, error) {
 
 func (s *stream) Close() error { return nil }
 
-// InferState uses the live event name when one is available and falls back to
-// the rollout tail otherwise.
+// InferState uses the lifecycle record when the stream can name one, and falls
+// back to the rendered tail for an older stream or a hand-built input.
 func (*Adapter) InferState(in adapter.StateInput) (protocol.StateGuess, bool) {
 	if in.Event != "" {
-		if g, ok := StateFromEvent(in.Event); ok {
-			return g, true
+		return InferStateFromRollout(in.Event, in.Idle, in.Quiescence), true
+	}
+	if n := len(in.Recent); n > 0 {
+		switch in.Recent[n-1].Kind {
+		case protocol.EventToolCall, protocol.EventToolResult, protocol.EventUserMessage:
+			return protocol.StateGuess{
+				State: protocol.StateRunning, Confidence: 0.6,
+				Reason: "the rollout ends with activity", Evidence: "codex:rollout tail", At: time.Now(),
+			}, true
+		case protocol.EventAssistantMessage, protocol.EventThinking:
+			state := protocol.StateRunning
+			confidence := 0.6
+			if in.Idle >= in.Quiescence {
+				state, confidence = protocol.StateWaitingInput, 0.6
+			}
+			return protocol.StateGuess{
+				State: state, Confidence: confidence,
+				Reason: "the rollout ends with an assistant turn", Evidence: "codex:rollout tail", At: time.Now(),
+			}, true
 		}
 	}
-	var last string
-	if n := len(in.Recent); n > 0 {
-		last = string(in.Recent[n-1].Kind)
-	}
-	return InferStateFromRollout(last, in.Idle, in.Quiescence), true
+	return InferStateFromRollout("", in.Idle, in.Quiescence), true
 }

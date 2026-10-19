@@ -1067,8 +1067,13 @@ func (m *Manager) adoptDiscovered(a adapter.Adapter, d adapter.Discovered) {
 				if s.Cwd == "" {
 					s.Cwd = d.Cwd
 				}
-				if s.Title == "" {
+				// The index is the agent's own title record. A placeholder
+				// written by an older discovery pass must yield to it.
+				if d.Title != "" {
 					s.Title = d.Title
+				}
+				if s.Name == "" {
+					s.Name = d.Name
 				}
 				if s.Model == "" {
 					s.Model = d.Model
@@ -1102,6 +1107,9 @@ func (m *Manager) adoptDiscovered(a adapter.Adapter, d adapter.Discovered) {
 		}
 		if d.Title != "" {
 			s.Title = d.Title
+		}
+		if d.Name != "" {
+			s.Name = d.Name
 		}
 		if d.Model != "" {
 			s.Model = d.Model
@@ -1169,6 +1177,14 @@ func helperProcess(argv []string) bool {
 		// session and have nothing to read or answer, but the process scan sees
 		// the same argv[0] as an agent and would list them forever.
 		if strings.HasPrefix(a, "__omp_worker_") {
+			return true
+		}
+	}
+	// Codex's app-server and remote-control daemons are infrastructure, not
+	// conversations. They outlive every session and would sit in the list.
+	if len(argv) > 1 && filepath.Base(argv[0]) == "codex" {
+		switch argv[1] {
+		case "app-server", "remote-control", "exec-server":
 			return true
 		}
 	}
@@ -1669,7 +1685,7 @@ func (m *Manager) tailLoop(sessionID string, h *tailHandle) {
 		// not override what the agent told us directly. A hook session's
 		// state is a guess only until its first hook after a restart.
 		if !terminal {
-			if guess, ok := m.infer(sessionID, h.ref, events); ok {
+			if guess, ok := m.infer(sessionID, h, events); ok {
 				m.reg.SetState(sessionID, guess)
 			}
 		}
@@ -1683,14 +1699,11 @@ func (m *Manager) tailLoop(sessionID string, h *tailHandle) {
 // result only when it changes the state. It never replaces a state the agent
 // reported (confidence 1) -- a hook's word outranks a guess from silence.
 func (m *Manager) reinfer(sessionID string, h *tailHandle, last []protocol.TranscriptEvent) {
-	if len(last) == 0 {
-		return
-	}
 	s, ok := m.reg.Get(sessionID)
 	if !ok || s.Guess.Confidence >= 1 {
 		return
 	}
-	if guess, ok := m.infer(sessionID, h.ref, last); ok && guess.State != s.State {
+	if guess, ok := m.infer(sessionID, h, last); ok && guess.State != s.State {
 		m.reg.SetState(sessionID, guess)
 	}
 }
@@ -1702,9 +1715,15 @@ func (m *Manager) reinfer(sessionID string, h *tailHandle, last []protocol.Trans
 // adapter knows how to read it. An adapter with no opinion returns false, and
 // the session keeps whatever state it had rather than being guessed at by a
 // generic heuristic that knows nothing about the agent.
-func (m *Manager) infer(sessionID, path string, events []protocol.TranscriptEvent) (protocol.StateGuess, bool) {
+func (m *Manager) infer(sessionID string, h *tailHandle, events []protocol.TranscriptEvent) (protocol.StateGuess, bool) {
+	// A rollout can hold lifecycle records and no rendered conversation yet
+	// -- a failed first turn is exactly that. The adapter's own last event is
+	// still evidence, so an empty tail is not an empty question.
 	if len(events) == 0 {
-		return protocol.StateGuess{}, false
+		er, ok := h.stream.(adapter.EventReporter)
+		if !ok || er.LastEvent() == "" {
+			return protocol.StateGuess{}, false
+		}
 	}
 	s, ok := m.reg.Get(sessionID)
 	if !ok || s.Guess.Confidence >= 1 {
@@ -1718,6 +1737,7 @@ func (m *Manager) infer(sessionID, path string, events []protocol.TranscriptEven
 	if !ok {
 		return protocol.StateGuess{}, false
 	}
+	path := h.ref
 	if path == "" {
 		path = s.TranscriptPath
 	}
@@ -1728,6 +1748,9 @@ func (m *Manager) infer(sessionID, path string, events []protocol.TranscriptEven
 	in := adapter.StateInput{
 		Ref: path, Recent: events,
 		Idle: time.Since(fi.ModTime()), Quiescence: 6 * time.Second,
+	}
+	if er, ok := h.stream.(adapter.EventReporter); ok {
+		in.Event = er.LastEvent()
 	}
 	if lv, ok := a.(adapter.Liveness); ok {
 		if live, known := lv.Live(path); known {
