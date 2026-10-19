@@ -76,6 +76,7 @@ func (*Adapter) Discover(context.Context) ([]adapter.Discovered, error) {
 	if err != nil {
 		return nil, err
 	}
+	now := time.Now()
 	out := make([]adapter.Discovered, 0, len(sessions))
 	for _, s := range sessions {
 		out = append(out, adapter.Discovered{
@@ -88,7 +89,7 @@ func (*Adapter) Discover(context.Context) ([]adapter.Discovered, error) {
 			Title: s.Title,
 			Model: s.Model,
 			Ref:   s.ID,
-			Live:  s.IsLive(),
+			Live:  s.IsActive(now),
 		})
 	}
 	return out, nil

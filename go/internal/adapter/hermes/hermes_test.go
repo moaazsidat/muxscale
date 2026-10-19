@@ -353,3 +353,36 @@ func contains(s, sub string) bool {
 	}
 	return false
 }
+
+// A session Hermes never closed -- it crashed, or its terminal was closed --
+// has no end recorded. It is live only while it is still being used.
+func TestIsActiveNeedsRecentUse(t *testing.T) {
+	s := openFixture(t)
+	sessions, err := s.Sessions(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]Session{}
+	for _, sess := range sessions {
+		byID[sess.ID] = sess
+	}
+	now := time.Now()
+
+	live := byID["s-live"]
+	if got := now.Sub(live.LastActiveAt); got < 570*time.Second || got > 590*time.Second {
+		t.Errorf("last active %v ago, want the newest message (~575s)", got)
+	}
+	if !live.IsActive(now) {
+		t.Error("a session used ten minutes ago is not active")
+	}
+	if live.IsActive(now.Add(13 * time.Hour)) {
+		t.Error("a session untouched for half a day is still active")
+	}
+	// No messages: the start is the last sign of use.
+	if child := byID["s-child"]; !child.LastActiveAt.Equal(child.StartedAt) {
+		t.Errorf("message-less session last active %v, want its start %v", child.LastActiveAt, child.StartedAt)
+	}
+	if byID["s-done"].IsActive(now) {
+		t.Error("an ended session is active")
+	}
+}

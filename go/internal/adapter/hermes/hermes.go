@@ -92,6 +92,9 @@ type Session struct {
 	StartedAt time.Time
 	EndedAt   time.Time
 	EndReason string
+	// LastActiveAt is the newest message, or the start for a session with
+	// none.
+	LastActiveAt time.Time
 
 	MessageCount  int
 	ToolCallCount int
@@ -101,6 +104,20 @@ type Session struct {
 
 // IsLive reports whether the session has not ended.
 func (s Session) IsLive() bool { return s.EndedAt.IsZero() && s.EndReason == "" }
+
+// IsActive reports a session that has not ended and has been used within
+// activeWindow of now.
+//
+// Not having ended is not enough. Hermes records the end when it closes a
+// session itself; a crash, a kill or a closed terminal records nothing, and
+// such a session stayed live in the list for months.
+func (s Session) IsActive(now time.Time) bool {
+	return s.IsLive() && now.Sub(s.LastActiveAt) < activeWindow
+}
+
+// activeWindow matches the other adapters' (Codex's liveWindow): generous,
+// because a session waiting on its person is quiet by definition.
+const activeWindow = 12 * time.Hour
 
 // IsChild reports whether Hermes spawned this session from another.
 func (s Session) IsChild() bool { return s.ParentID != "" }
@@ -116,7 +133,8 @@ SELECT id, COALESCE(source,''), COALESCE(model,''), COALESCE(parent_session_id,'
        COALESCE(message_count,0), COALESCE(tool_call_count,0),
        COALESCE(input_tokens,0), COALESCE(output_tokens,0),
        COALESCE(cache_read_tokens,0), COALESCE(cache_write_tokens,0),
-       COALESCE(actual_cost_usd, estimated_cost_usd, 0)
+       COALESCE(actual_cost_usd, estimated_cost_usd, 0),
+       (SELECT MAX(timestamp) FROM messages m WHERE m.session_id = sessions.id)
 FROM sessions ORDER BY started_at DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -129,16 +147,21 @@ FROM sessions ORDER BY started_at DESC LIMIT ?`, limit)
 			sess    Session
 			started float64
 			ended   sql.NullFloat64
+			lastMsg sql.NullFloat64
 		)
 		if err := rows.Scan(&sess.ID, &sess.Source, &sess.Model, &sess.ParentID,
 			&sess.Title, &started, &ended, &sess.EndReason,
 			&sess.MessageCount, &sess.ToolCallCount,
 			&sess.Tokens.InputTokens, &sess.Tokens.OutputTokens,
 			&sess.Tokens.CacheReadTokens, &sess.Tokens.CacheWriteTokens,
-			&sess.CostUSD); err != nil {
+			&sess.CostUSD, &lastMsg); err != nil {
 			return nil, err
 		}
 		sess.StartedAt = floatTime(started)
+		sess.LastActiveAt = sess.StartedAt
+		if lastMsg.Valid && lastMsg.Float64 > started {
+			sess.LastActiveAt = floatTime(lastMsg.Float64)
+		}
 		if ended.Valid && ended.Float64 > 0 {
 			sess.EndedAt = floatTime(ended.Float64)
 		}
