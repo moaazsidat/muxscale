@@ -11,6 +11,7 @@ import (
 
 	"github.com/muxscale/muxscale/go/internal/adapter"
 	"github.com/muxscale/muxscale/go/internal/adapter/omp"
+	"github.com/muxscale/muxscale/go/internal/protocol"
 	"github.com/muxscale/muxscale/go/internal/store"
 )
 
@@ -91,5 +92,26 @@ func TestAdapterDiscoveryAdoptsOnlyLiveSessions(t *testing.T) {
 			t.Fatal("transcript was never read")
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Discovery was this row's only evidence. When the agent lets go of the
+	// session, the row ends rather than keeping its last state forever.
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_UN); err != nil {
+		t.Fatal(err)
+	}
+	m.lastAdapterScan = time.Time{}
+	m.discoverAdapters()
+	if s, _ := reg.Get(id); s.State != protocol.StateExited {
+		t.Fatalf("released session state = %s, want EXITED", s.State)
+	}
+
+	// Resumed: the same row comes back.
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	m.lastAdapterScan = time.Time{}
+	m.discoverAdapters()
+	if s, _ := reg.Get(id); s.State.Terminal() {
+		t.Fatalf("resumed session state = %s, want it live again", s.State)
 	}
 }

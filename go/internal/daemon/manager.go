@@ -1034,6 +1034,7 @@ func (m *Manager) discoverAdapters() {
 			m.log.Debug("adapter discovery failed", "agent", a.Info().ID, "err", err)
 			continue
 		}
+		live := map[string]bool{}
 		for _, s := range found {
 			// History is not a live session. The process scan and the store
 			// already keep what ended; inserting every file an agent ever
@@ -1043,8 +1044,38 @@ func (m *Manager) discoverAdapters() {
 			if !s.Live {
 				continue
 			}
+			live[s.NaturalKey] = true
 			m.adoptDiscovered(a, s)
 		}
+		m.retireDiscovered(a.Info().ID, live)
+	}
+}
+
+// retireDiscovered ends the rows discovery made that their agent no longer
+// considers alive.
+//
+// Discovery is the only evidence such a row has: no process, no pane, no hook.
+// It used to only ever add, so a row outlived the window that let it in -- a
+// Codex thread stayed "waiting for you" a day after its window closed, and a
+// `codex exec` run that answered once and exited stayed "working" -- because
+// nothing else was ever going to say it had ended.
+func (m *Manager) retireDiscovered(agentID string, live map[string]bool) {
+	now := time.Now()
+	for _, s := range m.reg.List() {
+		if s.AgentID != agentID || s.State.Terminal() || s.Attachment != protocol.AttachTranscript {
+			continue
+		}
+		if strings.HasPrefix(s.NaturalKey, "pid:") || strings.HasPrefix(s.NaturalKey, "tmux:") {
+			continue // the process scan answers for these
+		}
+		if live[s.NaturalKey] {
+			continue
+		}
+		m.reg.SetState(s.ID, protocol.StateGuess{
+			State: protocol.StateExited, Confidence: 0.8,
+			Reason:   "no longer active in the agent's session files",
+			Evidence: "adapter:" + agentID + " not live", At: now,
+		})
 	}
 }
 
@@ -1123,7 +1154,8 @@ func (m *Manager) adoptDiscovered(a adapter.Adapter, d adapter.Discovered) {
 	if existing, ok := m.reg.Get(sess.ID); ok {
 		revive := existing.State == protocol.StateStarting ||
 			(d.Live && existing.State == protocol.StateDetached && existing.Guess.Evidence == "restore") ||
-			(d.Live && existing.State == protocol.StateUnknown && existing.Guess.Confidence < 1)
+			(d.Live && existing.State == protocol.StateUnknown && existing.Guess.Confidence < 1) ||
+			(d.Live && retired(existing))
 		if revive {
 			m.reg.SetState(sess.ID, protocol.StateGuess{
 				State: state, Confidence: confidence, Reason: reason,
@@ -1134,6 +1166,12 @@ func (m *Manager) adoptDiscovered(a adapter.Adapter, d adapter.Discovered) {
 	if d.Ref != "" {
 		m.EnsureTailer(sess.ID, d.Ref)
 	}
+}
+
+// retired reports a row that retireDiscovered ended. Resuming the
+// conversation -- `codex resume` -- makes it live again.
+func retired(s protocol.Session) bool {
+	return s.State == protocol.StateExited && strings.HasSuffix(s.Guess.Evidence, " not live")
 }
 
 // reviveRestored gives a live session back to inference after a restart.
@@ -1151,7 +1189,8 @@ func (m *Manager) reviveRestored(sessionID string) {
 	switch {
 	case s.State == protocol.StateDetached && s.Guess.Evidence == "restore",
 		s.State == protocol.StateStarting,
-		s.State == protocol.StateUnknown && s.Guess.Confidence < 1:
+		s.State == protocol.StateUnknown && s.Guess.Confidence < 1,
+		retired(s):
 		m.reg.SetState(sessionID, protocol.StateGuess{
 			State: protocol.StateUnknown, Confidence: 0.4,
 			Reason:   "found live in the agent's session files",
