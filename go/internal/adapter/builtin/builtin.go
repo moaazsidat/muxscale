@@ -13,6 +13,7 @@ import (
 	"github.com/muxscale/muxscale/go/internal/adapter/codex"
 	"github.com/muxscale/muxscale/go/internal/adapter/generic"
 	"github.com/muxscale/muxscale/go/internal/adapter/hermes"
+	"github.com/muxscale/muxscale/go/internal/adapter/omp"
 	"github.com/muxscale/muxscale/go/internal/adapter/opencode"
 	"github.com/muxscale/muxscale/go/internal/adapter/pi"
 )
@@ -40,6 +41,7 @@ func Registry(opt Options) *adapter.Registry {
 		claudecode.New(),
 		codex.New(),
 		hermes.New(),
+		omp.New(),
 		opencode.New(opt.OpenCodeURL),
 		pi.New(),
 	)

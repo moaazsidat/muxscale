@@ -40,6 +40,7 @@ var AgentBinaries = map[string]string{
 	"codex":        "codex",
 	"opencode":     "opencode",
 	"pi":           "pi",
+	"omp":          "omp",
 	"hermes":       "hermes",
 	"amp":          "amp",
 	"cursor-agent": "cursor-agent",
