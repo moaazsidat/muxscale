@@ -127,12 +127,17 @@ func (t *Tailer) Interval() time.Duration { return t.interval }
 func (t *Tailer) Path() string { return t.path }
 
 // ProjectSlug converts a working directory into Claude Code's project
-// directory name: the absolute path with every "/" replaced by "-".
+// directory name: the absolute path with "/" and "." replaced by "-".
 // Verified against real directories, e.g.
 //
-//	/Users/sam/dev/muxscale -> -Users-sam-dev-muxscale
+//	/Users/sam/dev/muxscale        -> -Users-sam-dev-muxscale
+//	/Users/sam/dev/admin.example.com -> -Users-sam-dev-admin-example-com
+//
+// The dot matters: a repo named for its domain is the common case, and a
+// slug that keeps dots pointed the pid-record join at a directory that does
+// not exist. That silence is how one session became two rows.
 func ProjectSlug(cwd string) string {
-	return strings.ReplaceAll(filepath.Clean(cwd), "/", "-")
+	return strings.NewReplacer("/", "-", ".", "-").Replace(filepath.Clean(cwd))
 }
 
 // ProjectDir returns the transcript directory for a working directory.

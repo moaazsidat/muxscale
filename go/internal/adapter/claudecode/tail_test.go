@@ -225,3 +225,17 @@ func TestInferStateConfidenceStaysBelowHooks(t *testing.T) {
 		}
 	}
 }
+
+// A repo named for its domain is the common case, and Claude Code slugifies
+// the dots as well as the slashes. Keeping them pointed the pid-record join at
+// a directory that did not exist, which silently split one session into two.
+func TestProjectSlugReplacesDots(t *testing.T) {
+	for _, tc := range []struct{ cwd, want string }{
+		{"/Users/sam/dev/muxscale", "-Users-sam-dev-muxscale"},
+		{"/Users/sam/dev/admin.example.com", "-Users-sam-dev-admin-example-com"},
+	} {
+		if got := ProjectSlug(tc.cwd); got != tc.want {
+			t.Errorf("ProjectSlug(%q) = %q, want %q", tc.cwd, got, tc.want)
+		}
+	}
+}
