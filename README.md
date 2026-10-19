@@ -12,7 +12,9 @@ no phone app and no cloud yet. See [the technical spec](docs/20260729-technical-
 design, [§13 Milestones](docs/20260729-technical-spec.md#13-milestones) for what lands
 when, [the omp adapter spec](docs/20261018-omp-adapter.md), and [the Codex adapter
 spec](docs/20261018-codex-adapter.md). Adopting agents that are *already running* is specified and partly built in
-[the adoption spec](docs/20260925-adopting-existing-sessions.md).
+[the adoption spec](docs/20260925-adopting-existing-sessions.md). pi, OpenCode, Gemini CLI, GitHub Copilot CLI, Kimi
+Code, Kiro CLI and IBM Bob are read too, most of them not yet verified against a real install; see
+[more agents](docs/20261019-more-agents.md) for what each one gives and where its format came from.
 
 ## What works today
 
