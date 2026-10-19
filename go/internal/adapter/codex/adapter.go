@@ -84,17 +84,18 @@ func (*Adapter) Discover(context.Context) ([]adapter.Discovered, error) {
 	}
 	out := make([]adapter.Discovered, 0, len(paths))
 	for _, p := range paths {
-		cwd, id, err := RolloutCwd(p)
-		if err != nil {
+		sm, err := readSessionMeta(p)
+		if err != nil || sm.ID == "" {
 			continue // A truncated or in-progress rollout is not an error.
 		}
+		kind, _ := decodeSource(sm.Source)
 		fi, statErr := os.Stat(p)
 		out = append(out, adapter.Discovered{
-			NaturalKey: id,
-			Cwd:        cwd,
+			NaturalKey: sm.ID,
+			Cwd:        sm.Cwd,
 			Ref:        p,
 			Title:      strings.TrimSuffix(filepath.Base(p), ".jsonl"),
-			Live:       statErr == nil && time.Since(fi.ModTime()) < liveWindow,
+			Live:       statErr == nil && time.Since(fi.ModTime()) < liveWindow && kind != sourceExec,
 		})
 	}
 	return out, nil

@@ -222,6 +222,7 @@ func TestStateMapping(t *testing.T) {
 	cases := map[string]protocol.SessionState{
 		"task_complete":                protocol.StateWaitingInput,
 		"task_started":                 protocol.StateRunning,
+		"turn_aborted":                 protocol.StateWaitingInput,
 		"exec_approval_request":        protocol.StateWaitingApproval,
 		"apply_patch_approval_request": protocol.StateWaitingApproval,
 	}
@@ -251,6 +252,10 @@ func TestRolloutInferenceIsLowerConfidence(t *testing.T) {
 	}
 	if g.Confidence >= 1.0 {
 		t.Errorf("inference confidence %v must stay below the event path's 1.0", g.Confidence)
+	}
+	// Interrupted, even a moment ago: the prompt is back.
+	if g := InferStateFromRollout("turn_aborted", time.Second, 6*time.Second); g.State != protocol.StateWaitingInput {
+		t.Errorf("turn_aborted -> %s, want WAITING_INPUT", g.State)
 	}
 	running := InferStateFromRollout("agent_message", time.Second, 6*time.Second)
 	if running.State != protocol.StateRunning {

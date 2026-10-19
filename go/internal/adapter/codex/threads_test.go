@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,8 +21,12 @@ func seedThreads(t *testing.T) (home, mainRollout string) {
 		t.Fatal(err)
 	}
 	mainRollout = filepath.Join(rolloutDir, "rollout-2026-10-18T22-40-11-01a15207-e400-7180-ad11-0bd4405a75e7.jsonl")
-	header := `{"timestamp":"2026-10-19T02:40:11.809Z","type":"session_meta","payload":{"id":"01a15207-e400-7180-ad11-0bd4405a75e7","session_id":"01a15207-e400-7180-ad11-0bd4405a75e7","timestamp":"2026-10-19T02:40:11.705Z","cwd":"/Users/sam/dev/muxscale","cli_version":"0.163.0","source":"exec"}}` + "\n"
+	header := `{"timestamp":"2026-10-19T02:40:11.809Z","type":"session_meta","payload":{"id":"01a15207-e400-7180-ad11-0bd4405a75e7","session_id":"01a15207-e400-7180-ad11-0bd4405a75e7","timestamp":"2026-10-19T02:40:11.705Z","cwd":"/Users/sam/dev/muxscale","cli_version":"0.163.0","source":"cli"}}` + "\n"
 	if err := os.WriteFile(mainRollout, []byte(header), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	execRollout := filepath.Join(rolloutDir, "rollout-2026-10-18T23-50-00-01a15299-0000-7000-8000-000000000000.jsonl")
+	if err := os.WriteFile(execRollout, []byte(strings.ReplaceAll(header, `"source":"cli"`, `"source":"exec"`)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -48,7 +53,8 @@ func seedThreads(t *testing.T) (home, mainRollout string) {
 		id, path, source, title, name, role string
 		archived                            int
 	}{
-		{"01a15207-e400-7180-ad11-0bd4405a75e7", mainRollout, "exec", "Reply with exactly OK", "focus-codex", "", 0},
+		{"01a15207-e400-7180-ad11-0bd4405a75e7", mainRollout, "cli", "Fix the flaky test", "focus-codex", "", 0},
+		{"exec-run", execRollout, "exec", "Reply with exactly OK", "", "", 0},
 		{"archived", mainRollout, "cli", "Old", "", "", 1},
 		{"sub", mainRollout, "subagent", "Child", "", "review", 0},
 	} {
@@ -71,11 +77,22 @@ func TestDiscoveryUsesTheThreadIndex(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 {
+	if len(got) != 2 {
 		t.Fatalf("discovered %d threads: %+v", len(got), got)
 	}
-	d := got[0]
-	if d.Ref != rollout || d.Title != "Reply with exactly OK" || d.Name != "focus-codex" {
+	var d, run adapter.Discovered
+	for _, g := range got {
+		if g.NaturalKey == "exec-run" {
+			run = g
+		} else {
+			d = g
+		}
+	}
+	// A `codex exec` run answered one prompt and exited; nobody can reply.
+	if run.NaturalKey == "" || run.Live {
+		t.Errorf("exec run = %+v, want discovered and not live", run)
+	}
+	if d.Ref != rollout || d.Title != "Fix the flaky test" || d.Name != "focus-codex" {
 		t.Fatalf("discovered = %+v", d)
 	}
 	if d.Cwd != "/Users/sam/dev/muxscale" || d.Model != "gpt-5.5" {

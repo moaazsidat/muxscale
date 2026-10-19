@@ -289,7 +289,7 @@ func discoveredFromThreads(limit int) ([]adapter.Discovered, bool) {
 		if _, err := os.Stat(t.Rollout); err != nil {
 			continue
 		}
-		live := time.Since(t.UpdatedAt) < liveWindow
+		live := time.Since(t.UpdatedAt) < liveWindow && t.Source != sourceExec
 		out = append(out, adapter.Discovered{
 			NaturalKey: t.ID,
 			Cwd:        t.Cwd,

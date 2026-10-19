@@ -257,7 +257,7 @@ func ParseRollout(r io.Reader) ([]protocol.TranscriptEvent, Meta, error) {
 			var em eventMsg
 			if json.Unmarshal(rec.Payload, &em) == nil {
 				switch em.Type {
-				case "task_started", "task_complete",
+				case "task_started", "task_complete", "turn_aborted",
 					"exec_approval_request", "apply_patch_approval_request",
 					"error", "stream_error":
 					meta.LastEventType = em.Type
@@ -388,6 +388,10 @@ func StateFromEvent(eventType string) (protocol.StateGuess, bool) {
 	case "task_complete":
 		// Codex's equivalent of Claude Code's Stop: the turn ended.
 		return g(protocol.StateWaitingInput, "task complete")
+	case "turn_aborted":
+		// Interrupted: the turn ended without completing, and the prompt is
+		// back.
+		return g(protocol.StateWaitingInput, "turn interrupted")
 	case "task_started":
 		return g(protocol.StateRunning, "task started")
 	case "exec_approval_request", "apply_patch_approval_request":
@@ -410,6 +414,12 @@ func InferStateFromRollout(lastEventType string, idle time.Duration, quiescence 
 		return protocol.StateGuess{
 			State: protocol.StateWaitingInput, Confidence: 0.9,
 			Reason:   "rollout ends with task_complete",
+			Evidence: "codex:rollout tail", At: now,
+		}
+	case lastEventType == "turn_aborted":
+		return protocol.StateGuess{
+			State: protocol.StateWaitingInput, Confidence: 0.9,
+			Reason:   "rollout ends with an interrupted turn",
 			Evidence: "codex:rollout tail", At: now,
 		}
 	case lastEventType == "exec_approval_request" || lastEventType == "apply_patch_approval_request":
@@ -515,9 +525,15 @@ func FindRollouts(limit int) ([]string, error) {
 // RolloutCwd reads just the session_meta header, so callers can match a rollout
 // to a working directory without parsing a multi-megabyte file.
 func RolloutCwd(path string) (string, string, error) {
+	sm, err := readSessionMeta(path)
+	return sm.Cwd, sm.ID, err
+}
+
+// readSessionMeta reads a rollout's session_meta header and nothing else.
+func readSessionMeta(path string) (sessionMeta, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return "", "", err
+		return sessionMeta{}, err
 	}
 	defer f.Close()
 
@@ -532,13 +548,19 @@ func RolloutCwd(path string) (string, string, error) {
 			continue
 		}
 		var sm sessionMeta
-		if err := json.Unmarshal(rec.Payload, &sm); err != nil {
-			return "", "", err
+		err := json.Unmarshal(rec.Payload, &sm)
+		if sm.ID == "" {
+			sm.ID = sm.SessionID
 		}
-		return sm.Cwd, sm.ID, nil
+		return sm, err
 	}
-	return "", "", sc.Err()
+	return sessionMeta{}, sc.Err()
 }
+
+// sourceExec is the source of a `codex exec` run: one prompt, answered, and
+// the process exits. Nobody can reply to it afterwards, so it is never a live
+// session -- while it runs, the process scan already lists it.
+const sourceExec = "exec"
 
 // FindRolloutForCwd returns the newest rollout whose session_meta matches cwd.
 func FindRolloutForCwd(cwd string, scanLimit int) (string, error) {
