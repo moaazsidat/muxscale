@@ -36,17 +36,26 @@ type Process struct {
 
 // AgentBinaries maps a binary name to an adapter id.
 var AgentBinaries = map[string]string{
-	"claude":       "claude-code",
-	"codex":        "codex",
-	"opencode":     "opencode",
-	"pi":           "pi",
-	"omp":          "omp",
-	"hermes":       "hermes",
-	"amp":          "amp",
-	"cursor-agent": "cursor-agent",
-	"aider":        "aider",
-	"goose":        "goose",
-	"gemini":       "gemini-cli",
+	"claude":          "claude-code",
+	"codex":           "codex",
+	"opencode":        "opencode",
+	"pi":              "pi",
+	"omp":             "omp",
+	"hermes":          "hermes",
+	"amp":             "amp",
+	"cursor-agent":    "cursor-agent",
+	"aider":           "aider",
+	"goose":           "goose",
+	"gemini":          "gemini-cli",
+	"copilot":         "copilot",
+	"kimi":            "kimi",
+	"kimi-code":       "kimi",
+	"kiro-cli":        "kiro",
+	"kiro-cli-chat":   "kiro",
+	"bob":             "bob",
+	"agy":             "antigravity",
+	"antigravity-cli": "antigravity",
+	"grok":            "grok-build",
 }
 
 // terminalAncestors are processes that, if they own an agent, imply a
@@ -224,6 +233,14 @@ var argvMarkers = []string{
 	"@anthropic-ai/claude-code",
 	"@openai/codex",
 	"@earendil-works/pi-coding-agent",
+	"@google/gemini-cli",
+	"@github/copilot",
+	"@moonshot-ai/kimi-code",
+	"bobshell/dist/bob.js",
+	"@ampcode/cli",
+	"@sourcegraph/amp",
+	"@xai-official/grok",
+	"/cursor-agent/",
 }
 
 // findAncestor walks up the process tree looking for a known terminal or

@@ -9,10 +9,15 @@ package builtin
 
 import (
 	"github.com/muxscale/muxscale/go/internal/adapter"
+	"github.com/muxscale/muxscale/go/internal/adapter/bob"
 	"github.com/muxscale/muxscale/go/internal/adapter/claudecode"
 	"github.com/muxscale/muxscale/go/internal/adapter/codex"
+	"github.com/muxscale/muxscale/go/internal/adapter/copilot"
+	"github.com/muxscale/muxscale/go/internal/adapter/gemini"
 	"github.com/muxscale/muxscale/go/internal/adapter/generic"
 	"github.com/muxscale/muxscale/go/internal/adapter/hermes"
+	"github.com/muxscale/muxscale/go/internal/adapter/kimi"
+	"github.com/muxscale/muxscale/go/internal/adapter/kiro"
 	"github.com/muxscale/muxscale/go/internal/adapter/omp"
 	"github.com/muxscale/muxscale/go/internal/adapter/opencode"
 	"github.com/muxscale/muxscale/go/internal/adapter/pi"
@@ -44,6 +49,11 @@ func Registry(opt Options) *adapter.Registry {
 		omp.New(),
 		opencode.New(opt.OpenCodeURL),
 		pi.New(),
+		gemini.New(),
+		copilot.New(),
+		kimi.New(),
+		kiro.New(),
+		bob.New(),
 	)
 	// Detection-only agents. They are registered rather than left to the
 	// binary-name table so that everything muxscale knows how to recognise is

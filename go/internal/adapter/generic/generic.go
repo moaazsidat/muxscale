@@ -121,16 +121,42 @@ func contains(s, sub string) bool {
 // here rather than there because none could be verified against a running
 // installation. The comment on each says what it would take to promote it.
 var (
-	// Amp (Sourcegraph). Promotion needs its thread storage format.
+	// Amp. Promotion needs its thread format: the CLI's data directory
+	// (~/.local/share/amp, or $XDG_DATA_HOME/amp) holds a prompt history,
+	// and its threads are kept on ampcode.com; no local thread file could be
+	// confirmed from the package (October 2026).
 	Amp = Spec{
 		ID: "amp", DisplayName: "Amp",
-		Binaries: []string{"amp"}, MinVersion: "0.1.0",
+		Binaries: []string{"amp"}, ArgvMarkers: []string{"@ampcode/cli", "@sourcegraph/amp"},
+		MinVersion: "0.1.0",
 	}
 
-	// Cursor CLI. Promotion needs the on-disk chat format.
+	// Cursor CLI. Promotion needs its chat store, ~/.cursor/chats/<hash>/<id>/
+	// store.db, which Cursor documents nowhere. Its hooks (~/.cursor/
+	// hooks.json) are documented, but under cursor-agent only the shell
+	// execution hooks fire (Cursor forum, January 2026), which says nothing
+	// about whose turn it is.
 	CursorAgent = Spec{
 		ID: "cursor-agent", DisplayName: "Cursor CLI",
-		Binaries: []string{"cursor-agent"}, MinVersion: "0.1.0",
+		Binaries: []string{"cursor-agent"}, ArgvMarkers: []string{"/cursor-agent/"},
+		MinVersion: "0.1.0",
+	}
+
+	// Antigravity CLI (Google, `agy`), Gemini CLI's successor. It shares
+	// ~/.gemini and has hooks, but its session format is not documented.
+	// Promotion needs one session file from a real install.
+	Antigravity = Spec{
+		ID: "antigravity", DisplayName: "Antigravity CLI",
+		Binaries: []string{"agy", "antigravity-cli"}, MinVersion: "0.1.0",
+	}
+
+	// Grok Build (xAI, `grok`). Sessions live under ~/.grok/sessions (or
+	// $GROK_HOME); their format is not documented. Promotion needs a real
+	// session file.
+	GrokBuild = Spec{
+		ID: "grok-build", DisplayName: "Grok Build",
+		Binaries: []string{"grok"}, ArgvMarkers: []string{"@xai-official/grok"},
+		MinVersion: "0.1.0",
 	}
 
 	// Aider. Writes .aider.chat.history.md in the project directory, which is
@@ -148,15 +174,7 @@ var (
 		ID: "goose", DisplayName: "Goose",
 		Binaries: []string{"goose"}, MinVersion: "0.1.0",
 	}
-
-	// Gemini CLI. Promotion needs the logs format under ~/.gemini.
-	GeminiCLI = Spec{
-		ID: "gemini-cli", DisplayName: "Gemini CLI",
-		Binaries:    []string{"gemini"},
-		ArgvMarkers: []string{"@google/gemini-cli"},
-		MinVersion:  "0.1.0",
-	}
 )
 
 // All returns every detection-only spec.
-func All() []Spec { return []Spec{Amp, CursorAgent, Aider, Goose, GeminiCLI} }
+func All() []Spec { return []Spec{Amp, CursorAgent, Antigravity, GrokBuild, Aider, Goose} }
