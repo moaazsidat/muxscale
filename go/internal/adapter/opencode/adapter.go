@@ -2,8 +2,11 @@ package opencode
 
 import (
 	"context"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/muxscale/muxscale/go/internal/adapter"
 	"github.com/muxscale/muxscale/go/internal/protocol"
@@ -11,10 +14,13 @@ import (
 
 // Adapter is the OpenCode integration.
 //
-// The only adapter besides Claude Code with a genuine native channel: OpenCode
-// runs a local HTTP server with an SSE event stream and REST endpoints for
-// prompting, answering permissions, and interrupting. That means remote input
-// works without owning a PTY, which is why AttachNative leads its list.
+// Two channels. The database (db.go) is the one every session has: discovery,
+// the whole transcript, and state inferred from how the last turn ended,
+// including for sessions started before muxscale. The HTTP server is the
+// other: an SSE event stream and REST endpoints for prompting, answering
+// permissions and interrupting -- but the TUI's server listens on a port it
+// tells nobody, so that channel is only reachable for `opencode serve` on the
+// configured address.
 type Adapter struct {
 	baseURL string
 
@@ -31,6 +37,7 @@ var (
 	_ adapter.Transcriber   = (*Adapter)(nil)
 	_ adapter.StateInferrer = (*Adapter)(nil)
 	_ adapter.Approver      = (*Adapter)(nil)
+	_ adapter.Locator       = (*Adapter)(nil)
 )
 
 func (*Adapter) Info() adapter.Info {
@@ -41,13 +48,15 @@ func (*Adapter) Info() adapter.Info {
 		NewestTested: "",
 		Signals: adapter.Signals{
 			Discovery: adapter.SupportExact,
-			// The SSE stream carries the agent's own event names, including
-			// permission.asked, so state is authoritative while connected.
-			State:      adapter.SupportExact,
+			// Inferred from the database: how the last assistant message
+			// ended, and whether a tool is still running. The server's SSE
+			// stream would make it exact, but is out of reach for a TUI.
+			State:      adapter.SupportDerived,
 			Transcript: adapter.SupportExact,
-			// permission.asked plus a REST reply endpoint is a real decision
-			// channel: the answer is structured data, not keystrokes.
-			Approvals: adapter.SupportExact,
+			// Reply can answer a permission over REST, but a request is only
+			// ever announced on the SSE stream, which nothing follows yet; the
+			// database never records a pending one.
+			Approvals: adapter.SupportNone,
 		},
 		Attachments: []protocol.Attachment{
 			protocol.AttachNative,
@@ -69,16 +78,19 @@ func (a *Adapter) c() *Client {
 	return a.client
 }
 
-// Discover asks the OpenCode server for its sessions.
+// Discover lists sessions from OpenCode's database.
 //
-// A server that is not running is not an error: OpenCode simply is not up, and
-// a failed dial here would otherwise surface to the user as a broken daemon
-// rather than an absent agent.
+// No database is not an error: OpenCode is not installed, or predates 1.x.
 func (a *Adapter) Discover(ctx context.Context) ([]adapter.Discovered, error) {
-	if err := a.c().Health(ctx); err != nil {
-		return nil, nil
+	db, err := openDB()
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
 	}
-	sessions, err := a.c().Sessions(ctx)
+	defer db.Close()
+	sessions, err := storedSessions(db, discoverLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -86,78 +98,104 @@ func (a *Adapter) Discover(ctx context.Context) ([]adapter.Discovered, error) {
 	for _, s := range sessions {
 		out = append(out, adapter.Discovered{
 			NaturalKey: s.ID,
-			// Cwd() prefers the undocumented `location` object over the
-			// documented-but-null `directory` field. See opencode.go.
-			Cwd:   s.Cwd(),
-			Title: s.Title,
-			Model: s.ModelName(),
-			Ref:   s.ID,
-			Live:  true,
+			Cwd:        s.Directory,
+			Title:      s.Title,
+			Model:      s.Model,
+			Ref:        s.ID,
+			// No lease or exit record: live while the process is (the scan)
+			// or, without one, while the session was used recently.
+			Live: time.Since(s.Updated) < liveWindow,
 		})
 	}
 	return out, nil
 }
 
-// OpenTranscript subscribes to the event stream and filters it to one session.
-//
-// Unlike every other adapter, OpenCode has no file to re-read: the transcript
-// exists only as it streams past. So this buffers events as they arrive and
-// hands them over on Poll, which means a session's history *before* muxscale
-// connected is not available -- an honest limitation of a live-only source,
-// recorded here rather than papered over with an empty transcript.
+const (
+	discoverLimit = 200
+	liveWindow    = 12 * time.Hour
+)
+
+// OpenTranscript follows one session in the database. ref is the session id.
 func (a *Adapter) OpenTranscript(ctx context.Context, ref string) (adapter.TranscriptStream, error) {
-	ctx, cancel := context.WithCancel(ctx)
-	s := &stream{sessionID: ref, cancel: cancel}
-
-	go func() {
-		// A dropped stream is not fatal: OpenCode may be restarting. Poll keeps
-		// returning what was already buffered and the daemon's own reconnect
-		// logic decides whether to reopen.
-		_ = StreamEvents(ctx, a.baseURL, func(e Event) {
-			if e.SessionID() != s.sessionID {
-				return
-			}
-			if evs := ToTranscript(e); len(evs) > 0 {
-				s.mu.Lock()
-				s.buf = append(s.buf, evs...)
-				s.mu.Unlock()
-			}
-		})
-	}()
-	return s, nil
-}
-
-type stream struct {
-	sessionID string
-	cancel    context.CancelFunc
-
-	mu  sync.Mutex
-	buf []protocol.TranscriptEvent
-}
-
-func (s *stream) Poll(context.Context) ([]protocol.TranscriptEvent, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.buf) == 0 {
-		return nil, nil
+	db, err := openDB()
+	if err != nil {
+		return nil, err
 	}
-	out := s.buf
-	// Release the buffer rather than reslicing, so a burst does not pin its
-	// backing array for the life of the session.
-	s.buf = nil
-	return out, nil
+	return &stream{dbStream{db: db, sessionID: ref}}, nil
 }
 
-func (s *stream) Close() error {
-	s.cancel()
-	return nil
-}
+// stream adapts dbStream to the transcript interfaces.
+type stream struct{ dbStream }
 
+func (s *stream) Poll(context.Context) ([]protocol.TranscriptEvent, error) { return s.dbStream.Poll() }
+
+var (
+	_ adapter.SeekableStream = (*stream)(nil)
+	_ adapter.EventReporter  = (*stream)(nil)
+)
+
+// InferState takes the server's event name when one came from the SSE
+// stream, and otherwise the lifecycle the database last recorded.
 func (*Adapter) InferState(in adapter.StateInput) (protocol.StateGuess, bool) {
-	if in.Event == "" {
-		return protocol.StateGuess{}, false
+	if strings.HasPrefix(in.Event, "db:") {
+		return stateFromLifecycle(in.Event, in.Idle, in.Quiescence)
 	}
-	return StateFromEvent(in.Event)
+	if in.Event != "" {
+		return StateFromEvent(in.Event)
+	}
+	return protocol.StateGuess{}, false
+}
+
+// TranscriptForProcess has nothing to read: OpenCode records no per-process
+// or per-terminal pointer to its session.
+func (*Adapter) TranscriptForProcess(adapter.Process) string { return "" }
+
+// MatchTranscript joins a running opencode to its session: one created in the
+// same directory as the process started, else the only candidate, else the
+// one written since the process began. The returned ref is a session id.
+func (*Adapter) MatchTranscript(cwd string, started time.Time, claimed map[string]bool) string {
+	if cwd == "" {
+		return ""
+	}
+	db, err := openDB()
+	if err != nil {
+		return ""
+	}
+	defer db.Close()
+	sessions, err := storedSessions(db, discoverLimit)
+	if err != nil {
+		return ""
+	}
+	var cands []StoredSession
+	for _, s := range sessions {
+		if !claimed[s.ID] && filepath.Clean(s.Directory) == filepath.Clean(cwd) {
+			cands = append(cands, s)
+		}
+	}
+	if len(cands) == 0 {
+		return ""
+	}
+	if !started.IsZero() {
+		for _, c := range cands {
+			if d := c.Created.Sub(started); d > -time.Minute && d < time.Minute {
+				return c.ID
+			}
+		}
+	}
+	if len(cands) == 1 {
+		return cands[0].ID
+	}
+	if started.IsZero() {
+		return ""
+	}
+	// cands is newest-updated first: the first written since the process
+	// began is the one it is working in.
+	for _, c := range cands {
+		if !c.Updated.Before(started.Add(-5 * time.Second)) {
+			return c.ID
+		}
+	}
+	return ""
 }
 
 // Reply carries a human's decision back to OpenCode.
