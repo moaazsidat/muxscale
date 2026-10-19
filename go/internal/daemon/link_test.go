@@ -1,6 +1,8 @@
 package daemon
 
 import (
+	"bytes"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -100,5 +102,29 @@ func TestTwoRowsForOneProcessMerge(t *testing.T) {
 		case <-deadline:
 			t.Fatal("clients were never told the duplicate is gone")
 		}
+	}
+}
+
+// A command-hook relay is a child process; its socket peer is the relay, not
+// the agent. The relay names the agent's pid in a header, and that must win.
+func TestHookPeerHeaderLinksTheAgentProcess(t *testing.T) {
+	srv, reg := linkServer(t)
+	body := map[string]any{
+		"session_id": "s-hdr", "hook_event_name": "SessionStart", "cwd": "/w",
+	}
+	b, _ := json.Marshal(body)
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/hook/claude-code", bytes.NewReader(b))
+	req.Header.Set("Authorization", "Bearer secret-token")
+	req.Header.Set("X-Muxscale-Peer-PID", "7777")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if _, ok := reg.IDFor("claude-code", "pid:7777"); !ok {
+		t.Fatal("session was not aliased to the pid in the header")
+	}
+	if _, ok := reg.IDFor("claude-code", "pid:4242"); ok {
+		t.Fatal("header was ignored in favour of the relay's socket peer")
 	}
 }

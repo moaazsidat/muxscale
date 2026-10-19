@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/muxscale/muxscale/go/internal/adapter"
 	"github.com/muxscale/muxscale/go/internal/adapter/claudecode"
+	"github.com/muxscale/muxscale/go/internal/adapter/codex"
 	"github.com/muxscale/muxscale/go/internal/adapter/omp"
 	"github.com/muxscale/muxscale/go/internal/attach"
 	"github.com/muxscale/muxscale/go/internal/protocol"
@@ -124,6 +126,9 @@ func cmdDown(args []string) error {
 	if omp.ExtensionPresent() {
 		removing = append(removing, "the muxscale extension for omp")
 	}
+	if codex.HooksPresent() {
+		removing = append(removing, "muxscale's hooks in ~/.codex/hooks.json")
+	}
 	shims, _ := setup.InstalledShims()
 	if len(shims) > 0 {
 		removing = append(removing, "shims for "+strings.Join(shims, ", "))
@@ -161,6 +166,13 @@ func cmdDown(args []string) error {
 			fmt.Printf("omp extension: %v\n", err)
 		} else if removed {
 			fmt.Println("removed the omp extension")
+		}
+	}
+	if codex.HooksPresent() {
+		if removed, err := codex.RemoveHooks(""); err != nil {
+			fmt.Printf("codex hooks: %v\n", err)
+		} else if removed {
+			fmt.Println("removed muxscale's Codex hooks")
 		}
 	}
 	if len(shims) > 0 {
@@ -269,6 +281,20 @@ func cmdStatus(args []string) error {
 		} else {
 			line(" ok ", "omp", fmt.Sprintf("%s (%s)", v, s))
 			statusOMPExtension(line, fix)
+		}
+	}
+
+	// Codex, and the hooks that relay its lifecycle into the daemon.
+	if v, err := codex.DetectVersion(); err != nil {
+		line(" -- ", "codex", "not on PATH")
+	} else {
+		info := codex.New().Info()
+		s := info.ClassifyVersion(v)
+		if s == adapter.VersionTooOld {
+			line("FAIL", "codex", info.VersionMessage(v, s))
+		} else {
+			line(" ok ", "codex", fmt.Sprintf("%s (%s)", v, s))
+			statusCodexHooks(line, fix)
 		}
 	}
 
@@ -419,4 +445,22 @@ func statusOMPExtension(line statusLine, fix func(string)) {
 	}
 	line("FAIL", "omp extension", "not installed or out of date")
 	fix("restart the daemon; it installs the extension as it starts")
+}
+
+// statusCodexHooks checks the command hooks Codex must trust once. Trust is
+// recorded by Codex against the handler hash and cannot be asserted from
+// here, so "installed" and "trusted" are deliberately separate sentences.
+func statusCodexHooks(line statusLine, fix func(string)) {
+	exe, err := os.Executable()
+	if err != nil {
+		exe = "muxscale"
+	}
+	tokenPath := filepath.Join(stateDirOrEmpty(), "hook-token")
+	relay := codex.RelayCommand(exe, apiAddr(), tokenPath)
+	if codex.HooksInstalled(relay) {
+		line(" ok ", "codex hooks", "installed; trust them once with /hooks in Codex")
+		return
+	}
+	line("FAIL", "codex hooks", "not installed or out of date")
+	fix("restart the daemon; then run /hooks in Codex and trust muxscale's hooks")
 }

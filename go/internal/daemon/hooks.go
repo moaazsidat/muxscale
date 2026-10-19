@@ -122,7 +122,7 @@ func (h *HookServer) handleHook(w http.ResponseWriter, r *http.Request, codec ad
 		return
 	}
 
-	pid := h.link(&e, r.RemoteAddr)
+	pid := h.link(&e, r)
 	sess := h.applyHook(&e)
 	h.linkNew(pid, e.AgentID, sess.ID)
 
@@ -152,8 +152,8 @@ func (h *HookServer) handleHook(w http.ResponseWriter, r *http.Request, codec ad
 //
 // It returns the process id it found, 0 when it did not look or could not
 // tell.
-func (h *HookServer) link(e *adapter.HookEvent, remoteAddr string) int {
-	if e.SessionID == "" || h.peerPID == nil {
+func (h *HookServer) link(e *adapter.HookEvent, r *http.Request) int {
+	if e.SessionID == "" {
 		return 0
 	}
 	h.linkMu.Lock()
@@ -163,10 +163,25 @@ func (h *HookServer) link(e *adapter.HookEvent, remoteAddr string) int {
 	if done {
 		return 0
 	}
-	pid, err := h.peerPID(remoteAddr)
-	if err != nil {
-		h.log.Debug("could not tie a hook to its process", "session", e.SessionID, "err", err)
-		return 0
+	// A command-hook relay is a short-lived child of the agent, so its socket
+	// peer is not the agent. It names the agent's pid in a header instead;
+	// direct HTTP hooks (Claude Code) fall back to the socket peer.
+	pid := 0
+	if v := r.Header.Get("X-Muxscale-Peer-PID"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			pid = n
+		}
+	}
+	if pid == 0 {
+		if h.peerPID == nil {
+			return 0
+		}
+		var err error
+		pid, err = h.peerPID(r.RemoteAddr)
+		if err != nil {
+			h.log.Debug("could not tie a hook to its process", "session", e.SessionID, "err", err)
+			return 0
+		}
 	}
 	procKey := "pid:" + strconv.Itoa(pid)
 	hookID, hasHook := h.reg.IDFor(e.AgentID, e.SessionID)

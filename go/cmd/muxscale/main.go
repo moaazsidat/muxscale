@@ -26,6 +26,7 @@ import (
 	"github.com/muxscale/muxscale/go/internal/adapter"
 	"github.com/muxscale/muxscale/go/internal/adapter/builtin"
 	"github.com/muxscale/muxscale/go/internal/adapter/claudecode"
+	"github.com/muxscale/muxscale/go/internal/adapter/codex"
 	"github.com/muxscale/muxscale/go/internal/adapter/omp"
 	"github.com/muxscale/muxscale/go/internal/daemon"
 	"github.com/muxscale/muxscale/go/internal/protocol"
@@ -68,6 +69,8 @@ func main() {
 		err = cmdAudit(os.Args[2:])
 	case "debug":
 		err = cmdDebug(os.Args[2:])
+	case "hook-relay":
+		err = cmdHookRelay(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -237,6 +240,39 @@ func ensureHooks(addr, token string, log *slog.Logger) {
 		log.Info("set up the omp extension; sessions started from now on report their state exactly",
 			"extension", path)
 	}
+
+	// Codex hooks are commands, so the hook runs `muxscale hook-relay`, which
+	// posts the payload here. Codex requires non-managed hooks to be trusted
+	// once in /hooks; until then the read path still works.
+	exe, err := os.Executable()
+	if err != nil {
+		exe = "muxscale"
+	}
+	tokenPath := filepath.Join(stateDirOrEmpty(), "hook-token")
+	relay := codex.RelayCommand(exe, addr, tokenPath)
+	if v, err := codex.DetectVersion(); err != nil {
+		log.Debug("codex not on PATH; skipping its hooks")
+	} else if info := codex.New().Info(); info.ClassifyVersion(v) == adapter.VersionTooOld {
+		log.Warn("Codex is below the supported floor; hooks not installed",
+			"version", v, "floor", info.MinVersion)
+	} else if changed, err := codex.EnsureHooks(relay); err != nil {
+		log.Warn("Codex hooks not set up", "reason", err)
+	} else if changed {
+		path, _ := codex.HooksPath()
+		log.Info("set up Codex hooks; trust them once with /hooks in Codex",
+			"hooks", path)
+	}
+}
+
+// stateDirOrEmpty is the daemon's state directory, or "" when it cannot be
+// resolved. The relay treats an empty token path as "no credential" and fails
+// open, which is the right outcome for a status path that cannot find home.
+func stateDirOrEmpty() string {
+	d, err := daemon.DefaultStateDir()
+	if err != nil {
+		return ""
+	}
+	return d
 }
 
 // ---------- ls ----------
