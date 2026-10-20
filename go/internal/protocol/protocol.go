@@ -117,6 +117,23 @@ type Session struct {
 
 	// PendingApproval is set while a decision hook is held open awaiting a human.
 	PendingApproval *ApprovalRequest `json:"pending_approval,omitempty"`
+
+	// Queued is what a person has sent that the agent has not taken up yet,
+	// oldest first: typed while it was busy, at the keyboard or from a phone.
+	// Read from the agent's own record of its queue, never from what muxscale
+	// sent, so it shows what the agent will actually do next. Empty for an
+	// agent that keeps its queue only in memory (Codex, Gemini CLI). Not
+	// persisted: each adapter reads it again from its source.
+	Queued []QueuedMessage `json:"queued,omitempty"`
+}
+
+// QueuedMessage is one message waiting for the agent.
+type QueuedMessage struct {
+	Text string `json:"text"`
+	// Delivery is when the agent will take it, where the agent says:
+	// "queue" (after the current turn) or "steer" (at its next step).
+	Delivery string    `json:"delivery,omitempty"`
+	At       time.Time `json:"at,omitempty"`
 }
 
 // EventKind discriminates TranscriptEvent.

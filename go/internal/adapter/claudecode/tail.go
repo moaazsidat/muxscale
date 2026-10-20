@@ -35,6 +35,12 @@ type Tailer struct {
 	partial  []byte // trailing bytes of an incomplete final line
 	lastSize int64
 	inode    uint64
+
+	// queue is the replay of Claude Code's message queue, carried across
+	// polls; queueDirty asks the next poll to report it even if nothing new
+	// was written (after SeekEnd rebuilt it).
+	queue      queue
+	queueDirty bool
 }
 
 // NewTailer follows path, starting from the beginning.
@@ -56,7 +62,64 @@ func (t *Tailer) SeekEnd(fromSeq uint64) error {
 	t.offset = fi.Size()
 	t.lastSize = fi.Size()
 	t.seq = fromSeq
+	t.queue = queueFromTail(t.path, fi.Size())
+	t.queueDirty = true
 	return nil
+}
+
+// queueTailBytes is how much of a file's end SeekEnd replays to rebuild the
+// queue. A queue lives for minutes, so its entries sit near the end; replaying
+// a whole multi-megabyte transcript to find them is not worth it.
+const queueTailBytes = 1 << 20
+
+// queueFromTail rebuilds the queue from the end of a transcript.
+func queueFromTail(path string, size int64) queue {
+	var q queue
+	f, err := os.Open(path)
+	if err != nil {
+		return q
+	}
+	defer f.Close()
+	from := size - queueTailBytes
+	if from < 0 {
+		from = 0
+	}
+	if _, err := f.Seek(from, io.SeekStart); err != nil {
+		return q
+	}
+	b, err := io.ReadAll(io.LimitReader(f, size-from))
+	if err != nil {
+		return q
+	}
+	if from > 0 {
+		// Started mid-line: drop the fragment.
+		if i := strings.IndexByte(string(b), '\n'); i >= 0 {
+			b = b[i+1:]
+		}
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if !strings.Contains(line, `"queue-operation"`) {
+			continue
+		}
+		var e entry
+		if json.Unmarshal([]byte(line), &e) != nil || e.Type != "queue-operation" {
+			continue
+		}
+		var content string
+		_ = json.Unmarshal(e.Content, &content)
+		q.apply(e.Operation, content, parseTime(e.Timestamp))
+	}
+	return q
+}
+
+// pendingQueue reports a queue rebuilt by SeekEnd, once.
+func (t *Tailer) pendingQueue() Meta {
+	if !t.queueDirty {
+		return Meta{}
+	}
+	t.queueDirty = false
+	snap := t.queue.snapshot()
+	return Meta{Queue: &snap}
 }
 
 // Poll reads whatever has been appended since the last call.
@@ -77,9 +140,10 @@ func (t *Tailer) Poll() ([]protocol.TranscriptEvent, Meta, error) {
 	// line.
 	if fi.Size() < t.offset {
 		t.offset, t.partial, t.seq = 0, nil, 0
+		t.queue = queue{}
 	}
 	if fi.Size() == t.offset {
-		return nil, Meta{}, nil
+		return nil, t.pendingQueue(), nil
 	}
 
 	f, err := os.Open(t.path)
@@ -108,7 +172,11 @@ func (t *Tailer) Poll() ([]protocol.TranscriptEvent, Meta, error) {
 		return nil, Meta{}, nil
 	}
 
-	events, meta, err := ParseTranscript(strings.NewReader(string(data)))
+	events, meta, err := parseTranscript(strings.NewReader(string(data)), &t.queue)
+	if meta.Queue == nil && t.queueDirty {
+		meta.Queue = t.pendingQueue().Queue
+	}
+	t.queueDirty = false
 	if err != nil {
 		return nil, meta, err
 	}

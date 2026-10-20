@@ -34,6 +34,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"github.com/muxscale/muxscale/go/internal/adapter"
 	"github.com/muxscale/muxscale/go/internal/protocol"
 )
 
@@ -132,7 +133,9 @@ ORDER BY s.time_updated DESC LIMIT ?`, limit)
 
 type storedMessage struct {
 	Role string `json:"role"`
-	Time struct {
+	// ParentID is, on an assistant message, the user message it answers.
+	ParentID string `json:"parentID"`
+	Time     struct {
 		Created   int64 `json:"created"`
 		Completed int64 `json:"completed"`
 	} `json:"time"`
@@ -402,6 +405,12 @@ type dbStream struct {
 	// number of the last one.
 	emitted int
 	life    string
+
+	// queueTable is where this database keeps its queue, looked up once;
+	// queue is what was last reported, so only a change is reported again.
+	queueTable   *string
+	queue        string
+	queueChanged *[]protocol.QueuedMessage
 }
 
 func (s *dbStream) SeekEnd(fromSeq uint64) error {
@@ -417,6 +426,7 @@ func (s *dbStream) Poll() ([]protocol.TranscriptEvent, error) {
 		return nil, err
 	}
 	s.life = life
+	s.pollQueue()
 	var out []protocol.TranscriptEvent
 	n := 0
 	for _, u := range units {
@@ -444,6 +454,34 @@ func (s *dbStream) Poll() ([]protocol.TranscriptEvent, error) {
 }
 
 func (s *dbStream) Close() error { return s.db.Close() }
+
+// pollQueue reads the session's queue and keeps it for Meta if it changed.
+func (s *dbStream) pollQueue() {
+	if s.queueTable == nil {
+		t := queueTable(s.db)
+		s.queueTable = &t
+	}
+	if *s.queueTable == "" {
+		return
+	}
+	q, err := readQueue(s.db, *s.queueTable, s.sessionID)
+	if err != nil {
+		return // the queue is extra; a failed read leaves the last one shown
+	}
+	b, _ := json.Marshal(q)
+	if string(b) == s.queue {
+		return
+	}
+	s.queue = string(b)
+	s.queueChanged = &q
+}
+
+// Meta reports the queue when it changed.
+func (s *dbStream) Meta() adapter.Meta {
+	m := adapter.Meta{Queue: s.queueChanged}
+	s.queueChanged = nil
+	return m
+}
 
 func firstNonEmptyStr(vals ...string) string {
 	for _, v := range vals {

@@ -47,6 +47,10 @@ type entry struct {
 	LastPrompt  string  `json:"lastPrompt"`
 	Mode        string  `json:"mode"`
 	PermMode    string  `json:"permissionMode"`
+
+	// queue-operation entries; see queue.go.
+	Operation string          `json:"operation"`
+	Content   json.RawMessage `json:"content"`
 }
 
 // message is the Anthropic Messages API shape as persisted.
@@ -103,6 +107,15 @@ const summaryBytes = 32 * 1024
 // appended to live by another process, so a torn final line is normal, not an
 // error.
 func ParseTranscript(r io.Reader) ([]protocol.TranscriptEvent, Meta, error) {
+	var q queue
+	return parseTranscript(r, &q)
+}
+
+// parseTranscript is ParseTranscript with the queue replay carried in, so a
+// tailer can continue one replay across the chunks it reads. Meta.Queue is set
+// when the chunk changed the queue.
+func parseTranscript(r io.Reader, q *queue) ([]protocol.TranscriptEvent, Meta, error) {
+	q.changed = false
 	var (
 		events []protocol.TranscriptEvent
 		meta   Meta
@@ -140,6 +153,11 @@ func ParseTranscript(r io.Reader) ([]protocol.TranscriptEvent, Meta, error) {
 			if e.LastPrompt != "" {
 				meta.LastPrompt = e.LastPrompt
 			}
+			continue
+		case "queue-operation":
+			var content string
+			_ = json.Unmarshal(e.Content, &content)
+			q.apply(e.Operation, content, parseTime(e.Timestamp))
 			continue
 		case "mode", "permission-mode", "file-history-snapshot", "attachment", "system":
 			continue
@@ -213,6 +231,10 @@ func ParseTranscript(r io.Reader) ([]protocol.TranscriptEvent, Meta, error) {
 			ev.Seq = seq
 			events = append(events, ev)
 		}
+	}
+	if q.changed {
+		snap := q.snapshot()
+		meta.Queue = &snap
 	}
 	if err := sc.Err(); err != nil {
 		return events, meta, err

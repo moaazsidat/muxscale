@@ -39,6 +39,13 @@ func ExtensionPath() (string, error) {
 // and async delivery, and treating that as a finished turn is the false "needs
 // you" notification this product cannot afford.
 //
+// The queue -- messages typed while omp is busy -- is kept in omp's memory,
+// with no event for it and only hasPendingMessages() to ask. The extension
+// keeps its own copy: input while busy joins it, a user message reaching the
+// conversation leaves it, and hasPendingMessages() going false empties it,
+// which also corrects anything the first two missed (a queued message pulled
+// back into the editor). Each change is sent whole.
+//
 // Approval events are omp's tool_approval_requested and _resolved, which only
 // report: omp shows its own prompt either way, and an answer from a phone is
 // typed into it (approve.go). Nothing here waits, so muxscale can never hold up
@@ -104,14 +111,55 @@ export default function muxscale(pi: any): void {
   }
 
   on("session_start", (_e, ctx) => post("session_start", ctx));
-  on("agent_start", (_e, ctx) => post("agent_start", ctx));
+  on("agent_start", (_e, ctx) => { post("agent_start", ctx); reportQueue(ctx); });
 
   on("agent_end", (e, ctx) => {
     // omp sets isTerminal: false when maintenance or async work will resume
     // the session. An absent field is terminal for older builds.
     if (e && e.isTerminal === false) return;
     post("agent_end", ctx, { is_terminal: true });
+    reportQueue(ctx);
   });
+
+  // Messages waiting for omp, oldest first.
+  let queued: { text: string; at: string }[] = [];
+  let sentQueue = "[]";
+  // fresh is a report straight from input, which runs before omp inserts the
+  // message: hasPendingMessages() cannot see it yet, so it is not asked.
+  function reportQueue(ctx: any, fresh = false): void {
+    try {
+      if (!fresh && queued.length > 0 && ctx?.hasPendingMessages?.() === false) queued = [];
+    } catch {}
+    const now = JSON.stringify(queued);
+    if (now === sentQueue) return;
+    sentQueue = now;
+    post("queue", ctx, { queued });
+  }
+  function textOf(message: any): string {
+    const c = message?.content;
+    if (typeof c === "string") return c;
+    if (!Array.isArray(c)) return "";
+    return c.filter((b: any) => b?.type === "text").map((b: any) => b.text ?? "").join("\n");
+  }
+  on("input", (e, ctx) => {
+    const text = String(e?.text ?? "").trim();
+    // A command runs rather than queueing; an idle omp takes the message now.
+    if (!text || text.startsWith("/")) return;
+    let idle = true;
+    try { idle = ctx?.isIdle?.() !== false; } catch {}
+    if (idle) return;
+    queued.push({ text, at: new Date().toISOString() });
+    reportQueue(ctx, true);
+  });
+  on("message_end", (e, ctx) => {
+    if (e?.message?.role === "user" && queued.length > 0) {
+      const said = textOf(e.message);
+      const i = queued.findIndex((q) => said.includes(q.text));
+      if (i >= 0) queued.splice(i, 1);
+    }
+    reportQueue(ctx);
+  });
+  on("turn_end", (_e, ctx) => reportQueue(ctx));
 
   // The arguments of recent calls, so an approval prompt can say what it is
   // for: omp's approval events carry only the tool's name.

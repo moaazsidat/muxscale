@@ -48,3 +48,17 @@ func TestExtensionReportsApprovalsWithoutAnsweringThem(t *testing.T) {
 		t.Error("the extension blocks a tool call; it must only observe")
 	}
 }
+
+func TestQueueEventDecodes(t *testing.T) {
+	a := New()
+	e, err := a.DecodeHook([]byte(`{"v":1,"agent":"omp","event":"queue","session_id":"s1",` +
+		`"queued":[{"text":"then push","at":"2026-10-19T10:00:00.000Z"}]}`))
+	if err != nil || e.Kind != adapter.HookQueue || e.Queue == nil || len(*e.Queue) != 1 || (*e.Queue)[0].Text != "then push" {
+		t.Fatalf("queue = %+v, %v", e, err)
+	}
+	// Emptied: an empty queue, not an absent one.
+	e, _ = a.DecodeHook([]byte(`{"v":1,"agent":"omp","event":"queue","session_id":"s1","queued":[]}`))
+	if e.Queue == nil || len(*e.Queue) != 0 {
+		t.Fatalf("emptied = %+v", e.Queue)
+	}
+}

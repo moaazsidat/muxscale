@@ -3,6 +3,7 @@ package omp
 import (
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/muxscale/muxscale/go/internal/adapter"
 	"github.com/muxscale/muxscale/go/internal/protocol"
@@ -35,6 +36,12 @@ type HookPayload struct {
 	// approval_requested, when omp gives one (a critical bash pattern).
 	Approved bool   `json:"approved"`
 	Reason   string `json:"reason"`
+
+	// Queued is the whole queue, with the queue event.
+	Queued *[]struct {
+		Text string `json:"text"`
+		At   string `json:"at"`
+	} `json:"queued"`
 
 	// IsTerminal is set by agent_end: false means maintenance or async work
 	// will resume the session, so it is not a turn completion.
@@ -97,6 +104,16 @@ func (*Adapter) DecodeHook(body []byte) (adapter.HookEvent, error) {
 		e.Kind = adapter.HookToolCall
 	case "tool_result":
 		e.Kind = adapter.HookToolResult
+	case "queue":
+		e.Kind = adapter.HookQueue
+		q := []protocol.QueuedMessage{}
+		if p.Queued != nil {
+			for _, m := range *p.Queued {
+				at, _ := time.Parse(time.RFC3339Nano, m.At)
+				q = append(q, protocol.QueuedMessage{Text: m.Text, At: at})
+			}
+		}
+		e.Queue = &q
 	case "approval_requested":
 		e.Kind = adapter.HookApprovalShown
 	case "approval_resolved":

@@ -266,6 +266,11 @@ func (r *Registry) SetState(sessionID string, g protocol.StateGuess) bool {
 		return false
 	}
 	s.State = g.State
+	if g.State == protocol.StateExited {
+		// An agent that is gone takes nothing more; what it had queued is
+		// lost with it, and showing it as still to come would mislead.
+		s.Queued = nil
+	}
 	s.StateSince = time.Now()
 	s.LastEventAt = s.StateSince
 	cp := *s

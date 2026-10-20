@@ -302,6 +302,12 @@ func (h *HookServer) applyHook(e *adapter.HookEvent) *protocol.Session {
 	case adapter.HookNotification:
 		h.reg.SetState(sess.ID, guess(protocol.StateWaitingInput, "agent requested attention"))
 
+	case adapter.HookQueue:
+		if e.Queue != nil {
+			q := append([]protocol.QueuedMessage(nil), (*e.Queue)...)
+			h.reg.Update(sess.ID, func(s *protocol.Session) { s.Queued = q })
+		}
+
 	case adapter.HookApprovalShown:
 		h.approvalShown(sess, e)
 

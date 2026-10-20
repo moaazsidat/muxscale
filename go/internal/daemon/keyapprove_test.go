@@ -197,3 +197,22 @@ func TestOMPApprovalOnlyTheOneOnScreen(t *testing.T) {
 		t.Errorf("now first: %d, typed %q", rec.Code, o.keys())
 	}
 }
+
+// omp's queue arrives whole and replaces what was shown; an exit clears it.
+func TestOMPQueueReachesTheSession(t *testing.T) {
+	o := newOMPApprovals(t)
+	o.hook("session_start", "", nil)
+	o.hook("queue", "", map[string]any{"queued": []map[string]any{{"text": "also run the tests"}, {"text": "then push"}}})
+	id, _ := o.reg.IDFor("omp", "s1")
+	if s, _ := o.reg.Get(id); len(s.Queued) != 2 || s.Queued[1].Text != "then push" {
+		t.Fatalf("queued = %+v", s.Queued)
+	}
+	o.hook("queue", "", map[string]any{"queued": []map[string]any{{"text": "then push"}}})
+	if s, _ := o.reg.Get(id); len(s.Queued) != 1 {
+		t.Fatalf("after one was taken = %+v", s.Queued)
+	}
+	o.hook("session_shutdown", "", nil)
+	if s, _ := o.reg.Get(id); len(s.Queued) != 0 {
+		t.Errorf("an exited session still shows %+v", s.Queued)
+	}
+}

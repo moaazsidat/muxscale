@@ -240,6 +240,11 @@ type Meta struct {
 	// never having had one.
 	CustomTitle *string
 	LastPrompt  string
+
+	// Queue is the agent's queue of messages not yet taken up, whole, when
+	// it changed; nil when it did not. A pointer for the same reason as
+	// CustomTitle: an emptied queue is news, an unchanged one is not.
+	Queue *[]protocol.QueuedMessage
 }
 
 // Merge folds an observation into m, keeping fields the observation omitted.
@@ -270,12 +275,16 @@ func (m *Meta) Merge(o Meta) {
 	if o.LastPrompt != "" {
 		m.LastPrompt = o.LastPrompt
 	}
+	if o.Queue != nil {
+		m.Queue = o.Queue
+	}
 }
 
 // Empty reports whether the observation carries nothing to apply.
 func (m Meta) Empty() bool {
 	return m.Title == "" && m.CustomTitle == nil && m.GitBranch == "" &&
-		m.Model == "" && m.Version == "" && m.Cwd == "" && m.SessionID == ""
+		m.Model == "" && m.Version == "" && m.Cwd == "" && m.SessionID == "" &&
+		m.Queue == nil
 }
 
 // MetaSource is implemented by transcript streams that recover metadata.
@@ -437,6 +446,9 @@ const (
 	// keyboard, reported without waiting for an answer. The answer is typed
 	// (see KeyApprover).
 	HookApprovalShown HookKind = "approval_shown"
+	// HookQueue reports the agent's queue of messages not yet taken up, whole
+	// (HookEvent.Queue).
+	HookQueue HookKind = "queue"
 	// HookApprovalClosed is that prompt going away: answered at the keyboard,
 	// by keys muxscale typed, or abandoned.
 	HookApprovalClosed HookKind = "approval_closed"
@@ -477,6 +489,9 @@ type HookEvent struct {
 	// (HookApprovalClosed); Reason is also why a prompt was raised.
 	Approved bool
 	Reason   string
+
+	// Queue is the whole queue, with HookQueue.
+	Queue *[]protocol.QueuedMessage
 }
 
 // Subject renders a short human-readable summary for a notification body.

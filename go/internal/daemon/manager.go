@@ -1823,10 +1823,13 @@ func (m *Manager) infer(sessionID string, h *tailHandle, events []protocol.Trans
 // line of its own.
 func (m *Manager) applyMeta(sessionID string, meta adapter.Meta) {
 	if meta.Title == "" && meta.CustomTitle == nil && meta.GitBranch == "" &&
-		meta.Model == "" && meta.Version == "" && meta.Cwd == "" {
+		meta.Model == "" && meta.Version == "" && meta.Cwd == "" && meta.Queue == nil {
 		return
 	}
 	m.reg.Update(sessionID, func(s *protocol.Session) {
+		if meta.Queue != nil {
+			s.Queued = append([]protocol.QueuedMessage(nil), (*meta.Queue)...)
+		}
 		if meta.Title != "" {
 			s.Title = meta.Title
 		}
