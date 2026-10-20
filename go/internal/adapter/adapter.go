@@ -405,6 +405,14 @@ type Approver interface {
 	Reply(ctx context.Context, req protocol.ApprovalRequest, d protocol.ApprovalDecision) error
 }
 
+// ScreenQueueReader is implemented by adapters whose agent keeps its queue of
+// messages only in memory, but draws it on screen (Codex, Gemini CLI). The
+// daemon reads it off the session's screen while the agent is busy. Returns
+// the queue shown, empty when the screen shows none.
+type ScreenQueueReader interface {
+	QueueFromScreen(screen string) []protocol.QueuedMessage
+}
+
 // KeyApprover is implemented by adapters whose agent asks at its own keyboard
 // and reports that it is asking, but cannot take an answer any other way: the
 // report arrives through a hook that does not wait for a reply (an approval

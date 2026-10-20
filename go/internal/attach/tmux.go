@@ -168,6 +168,16 @@ func CapturePane(target string, historyLines int) ([]byte, error) {
 	return out, nil
 }
 
+// CapturePaneText is what a pane shows now, as plain text: no colour, no
+// history.
+func CapturePaneText(target string) ([]byte, error) {
+	out, err := exec.Command("tmux", "capture-pane", "-p", "-t", target).Output()
+	if err != nil {
+		return nil, fmt.Errorf("capture-pane %s: %w", target, err)
+	}
+	return out, nil
+}
+
 // SendKeys sends literal bytes to a pane.
 //
 // Hex encoding (-H) is used rather than letting tmux interpret key names,

@@ -121,6 +121,11 @@ func TestDeclaredSignalsMatchImplementedInterfaces(t *testing.T) {
 						"decision has no way to reach the agent")
 				}
 			}
+			// A queue read off the screen needs a screen, which only a
+			// session muxscale can reach through a terminal has.
+			if _, ok := a.(adapter.ScreenQueueReader); ok && len(info.Attachments) == 0 {
+				t.Error("reads its queue off the screen but has no terminal attachment to read")
+			}
 			// Typed answers need somewhere to type them, and are keystrokes,
 			// which is the derived level by definition.
 			if _, ok := a.(adapter.KeyApprover); ok {

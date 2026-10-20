@@ -120,6 +120,7 @@ func NewManager(reg *Registry, adapters *adapter.Registry, st *store.Store, log 
 	}
 	m.typeKeys = m.deliver
 	go m.persistLoop()
+	go m.screenQueueLoop()
 	return m
 }
 
@@ -607,11 +608,21 @@ func (m *Manager) ScreenText(sessionID string) (string, bool) {
 func (m *Manager) sampleScreen(sessionID string) (*vt.Grid, bool) {
 	m.mu.RLock()
 	term, ok := m.termctlTargets[sessionID]
+	pane := m.tmuxTargets[sessionID]
 	m.mu.RUnlock()
-	if !ok {
+	if !ok && pane == "" {
 		return nil, false
 	}
-	text, err := term.Text()
+	var text string
+	var err error
+	if ok {
+		text, err = term.Text()
+	} else {
+		// A tmux pane muxscale adopted: what it shows now, as plain text.
+		var out []byte
+		out, err = attach.CapturePaneText(pane)
+		text = strings.TrimRight(string(out), "\n")
+	}
 	if err != nil {
 		if attach.IsTargetStale(err) {
 			m.mu.Lock()

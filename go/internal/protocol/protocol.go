@@ -120,10 +120,10 @@ type Session struct {
 
 	// Queued is what a person has sent that the agent has not taken up yet,
 	// oldest first: typed while it was busy, at the keyboard or from a phone.
-	// Read from the agent's own record of its queue, never from what muxscale
-	// sent, so it shows what the agent will actually do next. Empty for an
-	// agent that keeps its queue only in memory (Codex, Gemini CLI). Not
-	// persisted: each adapter reads it again from its source.
+	// Read from the agent's own record of its queue, or off its screen for an
+	// agent that keeps it only in memory (Codex, Gemini CLI, pi, Kimi Code) --
+	// never from what muxscale sent -- so it shows what the agent will
+	// actually do next. Not persisted: each adapter reads it again.
 	Queued []QueuedMessage `json:"queued,omitempty"`
 }
 
@@ -134,6 +134,10 @@ type QueuedMessage struct {
 	// "queue" (after the current turn) or "steer" (at its next step).
 	Delivery string    `json:"delivery,omitempty"`
 	At       time.Time `json:"at,omitempty"`
+	// Partial marks a message read off the agent's screen rather than from a
+	// record: its text is what the screen had room for, and may be cut
+	// short. One with no text at all is a message the screen only counted.
+	Partial bool `json:"partial,omitempty"`
 }
 
 // EventKind discriminates TranscriptEvent.

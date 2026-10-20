@@ -177,10 +177,12 @@ These are constraints, not aspirations. Each has tests.
   phone's answer is typed into omp's terminal as omp's own keys (`Ctrl+Q` to approve, `Esc`
   to deny). Rebinding the approve key or using Vim mode stops that from landing; the prompt
   then stays answerable at the keyboard.
-- **Queued messages show for Claude Code, OpenCode and omp.** Each is read from the agent's
-  own record (Claude Code's transcript, OpenCode's database, omp through its extension), so
-  messages typed at the keyboard show too. Codex, Gemini CLI and the rest keep their queue
-  in memory, so theirs is not shown.
+- **Queued messages** (typed while an agent is busy, at the keyboard or from the phone) show
+  for most agents. Claude Code, OpenCode and omp are read from the agent's own record (its
+  transcript, its database, its extension) and are exact. Codex, Gemini CLI, pi and Kimi
+  Code keep theirs in memory, so muxscale reads it off the session's screen: a preview,
+  marked as such, and only for sessions it can reach through a terminal. Copilot CLI, Kiro
+  and Bob neither record their queue nor publish how they draw it, so theirs is not shown.
 - **Codex hooks need trust.** The daemon installs them, but Codex skips non-managed hooks
   until you open `/hooks` in Codex and trust them. Until then Codex sessions still appear
   with transcripts and a derived state; `muxscale status` says what is missing.
