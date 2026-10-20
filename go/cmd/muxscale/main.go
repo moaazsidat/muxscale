@@ -36,6 +36,10 @@ import (
 
 const defaultAddr = "127.0.0.1:4455"
 
+// version is stamped by the release build (tools/release.sh) with
+// -ldflags "-X main.version=..."; a local build says so.
+var version = "dev"
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -73,6 +77,8 @@ func main() {
 		err = cmdDebug(os.Args[2:])
 	case "hook-relay":
 		err = cmdHookRelay(os.Args[2:])
+	case "version", "--version", "-v":
+		fmt.Println("muxscale " + version)
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -106,6 +112,7 @@ More
   muxscale acl [allow|deny U]  Who besides you may connect over Tailscale
   muxscale audit               Who did what, when
   muxscale daemon              Run in the foreground (what up runs in the background)
+  muxscale version             Which build this is
 
 `)
 }
@@ -740,17 +747,20 @@ func cmdAudit(args []string) error {
 
 // tailnetView is the shape /v1/tailnet answers with.
 type tailnetView struct {
-	Enabled bool   `json:"enabled"`
-	Mode    string `json:"mode"`
-	URL     string `json:"url"`
-	Status  *struct {
-		Hostname     string   `json:"hostname"`
-		DNSName      string   `json:"dns_name"`
-		TailnetIPs   []string `json:"tailnet_ips"`
-		BackendState string   `json:"backend_state"`
-		AuthURL      string   `json:"auth_url"`
-		Port         int      `json:"port"`
-	} `json:"status"`
+	Enabled bool           `json:"enabled"`
+	Mode    string         `json:"mode"`
+	URL     string         `json:"url"`
+	Status  *tailnetStatus `json:"status"`
+}
+
+type tailnetStatus struct {
+	Hostname     string   `json:"hostname"`
+	DNSName      string   `json:"dns_name"`
+	TailnetIPs   []string `json:"tailnet_ips"`
+	BackendState string   `json:"backend_state"`
+	AuthURL      string   `json:"auth_url"`
+	Port         int      `json:"port"`
+	HTTPSProblem string   `json:"https_problem"`
 }
 
 func cmdACL(args []string) error {

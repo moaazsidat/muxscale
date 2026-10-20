@@ -215,5 +215,13 @@ func (s *SystemNode) Status(ctx context.Context) (Status, error) {
 		}
 	}
 	out.Login = selfLogin(st)
+	out.HTTPSProblem = httpsProblem(st)
+	if out.HTTPSProblem == "" && s.certErr != nil {
+		// The tailnet allows certificates but this one was not issued: a
+		// Tailscale too old to fetch one, or control unreachable just then.
+		out.HTTPSProblem = "Tailscale would not issue this machine a certificate (" +
+			s.certErr.Error() + "). Check HTTPS is on at " + DNSAdminURL +
+			", then restart muxscale (`muxscale up`)"
+	}
 	return out, nil
 }

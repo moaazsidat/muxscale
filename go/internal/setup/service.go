@@ -64,17 +64,53 @@ func BuildServicePlan(binaryPath string, tailnet bool) (*ServicePlan, error) {
 		args = append(args, "--tailnet")
 	}
 
+	path := ServicePath(home, os.Getenv("PATH"))
 	switch runtime.GOOS {
 	case "darwin":
-		return buildLaunchd(home, abs, args)
+		return buildLaunchd(home, abs, args, path)
 	case "linux":
-		return buildSystemd(home, abs, args)
+		return buildSystemd(home, abs, args, path)
 	default:
 		return nil, fmt.Errorf("no service integration for %s yet; run `muxscale daemon` manually", runtime.GOOS)
 	}
 }
 
-func buildLaunchd(home, bin string, args []string) (*ServicePlan, error) {
+// ServicePath is the PATH the service runs with.
+//
+// A login service does not get the user's shell PATH: launchd gives it a
+// bare system one, systemd much the same. The daemon finds the agents by
+// running them (`claude --version` and the like), and Claude Code's own
+// installer, Codex's and omp's all put them in ~/.local/bin -- so under the
+// old fixed PATH a daemon started by `muxscale up` found none of them, set up
+// no hooks and no extension, and quietly fell back to guessing, while
+// `muxscale status`, run from a shell, said all was well.
+//
+// So the PATH of the shell that ran `muxscale up` is kept, then the usual
+// per-user install directories in case that shell was a sparse one, then the
+// system directories. Each once, in that order, and only absolute entries.
+func ServicePath(home, shellPath string) string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(dir string) {
+		if dir == "" || !filepath.IsAbs(dir) || seen[dir] {
+			return
+		}
+		seen[dir] = true
+		out = append(out, dir)
+	}
+	for _, d := range filepath.SplitList(shellPath) {
+		add(d)
+	}
+	for _, d := range []string{".local/bin", ".bun/bin", ".opencode/bin", ".npm-global/bin", ".cargo/bin", "go/bin", "bin"} {
+		add(filepath.Join(home, d))
+	}
+	for _, d := range []string{"/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"} {
+		add(d)
+	}
+	return strings.Join(out, string(filepath.ListSeparator))
+}
+
+func buildLaunchd(home, bin string, args []string, pathEnv string) (*ServicePlan, error) {
 	path := filepath.Join(home, "Library", "LaunchAgents", launchdLabel+".plist")
 	logDir := filepath.Join(home, "Library", "Logs", "muxscale")
 
@@ -109,11 +145,11 @@ func buildLaunchd(home, bin string, args []string) (*ServicePlan, error) {
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>PATH</key>
-		<string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<string>%s</string>
 	</dict>
 </dict>
 </plist>
-`, launchdLabel, argXML.String(), xmlEscape(logDir), xmlEscape(logDir))
+`, launchdLabel, argXML.String(), xmlEscape(logDir), xmlEscape(logDir), xmlEscape(pathEnv))
 
 	plan := &ServicePlan{Kind: "launchd", Path: path, Contents: contents}
 	if prev, err := os.ReadFile(path); err == nil {
@@ -126,7 +162,7 @@ func buildLaunchd(home, bin string, args []string) (*ServicePlan, error) {
 	return plan, nil
 }
 
-func buildSystemd(home, bin string, args []string) (*ServicePlan, error) {
+func buildSystemd(home, bin string, args []string, pathEnv string) (*ServicePlan, error) {
 	path := filepath.Join(home, ".config", "systemd", "user", "muxscaled.service")
 
 	contents := fmt.Sprintf(`[Unit]
@@ -137,6 +173,7 @@ After=network-online.target
 [Service]
 Type=simple
 ExecStart=%s %s
+Environment="PATH=%s"
 Restart=on-failure
 RestartSec=5
 # The daemon holds PTYs for wrapped agent sessions. Killing only the main
@@ -147,7 +184,7 @@ TimeoutStopSec=10
 
 [Install]
 WantedBy=default.target
-`, bin, strings.Join(args, " "))
+`, bin, strings.Join(args, " "), systemdQuote(pathEnv))
 
 	plan := &ServicePlan{Kind: "systemd", Path: path, Contents: contents}
 	if prev, err := os.ReadFile(path); err == nil {
@@ -158,6 +195,13 @@ WantedBy=default.target
 		{"systemctl", "--user", "enable", "--now", "muxscaled.service"},
 	}
 	return plan, nil
+}
+
+// systemdQuote makes a value safe inside Environment="...": quotes and
+// backslashes escaped, and % doubled so systemd does not read it as a
+// specifier.
+func systemdQuote(v string) string {
+	return strings.NewReplacer(`\`, `\\`, `"`, `\"`, "%", "%%").Replace(v)
 }
 
 // Apply writes the unit and runs the load commands.

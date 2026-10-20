@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -76,9 +77,24 @@ func detectWezTerm() TermCapability {
 	return c
 }
 
+// iTermInstalled looks where macOS installs apps: /Applications, or the
+// user's own ~/Applications for an install made without admin rights.
+func iTermInstalled() bool {
+	dirs := []string{"/Applications"}
+	if home, err := os.UserHomeDir(); err == nil {
+		dirs = append(dirs, filepath.Join(home, "Applications"))
+	}
+	for _, d := range dirs {
+		if _, err := os.Stat(filepath.Join(d, "iTerm.app")); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
 func detectITerm2() TermCapability {
 	c := TermCapability{Kind: TermITerm2}
-	if _, err := os.Stat("/Applications/iTerm.app"); err != nil {
+	if !iTermInstalled() {
 		c.Reason = "iTerm2 is not installed"
 		return c
 	}

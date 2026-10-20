@@ -224,6 +224,33 @@ type Status struct {
 	// set the daemon up, and so the one identity it can safely let in without
 	// being told.
 	Login string `json:"login,omitempty"`
+	// HTTPSProblem says why a phone cannot reach this node over HTTPS, with
+	// what to change; empty when it can, or before the node is up. The app
+	// only speaks HTTPS, so this is the setup step most likely to stop
+	// someone, and the place to say so is the terminal running connect.
+	HTTPSProblem string `json:"https_problem,omitempty"`
+}
+
+// DNSAdminURL is where a tailnet's MagicDNS and HTTPS settings live.
+const DNSAdminURL = "https://login.tailscale.com/admin/dns"
+
+// httpsProblem reads, from a running node's status, whether its tailnet will
+// issue it a certificate: MagicDNS gives it a name, and the HTTPS setting is
+// what fills CertDomains. Neither is on by default for every tailnet.
+func httpsProblem(st *ipnstate.Status) string {
+	if st == nil || st.Self == nil || st.BackendState != ipn.Running.String() {
+		return ""
+	}
+	if st.CurrentTailnet != nil && !st.CurrentTailnet.MagicDNSEnabled {
+		return "MagicDNS is off for your tailnet, so this machine has no name to get a " +
+			"certificate for. Turn on MagicDNS at " + DNSAdminURL
+	}
+	if len(st.CertDomains) == 0 {
+		return "HTTPS certificates are off for your tailnet, and the muxscale app only " +
+			"connects over HTTPS. Turn on HTTPS at " + DNSAdminURL +
+			" (under HTTPS Certificates, choose Enable HTTPS)"
+	}
+	return ""
 }
 
 // selfLogin is the login of the user a node belongs to.
@@ -267,6 +294,7 @@ func (n *Node) Status(ctx context.Context) (Status, error) {
 		}
 	}
 	s.Login = selfLogin(st)
+	s.HTTPSProblem = httpsProblem(st)
 	return s, nil
 }
 

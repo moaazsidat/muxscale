@@ -37,14 +37,7 @@ func TestTailnetBaseURL(t *testing.T) {
 
 	var tn tailnetView
 	tn.Enabled = true
-	tn.Status = &struct {
-		Hostname     string   `json:"hostname"`
-		DNSName      string   `json:"dns_name"`
-		TailnetIPs   []string `json:"tailnet_ips"`
-		BackendState string   `json:"backend_state"`
-		AuthURL      string   `json:"auth_url"`
-		Port         int      `json:"port"`
-	}{DNSName: "muxscale-studio.tail.ts.net.", Port: 4443, BackendState: "Running"}
+	tn.Status = &tailnetStatus{DNSName: "muxscale-studio.tail.ts.net.", Port: 4443, BackendState: "Running"}
 	got, err = tailnetBaseURL(tn)
 	if err != nil || got != "https://muxscale-studio.tail.ts.net:4443" {
 		t.Fatalf("from status: %q %v", got, err)
@@ -75,5 +68,23 @@ func TestRenderQRIsSquare(t *testing.T) {
 	// Two module rows per line, so a square code is about half as tall as wide.
 	if h := len(lines); h < width/2 || h > width/2+1 {
 		t.Fatalf("%d lines for width %d: not square", h, width)
+	}
+}
+
+// The app only speaks HTTPS: a tailnet without certificates must stop connect
+// before it shows a code that cannot work.
+func TestHTTPSProblemStopsConnect(t *testing.T) {
+	var tn tailnetView
+	if p := httpsProblem(tn); p != "" {
+		t.Errorf("no status, no problem: %q", p)
+	}
+	tn.URL = "http://a.ts.net:4443"
+	if p := httpsProblem(tn); !strings.Contains(p, "login.tailscale.com/admin/dns") {
+		t.Errorf("plain http: %q", p)
+	}
+	tn.URL = "https://a.ts.net:4443"
+	tn.Status = &tailnetStatus{HTTPSProblem: "HTTPS certificates are off"}
+	if p := httpsProblem(tn); p != "HTTPS certificates are off" {
+		t.Errorf("daemon's reason: %q", p)
 	}
 }

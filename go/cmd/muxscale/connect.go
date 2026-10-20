@@ -71,6 +71,12 @@ func cmdConnect(args []string) error {
 	if err != nil {
 		return fmt.Errorf("%w\nThen run `muxscale connect` again", err)
 	}
+	// Checked before the code is shown: the app only connects over HTTPS,
+	// and a code that cannot work fails on the phone with a TLS error and no
+	// hint of the fix, which is a setting in the tailnet's admin console.
+	if p := httpsProblem(tn); p != "" {
+		return fmt.Errorf("your phone can't connect yet. %s\nThen run `muxscale connect` again", p)
+	}
 	link := connectLink(base)
 
 	switch {
@@ -176,6 +182,20 @@ func tailnetBaseURL(tn tailnetView) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("the tailnet listener is starting and has no address yet; try again in a moment")
+}
+
+// httpsProblem is the daemon's account of why HTTPS will not work, if it has
+// one; a URL already on http means the same thing.
+func httpsProblem(tn tailnetView) string {
+	if tn.Status != nil && tn.Status.HTTPSProblem != "" {
+		return tn.Status.HTTPSProblem
+	}
+	if strings.HasPrefix(tn.URL, "http://") {
+		return "this machine is being served without HTTPS, and the muxscale app only " +
+			"connects over HTTPS. Turn on HTTPS at https://login.tailscale.com/admin/dns, " +
+			"then restart muxscale (`muxscale up`)"
+	}
+	return ""
 }
 
 // connectLink is the deep link the app opens. Its shape is mirrored in

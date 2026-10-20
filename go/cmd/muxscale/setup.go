@@ -391,6 +391,10 @@ func statusPhone(line statusLine, fix func(string)) {
 		line("FAIL", "phone", err.Error())
 		return
 	}
+	if p := httpsProblem(tn); p != "" {
+		line("FAIL", "phone", base+", but "+p)
+		return
+	}
 	var acl struct {
 		Allowed []string `json:"allowed"`
 	}

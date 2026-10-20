@@ -195,3 +195,40 @@ func TestLingerHintOnlyOnLinux(t *testing.T) {
 		t.Errorf("non-linux should not get a systemd hint, got %q", got)
 	}
 }
+
+// A login service gets a bare PATH, and the agents live in ~/.local/bin:
+// without the shell's PATH the daemon found none of them.
+func TestServicePathKeepsTheShellsAndTheUsualPlaces(t *testing.T) {
+	got := filepath.SplitList(ServicePath("/home/u", "/home/u/.nvm/bin:relative:/usr/bin:/home/u/.nvm/bin"))
+	want := []string{"/home/u/.nvm/bin", "/usr/bin", "/home/u/.local/bin", "/home/u/.bun/bin"}
+	for i, w := range want {
+		if i >= len(got) || got[i] != w {
+			t.Fatalf("PATH = %v, want it to start %v", got, want)
+		}
+	}
+	for _, d := range got {
+		if d == "relative" {
+			t.Errorf("relative entry kept: %v", got)
+		}
+	}
+	if got[len(got)-1] != "/sbin" {
+		t.Errorf("system directories should come last: %v", got)
+	}
+}
+
+func TestServicePlanCarriesThePath(t *testing.T) {
+	t.Setenv("PATH", "/custom/agents/bin:/usr/bin")
+	plan, err := BuildServicePlan("/x/muxscale", false)
+	if err != nil {
+		t.Skip(err) // no service integration on this OS
+	}
+	if !strings.Contains(plan.Contents, "/custom/agents/bin") || !strings.Contains(plan.Contents, ".local/bin") {
+		t.Errorf("service PATH does not carry the shell's:\n%s", plan.Contents)
+	}
+}
+
+func TestSystemdQuote(t *testing.T) {
+	if got := systemdQuote(`/a"b\c%d`); got != `/a\"b\\c%%d` {
+		t.Errorf("got %s", got)
+	}
+}
