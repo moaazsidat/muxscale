@@ -408,6 +408,8 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 			Behavior string `json:"behavior"`
 			Reason   string `json:"reason"`
 			By       string `json:"by"`
+			// Answers, for a question: question text to the answer.
+			Answers map[string]string `json:"answers"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
@@ -419,6 +421,15 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 		}
 		decision := protocol.ApprovalDecision{
 			Behavior: body.Behavior, Reason: body.Reason, DecidedBy: body.By,
+		}
+		// A question is answered, not allowed: an allow without answers would
+		// let the tool run with nothing chosen.
+		if req, ok := d.reg.Approval(body.ID); ok && req.Kind == "question" && body.Behavior == "allow" {
+			if err := checkAnswers(req.Questions, body.Answers); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			decision.Answers = body.Answers
 		}
 		// A prompt the agent is showing at its own keyboard is answered by
 		// typing its keys; the rest are answered as data to a waiting hook.

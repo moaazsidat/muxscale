@@ -356,12 +356,26 @@ func (h *HookServer) awaitDecision(r *http.Request, sess *protocol.Session, e *a
 	if e.Kind == adapter.HookElicit {
 		req.Kind = "elicitation"
 	}
+	question := false
+	if qs := parseQuestions(e.ToolName, e.ToolInput); len(qs) > 0 {
+		question = true
+		req.Kind, req.Questions, req.Options = "question", qs, []string{}
+		req.Subject = questionSubject(qs)
+	}
 
-	h.reg.SetState(sess.ID, protocol.StateGuess{
-		State: protocol.StateWaitingApproval, Confidence: 1.0,
-		Reason: "approval required: " + req.Subject, Evidence: "hook:" + e.EventName,
-		At: time.Now(),
-	})
+	if question {
+		h.reg.SetState(sess.ID, protocol.StateGuess{
+			State: protocol.StateWaitingInput, Confidence: 1.0,
+			Reason: "asked: " + req.Subject, Evidence: "hook:" + e.EventName,
+			At: time.Now(),
+		})
+	} else {
+		h.reg.SetState(sess.ID, protocol.StateGuess{
+			State: protocol.StateWaitingApproval, Confidence: 1.0,
+			Reason: "approval required: " + req.Subject, Evidence: "hook:" + e.EventName,
+			At: time.Now(),
+		})
+	}
 
 	answer := h.reg.AskApproval(req)
 	h.log.Info("approval requested", "session", sess.ID, "subject", req.Subject,
@@ -384,7 +398,18 @@ func (h *HookServer) awaitDecision(r *http.Request, sess *protocol.Session, e *a
 		// is the correct outcome, not a failure: the human at the keyboard is
 		// still a human.
 		h.reg.ResolveApproval(req.ID, protocol.ApprovalDecision{Behavior: "", Reason: "timeout"})
-		h.clearApprovalState(sess.ID, "approval timed out; agent is asking locally")
+		if question {
+			// Not running: the question is now on the agent's screen, and
+			// until it is answered there it takes whatever is typed. Saying
+			// "working" here is what made replies seem to vanish.
+			h.reg.SetState(sess.ID, protocol.StateGuess{
+				State: protocol.StateWaitingInput, Confidence: 1.0,
+				Reason: "asked at the keyboard: " + req.Subject, Evidence: "hook:" + e.EventName,
+				At: time.Now(),
+			})
+		} else {
+			h.clearApprovalState(sess.ID, "approval timed out; agent is asking locally")
+		}
 		h.log.Info("approval timed out, falling through to local prompt", "session", sess.ID)
 		return codec.EncodeHookReply(*e, nil)
 

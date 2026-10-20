@@ -231,7 +231,7 @@ type ApprovalRequest struct {
 	ID        string         `json:"id"`
 	SessionID string         `json:"session_id"`
 	Source    ApprovalSource `json:"source"`
-	Kind      string         `json:"kind"` // "tool_use", "elicitation"
+	Kind      string         `json:"kind"` // "tool_use", "elicitation", "question"
 
 	ToolName  string         `json:"tool_name,omitempty"`
 	ToolInput map[string]any `json:"tool_input,omitempty"`
@@ -240,6 +240,10 @@ type ApprovalRequest struct {
 	// Subject is a short human-readable summary for a notification body.
 	Subject string   `json:"subject"`
 	Options []string `json:"options"`
+
+	// Questions, for Kind "question": what the agent asked, each with its
+	// choices. Answered with ApprovalDecision.Answers, not allow or deny.
+	Questions []Question `json:"questions,omitempty"`
 
 	// PromptID fences the reply to the turn that asked.
 	PromptID string `json:"prompt_id,omitempty"`
@@ -251,10 +255,29 @@ type ApprovalRequest struct {
 	Deadline time.Time `json:"deadline"`
 }
 
+// Question is one question an agent put to the person, with its choices
+// (Claude Code's AskUserQuestion). Any answer may also be the person's own
+// words instead of one of the labels.
+type Question struct {
+	Question    string           `json:"question"`
+	Header      string           `json:"header,omitempty"`
+	Options     []QuestionOption `json:"options"`
+	MultiSelect bool             `json:"multi_select,omitempty"`
+}
+
+// QuestionOption is one choice offered for a question.
+type QuestionOption struct {
+	Label       string `json:"label"`
+	Description string `json:"description,omitempty"`
+}
+
 // ApprovalDecision is a human's answer.
 type ApprovalDecision struct {
 	Behavior string `json:"behavior"` // "allow" | "deny"
 	Reason   string `json:"reason,omitempty"`
+	// Answers, for a question: each question's text to what was chosen --
+	// an option's label, several joined with ", ", or the person's own words.
+	Answers map[string]string `json:"answers,omitempty"`
 	// DecidedBy records which device answered, for the audit log.
 	DecidedBy string `json:"decided_by,omitempty"`
 }

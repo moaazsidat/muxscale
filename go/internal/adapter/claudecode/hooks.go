@@ -119,6 +119,11 @@ type hookSpecificOutput struct {
 
 type decision struct {
 	Behavior string `json:"behavior"` // "allow" | "deny"
+	// UpdatedInput replaces the tool's input on an allow. Only ever set to
+	// answer AskUserQuestion: its questions, echoed, plus "answers".
+	UpdatedInput map[string]any `json:"updatedInput,omitempty"`
+	// Message tells Claude why, on a deny.
+	Message string `json:"message,omitempty"`
 	// Rule is deliberately never set by muxscale. Persisting a broadened
 	// permission rule is the user's business to do in Claude Code itself; we
 	// relay one answer to one question and nothing more.
@@ -186,7 +191,7 @@ func (*Adapter) DecodeHook(body []byte) (adapter.HookEvent, error) {
 		SessionFile: p.TranscriptPath, Cwd: p.Cwd,
 		PromptID: p.PromptID, EventName: p.HookEventName,
 		ToolName: p.ToolName, ToolUseID: p.ToolUseID, ToolInput: p.ToolInput,
-		ToolOutput: p.ToolError,
+		ToolOutput:  p.ToolError,
 		IsSidechain: p.AgentID != "",
 	}
 	switch p.HookEventName {
@@ -235,5 +240,21 @@ func (*Adapter) EncodeHookReply(e adapter.HookEvent, d *protocol.ApprovalDecisio
 	if e.Kind == adapter.HookElicit {
 		name = HookElicitation
 	}
-	return PermissionDecisionFor(name, d.Behavior, d.Reason)
+	r := PermissionDecisionFor(name, d.Behavior, d.Reason)
+	if e.ToolName == "AskUserQuestion" {
+		switch {
+		case d.Behavior == "allow" && len(d.Answers) > 0:
+			// Allow alone does not answer it: Claude Code wants the questions
+			// back with the answers added, and then shows no dialog.
+			in := make(map[string]any, len(e.ToolInput)+1)
+			for k, v := range e.ToolInput {
+				in[k] = v
+			}
+			in["answers"] = d.Answers
+			r.HookSpecificOutput.Decision.UpdatedInput = in
+		case d.Behavior == "deny":
+			r.HookSpecificOutput.Decision.Message = "The person chose not to answer these questions from their phone."
+		}
+	}
+	return r
 }
