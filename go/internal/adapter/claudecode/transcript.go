@@ -54,9 +54,12 @@ type entry struct {
 
 	// Attachment is an attachment entry's body; only queued_command is read.
 	Attachment *struct {
-		Type        string `json:"type"`
-		Prompt      string `json:"prompt"`
-		CommandMode string `json:"commandMode"`
+		Type string `json:"type"`
+		// A string, or content blocks when the message carried an image
+		// (Claude Code 2.1.301). Decoded as either: typed as a string, a
+		// message with an image failed the whole line and vanished.
+		Prompt      json.RawMessage `json:"prompt"`
+		CommandMode string          `json:"commandMode"`
 	} `json:"attachment"`
 }
 
@@ -174,14 +177,21 @@ func parseTranscript(r io.Reader, q *queue) ([]protocol.TranscriptEvent, Meta, e
 			// queue and appeared nowhere in the conversation. Claude Code's
 			// own task notifications ride the same attachment and are not
 			// the person's words.
-			if a := e.Attachment; a != nil && a.Type == "queued_command" && a.CommandMode == "prompt" && strings.TrimSpace(a.Prompt) != "" {
+			if a := e.Attachment; a != nil && a.Type == "queued_command" && a.CommandMode == "prompt" {
+				text := strings.TrimSpace(contentText(a.Prompt))
+				if text == "" && hasImage(a.Prompt) {
+					text = "[Image]"
+				}
+				if text == "" {
+					continue
+				}
 				seq++
 				ev := protocol.TranscriptEvent{
 					ID: e.UUID, ParentID: e.ParentUUID, SessionID: e.SessionID,
 					At: parseTime(e.Timestamp), IsSidechain: e.IsSidechain,
 					Kind: protocol.EventUserMessage, Seq: seq,
 				}
-				ev.Text, ev.Truncated = clip(strings.TrimSpace(a.Prompt))
+				ev.Text, ev.Truncated = clip(text)
 				events = append(events, ev)
 			}
 			continue
@@ -469,6 +479,20 @@ func contentText(raw json.RawMessage) string {
 		}
 	}
 	return strings.Join(parts, "\n\n")
+}
+
+// hasImage reports whether content blocks include an image.
+func hasImage(raw json.RawMessage) bool {
+	var blocks []contentBlock
+	if json.Unmarshal(raw, &blocks) != nil {
+		return false
+	}
+	for _, b := range blocks {
+		if b.Type == "image" {
+			return true
+		}
+	}
+	return false
 }
 
 // flattenResult renders a tool_result's content, which may be a string or an

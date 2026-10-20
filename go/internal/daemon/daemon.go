@@ -289,8 +289,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 // v2: messages Claude Code took in the middle of a turn are recorded only as
 // queued_command attachments, which the parser skipped, so every one of them
 // was missing from stored history. Reading again puts them back.
+//
+// v3: the same messages, when they carried an image: their prompt is content
+// blocks, not a string, and the parser dropped the whole line.
 func rereadTranscriptsOnce(st *store.Store) (int, error) {
-	const flag = "once:transcripts-reread-v2"
+	const flag = "once:transcripts-reread-v3"
 	if done, _ := st.Setting(flag); done != "" {
 		return 0, nil
 	}

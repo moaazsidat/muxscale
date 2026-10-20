@@ -120,3 +120,29 @@ func TestMidTurnMessageShowsInTheConversation(t *testing.T) {
 		t.Fatalf("events = %+v", events)
 	}
 }
+
+// With an image attached, the prompt is content blocks (Claude Code 2.1.301),
+// and the message must still show -- by its text, or as an image if it has none.
+func TestMidTurnMessageWithAnImageShows(t *testing.T) {
+	lines := []string{
+		qop("enqueue", "[Image #7]Also the text escapes the box"),
+		qop("remove", "[Image #7]Also the text escapes the box"),
+		`{"type":"attachment","uuid":"a1","sessionId":"s","timestamp":"2026-10-20T13:20:31.139Z","attachment":{"type":"queued_command","prompt":[{"type":"text","text":"[Image #7]Also the text escapes the box"},{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"AAAA"}}],"imagePasteIds":[7],"commandMode":"prompt","origin":{"kind":"human"},"humanTurn":true}}`,
+		`{"type":"attachment","uuid":"a2","sessionId":"s","timestamp":"2026-10-20T13:21:00Z","attachment":{"type":"queued_command","prompt":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}],"commandMode":"prompt"}}`,
+	}
+	events, meta, err := ParseTranscript(strings.NewReader(strings.Join(lines, "\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := texts(t, meta); len(got) != 0 {
+		t.Errorf("queue = %q", got)
+	}
+	if len(events) != 2 || events[0].Text != "[Image #7]Also the text escapes the box" || events[1].Text != "[Image]" {
+		t.Fatalf("events = %+v", events)
+	}
+	for _, e := range events {
+		if e.Kind != "user_message" {
+			t.Errorf("kind = %s", e.Kind)
+		}
+	}
+}
