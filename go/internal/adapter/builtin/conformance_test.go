@@ -121,6 +121,17 @@ func TestDeclaredSignalsMatchImplementedInterfaces(t *testing.T) {
 						"decision has no way to reach the agent")
 				}
 			}
+			// Typed answers need somewhere to type them, and are keystrokes,
+			// which is the derived level by definition.
+			if _, ok := a.(adapter.KeyApprover); ok {
+				if info.Signals.Approvals != adapter.SupportDerived {
+					t.Errorf("answers approvals with keys but declares Signals.Approvals=%s, not derived",
+						info.Signals.Approvals)
+				}
+				if len(info.Attachments) == 0 {
+					t.Error("answers approvals with keys but has no attachment to type them into")
+				}
+			}
 		})
 	}
 }

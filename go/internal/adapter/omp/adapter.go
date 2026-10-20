@@ -17,9 +17,11 @@ import (
 // It declares exact transcript and discovery because both are read from files
 // omp writes, not guessed from a screen. State is exact once the extension is
 // installed and derived otherwise; the same shape Claude Code has had since
-// its hooks landed. Approvals are declared none: no extension API can answer
-// omp's own approval dialog, and promising a reply that silently does nothing
-// is worse than saying so (see docs/20261018-omp-adapter.md §9).
+// its hooks landed. Approvals are derived: omp asks at its own keyboard (only
+// when tools.approvalMode asks for prompts; the default, yolo, never does), the
+// extension reports each prompt as it opens and closes, and a phone's answer is
+// typed as omp's own keys for it (see approve.go).
+
 type Adapter struct{}
 
 // New returns the omp adapter.
@@ -32,6 +34,7 @@ var (
 	_ adapter.StateInferrer = (*Adapter)(nil)
 	_ adapter.Locator       = (*Adapter)(nil)
 	_ adapter.Liveness      = (*Adapter)(nil)
+	_ adapter.KeyApprover   = (*Adapter)(nil)
 )
 
 func (*Adapter) Info() adapter.Info {
@@ -49,8 +52,9 @@ func (*Adapter) Info() adapter.Info {
 			// Claude Code before its hooks are installed.
 			State:      adapter.SupportExact,
 			Transcript: adapter.SupportExact,
-			// No structured approval channel exists in the extension API.
-			Approvals: adapter.SupportNone,
+			// The extension reports omp's prompts, but nothing in its API
+			// answers one: the answer is omp's own keys (KeyApprover).
+			Approvals: adapter.SupportDerived,
 		},
 		Attachments: []protocol.Attachment{
 			protocol.AttachWrap, protocol.AttachTmux, protocol.AttachTermctl,

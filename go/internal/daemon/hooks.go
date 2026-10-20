@@ -302,6 +302,12 @@ func (h *HookServer) applyHook(e *adapter.HookEvent) *protocol.Session {
 	case adapter.HookNotification:
 		h.reg.SetState(sess.ID, guess(protocol.StateWaitingInput, "agent requested attention"))
 
+	case adapter.HookApprovalShown:
+		h.approvalShown(sess, e)
+
+	case adapter.HookApprovalClosed:
+		h.approvalClosed(sess, e)
+
 	case adapter.HookSessionEnd:
 		// SessionEnd has a short budget on every transport, so this path must
 		// stay trivial. Record and return.

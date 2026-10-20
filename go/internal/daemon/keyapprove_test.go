@@ -1,0 +1,199 @@
+package daemon
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/muxscale/muxscale/go/internal/adapter"
+	"github.com/muxscale/muxscale/go/internal/adapter/omp"
+	"github.com/muxscale/muxscale/go/internal/protocol"
+	"github.com/muxscale/muxscale/go/internal/store"
+)
+
+// ompApprovals is a daemon with omp's adapter, its hook endpoint and the
+// control API on one mux, and a record of every key typed into a session.
+type ompApprovals struct {
+	t     *testing.T
+	mux   *http.ServeMux
+	reg   *Registry
+	mu    sync.Mutex
+	typed []string
+	fail  error
+}
+
+func newOMPApprovals(t *testing.T) *ompApprovals {
+	t.Helper()
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	reg := NewRegistry()
+	adapters := adapter.NewRegistry()
+	adapters.MustRegister(omp.New())
+	m := NewManager(reg, adapters, st, log)
+	o := &ompApprovals{t: t, mux: http.NewServeMux(), reg: reg}
+	m.typeKeys = func(_ string, keys []byte) error {
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		if o.fail != nil {
+			return o.fail
+		}
+		o.typed = append(o.typed, string(keys))
+		return nil
+	}
+	hs := NewHookServer(reg, adapters, "hook-token", time.Second, log)
+	hs.SetManager(m)
+	hs.Routes(o.mux)
+	d := &Daemon{cfg: Config{LocalToken: testToken}, mgr: m, reg: reg, store: st, log: log}
+	d.routes(o.mux)
+	return o
+}
+
+func (o *ompApprovals) hook(event, toolUseID string, extra map[string]any) {
+	o.t.Helper()
+	body := map[string]any{"v": 1, "agent": "omp", "event": event, "session_id": "s1", "cwd": "/w", "tool_use_id": toolUseID}
+	for k, v := range extra {
+		body[k] = v
+	}
+	b, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPost, "/v1/hook/omp", bytes.NewReader(b))
+	req.Header.Set("Authorization", "Bearer hook-token")
+	rec := httptest.NewRecorder()
+	o.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		o.t.Fatalf("hook %s: %d", event, rec.Code)
+	}
+}
+
+func (o *ompApprovals) decide(id, behavior string) *httptest.ResponseRecorder {
+	o.t.Helper()
+	b, _ := json.Marshal(map[string]string{"id": id, "behavior": behavior, "by": "phone"})
+	req := httptest.NewRequest(http.MethodPost, "/v1/approvals/decide", bytes.NewReader(b))
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	rec := httptest.NewRecorder()
+	o.mux.ServeHTTP(rec, req)
+	return rec
+}
+
+func (o *ompApprovals) pending() []protocol.ApprovalRequest { return o.reg.PendingApprovals() }
+
+func (o *ompApprovals) state() protocol.SessionState {
+	id, _ := o.reg.IDFor("omp", "s1")
+	s, _ := o.reg.Get(id)
+	return s.State
+}
+
+func (o *ompApprovals) keys() string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return strings.Join(o.typed, "|")
+}
+
+// omp's prompt, reported by the extension, becomes a card; the phone's answer
+// is typed as omp's own key; the prompt closing retires the card.
+func TestOMPApprovalAnsweredFromThePhone(t *testing.T) {
+	o := newOMPApprovals(t)
+	o.hook("session_start", "", nil)
+	o.hook("approval_requested", "call-1", map[string]any{
+		"tool_name": "bash", "tool_input": map[string]any{"command": "rm -rf build"},
+		"reason": "Critical pattern detected",
+	})
+
+	p := o.pending()
+	if len(p) != 1 || p[0].Source != protocol.ApprovalHook || p[0].ToolUseID != "call-1" {
+		t.Fatalf("pending = %+v", p)
+	}
+	if p[0].Subject != "bash: rm -rf build (Critical pattern detected)" || !p[0].Deadline.IsZero() {
+		t.Errorf("card = %+v", p[0])
+	}
+	if o.state() != protocol.StateWaitingApproval {
+		t.Fatalf("state = %s", o.state())
+	}
+
+	if rec := o.decide(p[0].ID, "allow"); rec.Code != http.StatusOK {
+		t.Fatalf("decide: %d %s", rec.Code, rec.Body)
+	}
+	if o.keys() != "\x11" {
+		t.Fatalf("typed %q, want Ctrl+Q", o.keys())
+	}
+	if len(o.pending()) != 0 {
+		t.Fatal("the card stayed after the answer was typed")
+	}
+	// omp then reports its prompt closed; nothing more is typed.
+	o.hook("approval_resolved", "call-1", map[string]any{"approved": true})
+	if o.keys() != "\x11" || o.state() != protocol.StateRunning {
+		t.Errorf("after close: keys %q state %s", o.keys(), o.state())
+	}
+
+	// A deny is Esc.
+	o.hook("approval_requested", "call-2", map[string]any{"tool_name": "write", "tool_input": map[string]any{"path": "/etc/hosts"}})
+	if rec := o.decide(o.pending()[0].ID, "deny"); rec.Code != http.StatusOK {
+		t.Fatalf("deny: %d %s", rec.Code, rec.Body)
+	}
+	if o.keys() != "\x11|\x1b" {
+		t.Errorf("typed %q", o.keys())
+	}
+}
+
+// Answered at the keyboard first: the card goes, and nothing is typed.
+func TestOMPApprovalAnsweredAtTheKeyboard(t *testing.T) {
+	o := newOMPApprovals(t)
+	o.hook("approval_requested", "call-1", map[string]any{"tool_name": "bash"})
+	id := o.pending()[0].ID
+	o.hook("approval_resolved", "call-1", map[string]any{"approved": false, "reason": "denied by user"})
+
+	if len(o.pending()) != 0 || o.state() != protocol.StateRunning {
+		t.Fatalf("pending %+v state %s", o.pending(), o.state())
+	}
+	if rec := o.decide(id, "allow"); rec.Code == http.StatusOK && o.keys() != "" {
+		t.Fatalf("a late answer was typed: %q", o.keys())
+	}
+	if o.keys() != "" {
+		t.Errorf("typed %q", o.keys())
+	}
+}
+
+// The keys answer whatever prompt is on screen, which is the oldest. A later
+// one cannot be answered first, and a failure to type leaves the card up.
+func TestOMPApprovalOnlyTheOneOnScreen(t *testing.T) {
+	o := newOMPApprovals(t)
+	o.hook("approval_requested", "call-1", map[string]any{"tool_name": "bash"})
+	o.hook("approval_requested", "call-2", map[string]any{"tool_name": "bash"})
+	o.hook("approval_requested", "call-2", map[string]any{"tool_name": "bash"}) // repeated
+	p := o.pending()
+	if len(p) != 2 {
+		t.Fatalf("pending = %d", len(p))
+	}
+	if rec := o.decide(p[1].ID, "allow"); rec.Code != http.StatusConflict || o.keys() != "" {
+		t.Fatalf("second answered first: %d, typed %q", rec.Code, o.keys())
+	}
+
+	o.fail = errors.New("pane gone")
+	if rec := o.decide(p[0].ID, "allow"); rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "pane gone") {
+		t.Fatalf("failed typing: %d %s", rec.Code, rec.Body)
+	}
+	if len(o.pending()) != 2 {
+		t.Fatal("a card was dropped though its answer never landed")
+	}
+
+	// Closing the first leaves the session waiting on the second.
+	o.fail = nil
+	o.hook("approval_resolved", "call-1", map[string]any{"approved": true})
+	if o.state() != protocol.StateWaitingApproval {
+		t.Errorf("state = %s with a prompt still open", o.state())
+	}
+	if rec := o.decide(p[1].ID, "deny"); rec.Code != http.StatusOK || o.keys() != "\x1b" {
+		t.Errorf("now first: %d, typed %q", rec.Code, o.keys())
+	}
+}

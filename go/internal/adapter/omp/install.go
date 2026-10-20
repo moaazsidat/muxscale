@@ -32,11 +32,17 @@ func ExtensionPath() (string, error) {
 
 // ExtensionSource is the module written to disk.
 //
-// It registers only lifecycle events. Tool activity already arrives through
-// the transcript, and forwarding it here would show every call twice. A
-// non-terminal agent_end is ignored: omp uses it for maintenance and async
-// delivery, and treating that as a finished turn is the false "needs you"
-// notification this product cannot afford.
+// It registers lifecycle events and omp's approval prompts. Tool activity
+// already arrives through the transcript, and forwarding it here would show
+// every call twice; tool_call is only remembered, so an approval can name what
+// it is for. A non-terminal agent_end is ignored: omp uses it for maintenance
+// and async delivery, and treating that as a finished turn is the false "needs
+// you" notification this product cannot afford.
+//
+// Approval events are omp's tool_approval_requested and _resolved, which only
+// report: omp shows its own prompt either way, and an answer from a phone is
+// typed into it (approve.go). Nothing here waits, so muxscale can never hold up
+// or change a prompt.
 func ExtensionSource(baseURL, token string) string {
 	baseURL = strings.TrimRight(baseURL, "/")
 	if baseURL == "" {
@@ -105,6 +111,39 @@ export default function muxscale(pi: any): void {
     // the session. An absent field is terminal for older builds.
     if (e && e.isTerminal === false) return;
     post("agent_end", ctx, { is_terminal: true });
+  });
+
+  // The arguments of recent calls, so an approval prompt can say what it is
+  // for: omp's approval events carry only the tool's name.
+  const calls = new Map<string, any>();
+  on("tool_call", (e, _ctx) => {
+    if (!e?.toolCallId) return;
+    calls.set(e.toolCallId, e.input ?? {});
+    if (calls.size > 64) calls.delete(calls.keys().next().value);
+  });
+
+  // A prompt's close is sent only after its open has landed, so muxscale can
+  // never see a prompt close before it opened and keep a card for it.
+  const asked = new Map<string, Promise<void>>();
+  on("tool_approval_requested", (e, ctx) => {
+    const id = e?.toolCallId ?? "";
+    asked.set(id, send("approval_requested", ctx, {
+      tool_name: e?.toolName ?? "",
+      tool_use_id: id,
+      tool_input: calls.get(id) ?? {},
+      reason: e?.reason ?? "",
+    }));
+  });
+  on("tool_approval_resolved", (e, ctx) => {
+    const id = e?.toolCallId ?? "";
+    const opened = asked.get(id) ?? Promise.resolve();
+    asked.delete(id);
+    void opened.then(() => send("approval_resolved", ctx, {
+      tool_name: e?.toolName ?? "",
+      tool_use_id: id,
+      approved: e?.approved === true,
+      reason: e?.reason ?? "",
+    }));
   });
 
   // session_shutdown has a 2s budget and may be the last code this process

@@ -396,6 +396,17 @@ type Approver interface {
 	Reply(ctx context.Context, req protocol.ApprovalRequest, d protocol.ApprovalDecision) error
 }
 
+// KeyApprover is implemented by adapters whose agent asks at its own keyboard
+// and reports that it is asking, but cannot take an answer any other way: the
+// report arrives through a hook that does not wait for a reply (an approval
+// with source "hook", spec §5.7). The answer is the agent's own keys for its
+// own prompt, typed into its terminal.
+//
+// Same rule as Approver: these are the keys for a decision a person made.
+type KeyApprover interface {
+	ApprovalKeys(req protocol.ApprovalRequest, d protocol.ApprovalDecision) ([]byte, error)
+}
+
 // HookKind is a normalized event an agent's installed integration reports.
 //
 // The daemon's state machine speaks these, not any one agent's event names.
@@ -422,6 +433,13 @@ const (
 	HookApproval HookKind = "approval"
 	// HookElicit is the same, for a typed form rather than a yes/no.
 	HookElicit HookKind = "elicitation"
+	// HookApprovalShown is an approval prompt the agent is showing at its own
+	// keyboard, reported without waiting for an answer. The answer is typed
+	// (see KeyApprover).
+	HookApprovalShown HookKind = "approval_shown"
+	// HookApprovalClosed is that prompt going away: answered at the keyboard,
+	// by keys muxscale typed, or abandoned.
+	HookApprovalClosed HookKind = "approval_closed"
 	// HookNotice is a valid event with no state consequence. It is accepted
 	// and logged rather than rejected: agents add events without warning, and
 	// an unknown event is not an error.
@@ -454,6 +472,11 @@ type HookEvent struct {
 
 	IsSidechain bool
 	EndReason   string
+
+	// Approved and Reason describe how an approval prompt closed
+	// (HookApprovalClosed); Reason is also why a prompt was raised.
+	Approved bool
+	Reason   string
 }
 
 // Subject renders a short human-readable summary for a notification body.

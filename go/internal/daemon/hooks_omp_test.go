@@ -28,7 +28,7 @@ func testOMPServer(t *testing.T) (*httptest.Server, *Registry) {
 	return srv, reg
 }
 
-// omp's extension reports lifecycle events, not approvals. The daemon must
+// omp's extension reports lifecycle events (approvals: keyapprove_test.go). The daemon must
 // turn turn_end into WAITING_INPUT and ignore a non-terminal agent_end, which
 // is maintenance work rather than a finished turn.
 func TestOMPLifecycleHooksDriveState(t *testing.T) {

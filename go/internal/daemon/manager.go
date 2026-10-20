@@ -54,6 +54,13 @@ type Manager struct {
 	// log. Guarded by mu. See SendRaw.
 	typedAudit map[string]time.Time
 
+	// answerMu serialises answers typed for hook-reported approvals, so two
+	// taps at once cannot type two answers (see AnswerByKeys).
+	answerMu sync.Mutex
+	// typeKeys writes an answer's keys; deliver, except in tests, which have
+	// no terminal to type into.
+	typeKeys func(sessionID string, keys []byte) error
+
 	// closing records sessions a human asked to end, so their exit-by-signal is
 	// reported as "closed" rather than "crashed".
 	closing map[string]bool
@@ -111,6 +118,7 @@ func NewManager(reg *Registry, adapters *adapter.Registry, st *store.Store, log 
 		screenChanged:  map[string]chan struct{}{},
 		typedAudit:     map[string]time.Time{},
 	}
+	m.typeKeys = m.deliver
 	go m.persistLoop()
 	return m
 }

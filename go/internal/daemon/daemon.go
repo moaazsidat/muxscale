@@ -410,9 +410,20 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 			http.Error(w, `behavior must be "allow" or "deny"`, http.StatusBadRequest)
 			return
 		}
-		ok := d.reg.ResolveApproval(body.ID, protocol.ApprovalDecision{
+		decision := protocol.ApprovalDecision{
 			Behavior: body.Behavior, Reason: body.Reason, DecidedBy: body.By,
-		})
+		}
+		// A prompt the agent is showing at its own keyboard is answered by
+		// typing its keys; the rest are answered as data to a waiting hook.
+		if req, ok := d.reg.Approval(body.ID); ok && req.Source == protocol.ApprovalHook {
+			if err := d.mgr.AnswerByKeys(body.ID, decision, body.By); err != nil {
+				http.Error(w, err.Error(), http.StatusConflict)
+				return
+			}
+			writeJSON(w, map[string]bool{"delivered": true})
+			return
+		}
+		ok := d.reg.ResolveApproval(body.ID, decision)
 		writeJSON(w, map[string]bool{"delivered": ok})
 	})
 

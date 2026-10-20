@@ -364,6 +364,28 @@ func (r *Registry) ResolveApproval(id string, d protocol.ApprovalDecision) bool 
 	return delivered
 }
 
+// Approval returns a pending approval by id.
+func (r *Registry) Approval(id string) (protocol.ApprovalRequest, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	p, ok := r.approvals[id]
+	if !ok {
+		return protocol.ApprovalRequest{}, false
+	}
+	return *p.req, true
+}
+
+// SessionApprovals lists one session's unanswered approvals, oldest first.
+func (r *Registry) SessionApprovals(sessionID string) []protocol.ApprovalRequest {
+	var out []protocol.ApprovalRequest
+	for _, a := range r.PendingApprovals() {
+		if a.SessionID == sessionID {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
 // PendingApprovals lists unanswered approvals, oldest first.
 func (r *Registry) PendingApprovals() []protocol.ApprovalRequest {
 	r.mu.RLock()

@@ -31,6 +31,11 @@ type HookPayload struct {
 	ToolInput map[string]any `json:"tool_input"`
 	IsError   bool           `json:"is_error"`
 
+	// Approved and Reason come with approval_resolved; Reason also with
+	// approval_requested, when omp gives one (a critical bash pattern).
+	Approved bool   `json:"approved"`
+	Reason   string `json:"reason"`
+
 	// IsTerminal is set by agent_end: false means maintenance or async work
 	// will resume the session, so it is not a turn completion.
 	IsTerminal *bool `json:"is_terminal"`
@@ -68,7 +73,7 @@ func (*Adapter) DecodeHook(body []byte) (adapter.HookEvent, error) {
 		PromptID: p.PromptID, EventName: p.Event,
 		AgentVersion: p.AgentVersion, Model: p.Model,
 		ToolName: p.ToolName, ToolUseID: p.ToolUseID, ToolInput: p.ToolInput,
-		IsError: p.IsError,
+		IsError: p.IsError, Approved: p.Approved, Reason: p.Reason,
 	}
 	switch p.Event {
 	case "session_start":
@@ -92,6 +97,10 @@ func (*Adapter) DecodeHook(body []byte) (adapter.HookEvent, error) {
 		e.Kind = adapter.HookToolCall
 	case "tool_result":
 		e.Kind = adapter.HookToolResult
+	case "approval_requested":
+		e.Kind = adapter.HookApprovalShown
+	case "approval_resolved":
+		e.Kind = adapter.HookApprovalClosed
 	case "compaction_start", "compaction_end":
 		e.Kind = adapter.HookCompaction
 	case "notification":
@@ -102,9 +111,9 @@ func (*Adapter) DecodeHook(body []byte) (adapter.HookEvent, error) {
 	return e, nil
 }
 
-// EncodeHookReply answers a blocking question. Today the extension never asks
-// one -- omp's approval dialog has no extension handler -- but the codec is
-// complete so the day it can, the daemon does not need to change.
+// EncodeHookReply answers a blocking question. The extension never asks one --
+// omp's approval events only report, and the answer is typed (approve.go) --
+// but the codec is complete so the day it can, the daemon does not change.
 func (*Adapter) EncodeHookReply(_ adapter.HookEvent, d *protocol.ApprovalDecision) any {
 	if d == nil || d.Behavior == "" {
 		return HookReply{Decision: "none"}

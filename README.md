@@ -172,9 +172,11 @@ These are constraints, not aspirations. Each has tests.
   floor, muxscale refuses to install hooks rather than ship a weaker safety model.
 - **omp ≥ 18.12.2.** That is where the session tree, writer lease, and extension surface
   were verified. Older sessions still parse; `muxscale status` says what is missing.
-- **omp approvals are local for now.** omp's extension API can report a turn boundary but
-  cannot answer its own approval dialog, so muxscale does not advertise remote approvals
-  for it. State is exact; a blocked `yolo`-off prompt is still answered in the terminal.
+- **omp approvals are typed.** omp only asks when `tools.approvalMode` is not `yolo` (its
+  default). Its extension reports each prompt, but nothing in its API answers one, so the
+  phone's answer is typed into omp's terminal as omp's own keys (`Ctrl+Q` to approve, `Esc`
+  to deny). Rebinding the approve key or using Vim mode stops that from landing; the prompt
+  then stays answerable at the keyboard.
 - **Codex hooks need trust.** The daemon installs them, but Codex skips non-managed hooks
   until you open `/hooks` in Codex and trust them. Until then Codex sessions still appear
   with transcripts and a derived state; `muxscale status` says what is missing.
