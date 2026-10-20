@@ -1764,11 +1764,12 @@ func (m *Manager) tailLoop(sessionID string, h *tailHandle) {
 const inferWindow = 8
 
 // reinfer re-runs state inference for a quiet transcript, and records the
-// result only when it changes the state. It never replaces a state the agent
-// reported (confidence 1) -- a hook's word outranks a guess from silence.
+// result only when it changes the state. A state the agent reported
+// (confidence 1) is replaced only as infer allows: a hook's word outranks a
+// guess from silence.
 func (m *Manager) reinfer(sessionID string, h *tailHandle, last []protocol.TranscriptEvent) {
 	s, ok := m.reg.Get(sessionID)
-	if !ok || s.Guess.Confidence >= 1 {
+	if !ok {
 		return
 	}
 	if guess, ok := m.infer(sessionID, h, last); ok && guess.State != s.State {
@@ -1794,7 +1795,7 @@ func (m *Manager) infer(sessionID string, h *tailHandle, events []protocol.Trans
 		}
 	}
 	s, ok := m.reg.Get(sessionID)
-	if !ok || s.Guess.Confidence >= 1 {
+	if !ok {
 		return protocol.StateGuess{}, false
 	}
 	a, ok := m.adapterByID(s.AgentID)
@@ -1825,7 +1826,37 @@ func (m *Manager) infer(sessionID string, h *tailHandle, events []protocol.Trans
 			in.Live = &live
 		}
 	}
-	return si.InferState(in)
+	exact := s.Guess.Confidence >= 1
+	if exact && !staleRunning(s, fi.ModTime(), in.Idle) {
+		return protocol.StateGuess{}, false
+	}
+	g, ok := si.InferState(in)
+	if exact && ok && !g.State.Terminal() && g.State != protocol.StateWaitingInput {
+		// Only the end of a turn may replace what a hook reported; a guess
+		// that the agent is still busy adds nothing to its own word.
+		return protocol.StateGuess{}, false
+	}
+	return g, ok
+}
+
+// staleHookAfter is how long a transcript must have been quiet, after being
+// written since a hook said the agent was working, before the transcript's
+// reading of the end of a turn is believed over the hook. Long enough that an
+// agent pausing mid-turn to think is not taken for one that stopped.
+const staleHookAfter = 60 * time.Second
+
+// staleRunning reports whether a hook's RUNNING has outlived its evidence.
+//
+// A hook says a turn started; a later hook says it ended. When that later one
+// never arrives -- Claude Code sends no Stop when a turn is interrupted with
+// Esc, and an extension's post can fail -- the session showed Working until
+// the next prompt, however long that was. The transcript is the agent's own
+// record too, so once it has been written after the hook and has since gone
+// quiet, its reading of the turn may stand. Only RUNNING is ever reopened: an
+// approval a hook is holding is a person's to answer, not silence's to clear.
+func staleRunning(s protocol.Session, written time.Time, idle time.Duration) bool {
+	return s.State == protocol.StateRunning && s.PendingApproval == nil &&
+		!s.Guess.At.IsZero() && written.After(s.Guess.At) && idle >= staleHookAfter
 }
 
 // applyMeta copies what a transcript says about its session onto the row:

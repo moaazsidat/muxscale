@@ -194,7 +194,15 @@ func InferTreeState(in adapter.StateInput, agent string) (protocol.StateGuess, b
 	case protocol.EventUserMessage, protocol.EventCommand:
 		return guess(agent, protocol.StateRunning, 0.5, "the last entry is input to the agent", last, now), true
 	case protocol.EventCompaction:
-		return guess(agent, protocol.StateRunning, 0.5, "omp is compacting the conversation", last, now), true
+		// omp writes the compaction entry when compaction is done, not when
+		// it starts. After a /compact, or one at the end of a turn, nothing
+		// follows until the person types, so a quiet one is a finished one.
+		// One mid-turn is followed by the turn going on.
+		if in.Idle >= in.Quiescence {
+			return guess(agent, protocol.StateWaitingInput, 0.6,
+				"compaction finished and the transcript has been quiet", last, now), true
+		}
+		return guess(agent, protocol.StateRunning, 0.5, "omp just compacted the conversation", last, now), true
 	case protocol.EventAssistantMessage, protocol.EventThinking, protocol.EventError:
 		if in.Idle >= in.Quiescence {
 			return guess(agent, protocol.StateWaitingInput, 0.7,

@@ -37,7 +37,7 @@ func TestQuietTranscriptIsReinferred(t *testing.T) {
 	}
 
 	// What an agent reported is never replaced by a guess from silence.
-	reg.SetState(s.ID, protocol.StateGuess{State: protocol.StateRunning, Confidence: 1})
+	reg.SetState(s.ID, protocol.StateGuess{State: protocol.StateRunning, Confidence: 1, At: time.Now()})
 	m.reinfer(s.ID, h, last)
 	if got, _ := reg.Get(s.ID); got.State != protocol.StateRunning {
 		t.Fatalf("state = %s, want the reported RUNNING kept", got.State)
@@ -127,5 +127,66 @@ func TestTmuxSessionsEndWithTheirPane(t *testing.T) {
 	}
 	if s, _ := reg.Get(kept.ID); s.State.Terminal() {
 		t.Error("pane %2 is still there")
+	}
+}
+
+// Regression: a hook said a turn started and the hook saying it ended never
+// came (Claude Code sends no Stop when a turn is interrupted; an extension's
+// post can fail), so the session read Working until its next prompt. Once the
+// transcript has been written since and gone quiet, its end of turn stands --
+// and only that: not a guess that the agent is busy, not over an approval.
+func TestStaleHookRunningGivesWayToTheTranscript(t *testing.T) {
+	m, reg, _ := testManager(t)
+	path := filepath.Join(t.TempDir(), "s.jsonl")
+	if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h := &tailHandle{ref: path}
+	s := reg.Upsert("claude-code", "k", func(s *protocol.Session) { s.Attachment = protocol.AttachNative })
+	written := func(ago time.Duration) {
+		at := time.Now().Add(-ago)
+		if err := os.Chtimes(path, at, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hook := func(ago time.Duration) {
+		reg.SetState(s.ID, protocol.StateGuess{State: protocol.StateWaitingInput, Confidence: 1, At: time.Now()})
+		reg.SetState(s.ID, protocol.StateGuess{State: protocol.StateRunning, Confidence: 1, At: time.Now().Add(-ago)})
+	}
+	state := func() protocol.SessionState { got, _ := reg.Get(s.ID); return got.State }
+	done := []protocol.TranscriptEvent{{Kind: protocol.EventAssistantMessage, Text: "done"}}
+	interrupted := []protocol.TranscriptEvent{{Kind: protocol.EventUserMessage, Text: "[Request interrupted by user]"}}
+	busy := []protocol.TranscriptEvent{{Kind: protocol.EventToolCall, ToolName: "Bash"}}
+
+	// Written after the hook, quiet for two minutes: the turn is over.
+	hook(10 * time.Minute)
+	written(2 * time.Minute)
+	m.reinfer(s.ID, h, interrupted)
+	if state() != protocol.StateWaitingInput {
+		t.Fatalf("interrupted turn = %s", state())
+	}
+
+	// Quiet for only twenty seconds: an agent may be thinking; keep the hook.
+	hook(10 * time.Minute)
+	written(20 * time.Second)
+	m.reinfer(s.ID, h, done)
+	if state() != protocol.StateRunning {
+		t.Errorf("briefly quiet = %s", state())
+	}
+
+	// Nothing written since the hook: it is the newest word, a long tool.
+	hook(time.Minute)
+	written(10 * time.Minute)
+	m.reinfer(s.ID, h, done)
+	if state() != protocol.StateRunning {
+		t.Errorf("not written since = %s", state())
+	}
+
+	// The transcript says busy: that adds nothing to the hook.
+	hook(10 * time.Minute)
+	written(2 * time.Minute)
+	m.reinfer(s.ID, h, busy)
+	if got, _ := reg.Get(s.ID); got.State != protocol.StateRunning || got.Guess.Confidence != 1 {
+		t.Errorf("busy transcript replaced the hook: %+v", got.Guess)
 	}
 }

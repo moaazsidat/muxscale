@@ -200,3 +200,18 @@ func TestNoDatabaseIsNotAnError(t *testing.T) {
 }
 
 func mkdirAll(dir string) error { return os.MkdirAll(dir, 0o755) }
+
+// Regression: a prompt left behind a failed reply was never taken up, and the
+// session read as working on it for good. OpenCode starts its reply's row at
+// once, so one still missing after a minute means nothing is working on it.
+func TestUnansweredPromptIsNotWork(t *testing.T) {
+	if g, _ := stateFromLifecycle(lifeUser, 2*time.Second, 6*time.Second); g.State != protocol.StateRunning {
+		t.Errorf("just sent = %s", g.State)
+	}
+	if g, _ := stateFromLifecycle(lifeUser, 30*time.Second, 6*time.Second); g.State != protocol.StateRunning {
+		t.Errorf("thirty seconds = %s", g.State)
+	}
+	if g, _ := stateFromLifecycle(lifeUser, 5*time.Minute, 6*time.Second); g.State != protocol.StateWaitingInput {
+		t.Errorf("five minutes unanswered = %s", g.State)
+	}
+}

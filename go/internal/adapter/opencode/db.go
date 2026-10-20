@@ -368,6 +368,10 @@ func lifecycle(any bool, m storedMessage, parts []storedPart) string {
 
 // stateFromLifecycle is inference from the database: below the server event
 // stream's 1.0, because a row is a record of what happened, not a report.
+// unansweredAfter is how long a prompt may sit with no reply started before
+// the session is taken to be idle rather than working on it.
+const unansweredAfter = 60 * time.Second
+
 func stateFromLifecycle(life string, idle, quiescence time.Duration) (protocol.StateGuess, bool) {
 	now := time.Now()
 	g := func(s protocol.SessionState, c float64, reason string) (protocol.StateGuess, bool) {
@@ -391,6 +395,12 @@ func stateFromLifecycle(life string, idle, quiescence time.Duration) (protocol.S
 	case lifeUser:
 		if idle < quiescence {
 			return g(protocol.StateRunning, 0.6, "a prompt was just sent")
+		}
+		if idle >= unansweredAfter {
+			// OpenCode writes its reply's row the moment it starts on a
+			// prompt (11 ms in 1.18.33), so a prompt still without one is not
+			// being worked on: left behind a failed reply, say.
+			return g(protocol.StateWaitingInput, 0.55, "a prompt has gone unanswered; OpenCode is not working on it")
 		}
 		return g(protocol.StateRunning, 0.5, "a prompt is waiting for an answer")
 	}

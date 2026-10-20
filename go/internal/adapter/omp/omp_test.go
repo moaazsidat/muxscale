@@ -264,3 +264,21 @@ func TestSessionIDFromPath(t *testing.T) {
 		}
 	}
 }
+
+// Regression: omp writes its compaction entry when compaction is done, and
+// after a /compact nothing follows until the person types. Read as "omp is
+// compacting", a session sat in Working all night.
+func TestCompactionDoneThenQuietIsWaiting(t *testing.T) {
+	compacted := []protocol.TranscriptEvent{
+		{Kind: protocol.EventAssistantMessage, Text: "done"},
+		{Kind: protocol.EventCompaction, Text: "Resume …"},
+	}
+	quiet := adapter.StateInput{Recent: compacted, Idle: time.Hour, Quiescence: 6 * time.Second, Live: new(true)}
+	if g, ok := (&Adapter{}).InferState(quiet); !ok || g.State != protocol.StateWaitingInput {
+		t.Fatalf("quiet after compaction = %+v, ok=%v", g, ok)
+	}
+	just := adapter.StateInput{Recent: compacted, Idle: time.Second, Quiescence: 6 * time.Second, Live: new(true)}
+	if g, _ := (&Adapter{}).InferState(just); g.State != protocol.StateRunning {
+		t.Fatalf("just compacted = %+v", g)
+	}
+}
