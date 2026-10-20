@@ -97,3 +97,26 @@ func TestQueueAcrossPollsAndSeekEnd(t *testing.T) {
 		t.Fatalf("rebuilt = %q", got)
 	}
 }
+
+// A message taken mid-turn leaves the queue through "remove" and reaches the
+// conversation only as a queued_command attachment (Claude Code 2.1.293). It
+// must show as the person's message; a task notification must not.
+func TestMidTurnMessageShowsInTheConversation(t *testing.T) {
+	lines := []string{
+		qop("enqueue", "Can cloudflare support this fine?"),
+		qop("remove", "Can cloudflare support this fine?"),
+		`{"type":"attachment","uuid":"a1","parentUuid":"p0","sessionId":"s","timestamp":"2026-10-20T01:05:10.047Z","attachment":{"type":"queued_command","prompt":"Can cloudflare support this fine?","commandMode":"prompt","origin":{"kind":"human"},"humanTurn":true}}`,
+		`{"type":"attachment","uuid":"a2","sessionId":"s","timestamp":"2026-10-20T01:05:11Z","attachment":{"type":"queued_command","prompt":"<task-notification>done</task-notification>","commandMode":"task-notification"}}`,
+		`{"type":"attachment","uuid":"a3","sessionId":"s","timestamp":"2026-10-20T01:05:12Z","attachment":{"type":"edited_text_file","filename":"x"}}`,
+	}
+	events, meta, err := ParseTranscript(strings.NewReader(strings.Join(lines, "\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := texts(t, meta); len(got) != 0 {
+		t.Errorf("queue = %q", got)
+	}
+	if len(events) != 1 || events[0].Kind != "user_message" || events[0].Text != "Can cloudflare support this fine?" || events[0].ID != "a1" {
+		t.Fatalf("events = %+v", events)
+	}
+}

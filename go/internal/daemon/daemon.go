@@ -285,8 +285,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 // kept only in part -- a few hundred events of a few thousand. The files
 // still hold all of it. Run before any tailer starts, so none is appending
 // while a transcript is swapped.
+//
+// v2: messages Claude Code took in the middle of a turn are recorded only as
+// queued_command attachments, which the parser skipped, so every one of them
+// was missing from stored history. Reading again puts them back.
 func rereadTranscriptsOnce(st *store.Store) (int, error) {
-	const flag = "once:transcripts-reread-v1"
+	const flag = "once:transcripts-reread-v2"
 	if done, _ := st.Setting(flag); done != "" {
 		return 0, nil
 	}

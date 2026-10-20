@@ -51,6 +51,13 @@ type entry struct {
 	// queue-operation entries; see queue.go.
 	Operation string          `json:"operation"`
 	Content   json.RawMessage `json:"content"`
+
+	// Attachment is an attachment entry's body; only queued_command is read.
+	Attachment *struct {
+		Type        string `json:"type"`
+		Prompt      string `json:"prompt"`
+		CommandMode string `json:"commandMode"`
+	} `json:"attachment"`
 }
 
 // message is the Anthropic Messages API shape as persisted.
@@ -159,7 +166,26 @@ func parseTranscript(r io.Reader, q *queue) ([]protocol.TranscriptEvent, Meta, e
 			_ = json.Unmarshal(e.Content, &content)
 			q.apply(e.Operation, content, parseTime(e.Timestamp))
 			continue
-		case "mode", "permission-mode", "file-history-snapshot", "attachment", "system":
+		case "attachment":
+			// A message typed while Claude Code was working, which it took
+			// in the middle of the turn (at a tool result) instead of as the
+			// next prompt. It is recorded only as this attachment, never as a
+			// user entry, so without this the person's message left the
+			// queue and appeared nowhere in the conversation. Claude Code's
+			// own task notifications ride the same attachment and are not
+			// the person's words.
+			if a := e.Attachment; a != nil && a.Type == "queued_command" && a.CommandMode == "prompt" && strings.TrimSpace(a.Prompt) != "" {
+				seq++
+				ev := protocol.TranscriptEvent{
+					ID: e.UUID, ParentID: e.ParentUUID, SessionID: e.SessionID,
+					At: parseTime(e.Timestamp), IsSidechain: e.IsSidechain,
+					Kind: protocol.EventUserMessage, Seq: seq,
+				}
+				ev.Text, ev.Truncated = clip(strings.TrimSpace(a.Prompt))
+				events = append(events, ev)
+			}
+			continue
+		case "mode", "permission-mode", "file-history-snapshot", "system":
 			continue
 		}
 
