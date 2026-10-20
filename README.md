@@ -71,11 +71,14 @@ Code, Kiro CLI and IBM Bob are read too, most of them not yet verified against a
 
 ## Quick start
 
-```bash
-cd go && go build -o muxscale ./cmd/muxscale
+You need a Mac or Linux machine, an iPhone, and [Tailscale](https://tailscale.com) on both,
+signed in to the same account, with HTTPS turned on for the tailnet (`connect` says if not).
 
-./muxscale up                # start muxscale now and at every login
-./muxscale connect           # serve it to your phone, and show the QR code to scan
+```bash
+curl -fsSL https://muxscale.com/install.sh | sh   # or: cd go && go build -o muxscale ./cmd/muxscale
+
+muxscale up                  # start muxscale now and at every login
+muxscale connect             # serve it to your phone, and show the QR code to scan
 ```
 
 That is the whole setup. Your running agents appear in `muxscale ls` within seconds, with
@@ -210,6 +213,18 @@ adapters/   signed manifests
 fixtures/   shared test data across implementations
 docs/       spec + docs site source
 ```
+
+## Releases
+
+`tools/release.sh 0.1.0` builds every platform, signs each tarball with the release key, uploads
+them to the `muxscale-dl` R2 bucket behind dl.muxscale.com, and moves the `stable` channel to the
+new version, which is what `install.sh` (served from `site/public/`) installs. `--no-promote` uploads
+without moving the channel; `--dry-run` only builds and signs into `dist/release/`.
+
+The signing key is `~/.minisign/muxscale.key`, its password in the macOS Keychain as
+`muxscale-release-minisign`. The public key is `tools/minisign.pub` and is baked into `install.sh`;
+the script refuses to release if the two differ. Lose the private key and existing installs can no
+longer verify new releases, so keep a backup of both the key file and its password.
 
 ## Tests
 
