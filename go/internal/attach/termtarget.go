@@ -13,16 +13,18 @@ import (
 // TermTarget is an adopted terminal pane: somewhere muxscale can type and
 // read, owned by an emulator rather than by muxscale.
 //
-// Only iTerm2 is wired up. kitty and WezTerm have equivalent scripting
-// interfaces and their send/read calls already exist in this package, but
-// neither joins a pane to a process by tty the way iTerm2 does -- kitty
-// reports foreground pids, WezTerm reports neither -- so adopting them needs a
-// different join and is not done here. DetectTerminals still reports their
-// capability, because `muxscale status` should say what a machine could do.
+// iTerm2 and kitty are wired up. iTerm2 reports each pane's tty; kitty
+// reports the pid it started in each window, whose tty is the window's.
+// WezTerm reports neither, so adopting it needs a different join and is not
+// done here. DetectTerminals still reports its capability, because
+// `muxscale status` should say what a machine could do.
 type TermTarget struct {
 	Kind TermKind
 	// ID is the emulator's own handle for the pane.
 	ID string
+	// Socket is the remote-control socket of the kitty instance that owns the
+	// pane; kitty window ids are only unique within one instance.
+	Socket string
 	// TTY is what the pane owned when it was adopted. Carried so a write can
 	// confirm the pane is still the one that was meant; see ITerm2SendText.
 	TTY string
@@ -59,6 +61,12 @@ func (t TermTarget) SendText(data []byte) error {
 	case TermITerm2:
 		err := ITerm2SendText(t.ID, t.TTY, data)
 		return markStale(err)
+	case TermKitty:
+		id, err := strconv.Atoi(t.ID)
+		if err != nil {
+			return err
+		}
+		return markStale(KittySendText(t.Socket, id, data))
 	}
 	return fmt.Errorf("muxscale cannot type into %s panes", t.Kind)
 }
@@ -69,6 +77,13 @@ func (t TermTarget) Text() (string, error) {
 	case TermITerm2:
 		s, err := ITerm2Text(t.ID)
 		return s, markStale(err)
+	case TermKitty:
+		id, err := strconv.Atoi(t.ID)
+		if err != nil {
+			return "", err
+		}
+		b, err := KittyGetText(t.Socket, id, false)
+		return string(b), markStale(err)
 	}
 	return "", fmt.Errorf("muxscale cannot read %s panes", t.Kind)
 }
@@ -112,7 +127,11 @@ func markStale(err error) error {
 	m := err.Error()
 	if strings.Contains(m, "has been closed") ||
 		strings.Contains(m, "no longer on") ||
-		strings.Contains(m, "no such session") {
+		strings.Contains(m, "no such session") ||
+		// kitty: the window closed, or the whole instance exited.
+		strings.Contains(m, "No matching windows") ||
+		strings.Contains(m, "No such file or directory") ||
+		strings.Contains(m, "Connection refused") {
 		return fmt.Errorf("%w: %s", errTargetStale, m)
 	}
 	return err
@@ -138,16 +157,91 @@ func DevPath(tty string) string {
 // a terminal pane both know, exactly and independently. Titles are guesses and
 // working directories are shared by half a dozen windows at a time.
 func AdoptableTerminalPanes() (map[string]TermTarget, error) {
+	out := map[string]TermTarget{}
+	var errs []error
+	if iTermInstalled() {
+		if err := addITerm2Panes(out); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := addKittyPanes(out); err != nil {
+		errs = append(errs, err)
+	}
+	if len(out) == 0 && len(errs) > 0 {
+		return nil, errors.Join(errs...)
+	}
+	return out, nil
+}
+
+func addITerm2Panes(out map[string]TermTarget) error {
 	sessions, err := ITerm2Sessions()
 	if err != nil {
-		return nil, err
+		return err
 	}
-	out := make(map[string]TermTarget, len(sessions))
 	for _, s := range sessions {
 		if s.TTY == "" || !strings.HasPrefix(s.TTY, "/dev/") {
 			continue // a session with no pane of its own, e.g. one still starting
 		}
 		out[s.TTY] = TermTarget{Kind: TermITerm2, ID: s.ID, TTY: s.TTY}
 	}
-	return out, nil
+	return nil
+}
+
+// addKittyPanes adds the windows of every kitty instance muxscale can reach.
+// An instance that does not answer is skipped -- a socket left behind by a
+// kitty that crashed looks exactly like that -- and only reported when none
+// did.
+func addKittyPanes(out map[string]TermTarget) error {
+	if _, err := exec.LookPath("kitty"); err != nil {
+		return nil
+	}
+	var firstErr error
+	for _, sock := range KittySockets() {
+		wins, err := KittyWindows(sock)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		firstErr = nil
+		pids := make([]int, 0, len(wins))
+		for _, w := range wins {
+			if w.Pid > 0 {
+				pids = append(pids, w.Pid)
+			}
+		}
+		ttys := processTTYs(pids)
+		for _, w := range wins {
+			dev := DevPath(ttys[w.Pid])
+			if dev == "" {
+				continue
+			}
+			out[dev] = TermTarget{Kind: TermKitty, ID: strconv.Itoa(w.ID), Socket: sock, TTY: dev}
+		}
+	}
+	return firstErr
+}
+
+// processTTYs maps each pid to its controlling tty as `ps` names it.
+func processTTYs(pids []int) map[int]string {
+	out := map[int]string{}
+	if len(pids) == 0 {
+		return out
+	}
+	list := make([]string, len(pids))
+	for i, p := range pids {
+		list[i] = strconv.Itoa(p)
+	}
+	data, _ := exec.Command("ps", "-o", "pid=,tty=", "-p", strings.Join(list, ",")).Output()
+	for _, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) != 2 {
+			continue
+		}
+		if pid, err := strconv.Atoi(f[0]); err == nil {
+			out[pid] = f[1]
+		}
+	}
+	return out
 }

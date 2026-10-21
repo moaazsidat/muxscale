@@ -1,11 +1,14 @@
 package attach
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // termctl adopts sessions through a terminal emulator's own remote-control API.
@@ -51,13 +54,18 @@ func detectKitty() TermCapability {
 		return c
 	}
 	c.Available = true
-	// `kitty @ ls` is the cheapest call that proves remote control is on.
-	if err := exec.Command("kitty", "@", "ls").Run(); err != nil {
-		c.Reason = "kitty remote control is disabled"
-		c.HowToFix = "add `allow_remote_control yes` and `listen_on unix:/tmp/kitty` to kitty.conf, then restart kitty"
-		return c
+	// `kitty @ ls` is the cheapest call that proves remote control is on. It
+	// goes to a socket by name: the daemon usually runs under a service
+	// manager, outside any kitty window, where a bare `kitty @` has nothing
+	// to talk to.
+	for _, sock := range KittySockets() {
+		if _, err := kittyCmd(sock, "ls"); err == nil {
+			c.Enabled = true
+			return c
+		}
 	}
-	c.Enabled = true
+	c.Reason = "kitty remote control is disabled, or no kitty is running with a socket muxscale can find"
+	c.HowToFix = "add `allow_remote_control yes` and `listen_on unix:/tmp/kitty` to kitty.conf, then restart kitty"
 	return c
 }
 
@@ -130,39 +138,168 @@ type KittyPane struct {
 	Title   string
 	Cwd     string
 	Command string
+	// Pid is the process kitty started in the window, usually a shell. Its
+	// tty is the window's, which is how a window is joined to an agent.
+	Pid int
 }
 
-// KittyWindows lists kitty windows via its remote-control API.
-func KittyWindows() ([]KittyPane, error) {
-	out, err := exec.Command("kitty", "@", "ls").Output()
+// kittyTimeout bounds a remote-control call, so a hung kitty stalls one scan
+// rather than the daemon.
+const kittyTimeout = 3 * time.Second
+
+// kittyCmd runs `kitty @ --to sock args...`.
+func kittyCmd(sock string, args ...string) ([]byte, error) {
+	return kittyCmdInput(sock, nil, args...)
+}
+
+func kittyCmdInput(sock string, stdin []byte, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), kittyTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "kitty", append([]string{"@", "--to", sock}, args...)...)
+	if stdin != nil {
+		cmd.Stdin = bytes.NewReader(stdin)
+	}
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("kitty did not answer within %s", kittyTimeout)
+		}
+		return nil, fmt.Errorf("kitty @ %s: %w: %s", args[0], err, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.Bytes(), nil
+}
+
+// KittySockets lists the remote-control sockets of running kitty instances.
+//
+// A daemon started by a service manager does not inherit KITTY_LISTEN_ON, and
+// kitty appends its own pid to a `listen_on` path from kitty.conf, so the
+// sockets are found from the configured path: /tmp/kitty in the config is
+// /tmp/kitty-417300 on disk, one per kitty instance.
+func KittySockets() []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(s string) {
+		if s != "" && !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	add(os.Getenv("KITTY_LISTEN_ON"))
+	listen := kittyConfListenOn()
+	switch {
+	case listen == "" || listen == "none":
+	case strings.HasPrefix(listen, "unix:@"):
+		for _, name := range abstractSockets(kittySocketPattern(strings.TrimPrefix(listen, "unix:"))) {
+			add("unix:" + name)
+		}
+	case strings.HasPrefix(listen, "unix:"):
+		path := os.ExpandEnv(strings.TrimPrefix(listen, "unix:"))
+		if strings.HasPrefix(path, "~/") {
+			if home, err := os.UserHomeDir(); err == nil {
+				path = filepath.Join(home, path[2:])
+			}
+		}
+		matches, _ := filepath.Glob(kittySocketPattern(path))
+		if !strings.Contains(path, "{kitty_pid}") {
+			matches = append([]string{path}, matches...)
+		}
+		for _, m := range matches {
+			if fi, err := os.Stat(m); err == nil && fi.Mode()&os.ModeSocket != 0 {
+				add("unix:" + m)
+			}
+		}
+	default:
+		add(listen) // tcp: kitty uses it as given
+	}
+	return out
+}
+
+// kittySocketPattern turns a configured socket path into a glob for the ones
+// kitty actually creates: {kitty_pid} stands for the pid, and a path without
+// it gets -<pid> appended.
+func kittySocketPattern(path string) string {
+	if strings.Contains(path, "{kitty_pid}") {
+		return strings.ReplaceAll(path, "{kitty_pid}", "*")
+	}
+	return path + "-*"
+}
+
+// abstractSockets lists Linux abstract-namespace sockets matching a glob,
+// written with their leading @.
+func abstractSockets(pattern string) []string {
+	data, err := os.ReadFile("/proc/net/unix")
 	if err != nil {
-		return nil, fmt.Errorf("kitty @ ls: %w", err)
+		return nil
+	}
+	var out []string
+	for _, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 8 {
+			continue
+		}
+		if ok, _ := filepath.Match(pattern, f[len(f)-1]); ok {
+			out = append(out, f[len(f)-1])
+		}
+	}
+	return out
+}
+
+// kittyConfListenOn is the listen_on value from kitty.conf; the last one wins,
+// as in kitty.
+func kittyConfListenOn() string {
+	dir := os.Getenv("KITTY_CONFIG_DIRECTORY")
+	if dir == "" {
+		if x := os.Getenv("XDG_CONFIG_HOME"); x != "" {
+			dir = filepath.Join(x, "kitty")
+		} else if home, err := os.UserHomeDir(); err == nil {
+			dir = filepath.Join(home, ".config", "kitty")
+		}
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "kitty.conf"))
+	if err != nil {
+		return ""
+	}
+	return parseListenOn(string(data))
+}
+
+func parseListenOn(conf string) string {
+	listen := ""
+	for _, line := range strings.Split(conf, "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 2 && f[0] == "listen_on" {
+			listen = f[1]
+		}
+	}
+	return listen
+}
+
+// KittyWindows lists the windows of the kitty listening on sock.
+func KittyWindows(sock string) ([]KittyPane, error) {
+	out, err := kittyCmd(sock, "ls")
+	if err != nil {
+		return nil, err
 	}
 	return parseKittyLS(out)
 }
 
-// KittySendText injects text into a kitty window.
-func KittySendText(windowID int, data []byte) error {
-	cmd := exec.Command("kitty", "@", "send-text",
-		"--match", fmt.Sprintf("id:%d", windowID), "--stdin")
-	cmd.Stdin = strings.NewReader(string(data))
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("kitty send-text: %w: %s", err, strings.TrimSpace(string(out)))
+// KittySendText types data into a kitty window. Nothing is appended; see
+// ITerm2SendText.
+func KittySendText(sock string, windowID int, data []byte) error {
+	if len(data) == 0 {
+		return nil
 	}
-	return nil
+	_, err := kittyCmdInput(sock, data, "send-text", "--match", fmt.Sprintf("id:%d", windowID), "--stdin")
+	return err
 }
 
 // KittyGetText reads a kitty window's contents.
-func KittyGetText(windowID int, includeScrollback bool) ([]byte, error) {
-	args := []string{"@", "get-text", "--match", fmt.Sprintf("id:%d", windowID)}
+func KittyGetText(sock string, windowID int, includeScrollback bool) ([]byte, error) {
+	args := []string{"get-text", "--match", fmt.Sprintf("id:%d", windowID)}
 	if includeScrollback {
 		args = append(args, "--extent", "all")
 	}
-	out, err := exec.Command("kitty", args...).Output()
-	if err != nil {
-		return nil, fmt.Errorf("kitty get-text: %w", err)
-	}
-	return out, nil
+	return kittyCmd(sock, args...)
 }
 
 // WezTermPane is a wezterm pane.

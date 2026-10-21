@@ -11,6 +11,7 @@ func parseKittyLS(data []byte) ([]KittyPane, error) {
 		Tabs []struct {
 			Windows []struct {
 				ID                  int    `json:"id"`
+				Pid                 int    `json:"pid"`
 				Title               string `json:"title"`
 				Cwd                 string `json:"cwd"`
 				ForegroundProcesses []struct {
@@ -28,7 +29,7 @@ func parseKittyLS(data []byte) ([]KittyPane, error) {
 	for _, osw := range osWindows {
 		for _, tab := range osw.Tabs {
 			for _, w := range tab.Windows {
-				p := KittyPane{ID: w.ID, Title: w.Title, Cwd: w.Cwd}
+				p := KittyPane{ID: w.ID, Title: w.Title, Cwd: w.Cwd, Pid: w.Pid}
 				if len(w.ForegroundProcesses) > 0 {
 					fp := w.ForegroundProcesses[0]
 					if len(fp.Cmdline) > 0 {

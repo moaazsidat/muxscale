@@ -71,3 +71,35 @@ func TestSampledNoticeIsHonest(t *testing.T) {
 		t.Errorf("SampledNotice should say plainly that it is not live: %q", SampledNotice)
 	}
 }
+
+func TestParseListenOn(t *testing.T) {
+	conf := "# listen_on none\nlisten_on unix:/tmp/old\nallow_remote_control yes\nlisten_on unix:/tmp/kitty\n"
+	if got := parseListenOn(conf); got != "unix:/tmp/kitty" {
+		t.Errorf("last listen_on should win, got %q", got)
+	}
+	if got := parseListenOn("# listen_on unix:/tmp/kitty\n"); got != "" {
+		t.Errorf("a commented line is not a setting, got %q", got)
+	}
+}
+
+func TestKittySocketPattern(t *testing.T) {
+	// kitty appends -<pid> to a configured path unless it places the pid itself.
+	if got := kittySocketPattern("/tmp/kitty"); got != "/tmp/kitty-*" {
+		t.Errorf("plain path: %q", got)
+	}
+	if got := kittySocketPattern("/run/kitty-{kitty_pid}.sock"); got != "/run/kitty-*.sock" {
+		t.Errorf("templated path: %q", got)
+	}
+}
+
+func TestParseKittyLSWindowPid(t *testing.T) {
+	sample := `[{"tabs":[{"windows":[{"id": 2, "pid": 417858, "title": "x",
+	   "foreground_processes": [{"pid": 425302, "cmdline": ["claude"]}]}]}]}]`
+	panes, err := parseKittyLS([]byte(sample))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if panes[0].Pid != 417858 {
+		t.Errorf("window pid = %d, want the window's own process, not the foreground one", panes[0].Pid)
+	}
+}
