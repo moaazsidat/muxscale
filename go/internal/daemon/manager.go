@@ -726,6 +726,47 @@ func (m *Manager) SendInput(sessionID string, text string, key attach.NamedKey, 
 	return nil
 }
 
+// Interrupt stops what the session is doing, the way a person at its terminal
+// would: Esc for an agent's TUI, which every one muxscale reads treats as "stop
+// this turn" (Claude Code, Codex, omp, OpenCode, Gemini CLI, Copilot CLI), and
+// Ctrl-C for a shell. The client says "interrupt" and the daemon picks the key,
+// so an agent that needs something else is a change here, not in every client.
+//
+// Not fenced: an interrupt is aimed at whatever is running now, and a turn that
+// moved on since the button was drawn is exactly the thing to stop. Refused
+// while an approval is pending, where Esc would answer the prompt behind
+// muxscale's back while the hook still holds it open; deny it instead.
+func (m *Manager) Interrupt(sessionID, actor string) error {
+	sess, ok := m.reg.Get(sessionID)
+	if !ok {
+		return fmt.Errorf("unknown session %s", sessionID)
+	}
+	switch sess.State {
+	case protocol.StateExited, protocol.StateCrashed:
+		return fmt.Errorf("the session has ended")
+	case protocol.StateWaitingApproval:
+		return fmt.Errorf("the agent is waiting on an approval; deny it to stop")
+	}
+	key := interruptKey(sess.AgentID)
+	b, err := attach.EncodeKeyMode(key, m.appCursor(sessionID))
+	if err != nil {
+		return err
+	}
+	if err := m.deliver(sessionID, b); err != nil {
+		return err
+	}
+	_ = m.store.Audit(actor, "interrupt", sessionID, "key="+string(key))
+	return nil
+}
+
+// interruptKey is the key that stops a session's current work.
+func interruptKey(agentID string) attach.NamedKey {
+	if agentID == ShellAgentID {
+		return attach.KeyCtrlC
+	}
+	return attach.KeyEscape
+}
+
 // SendRaw writes bytes to a session's terminal exactly as given: a keystroke
 // from a terminal on the phone, which is not a reply to an agent and so is
 // neither fenced nor normalised. Arrow keys arrive as named keys through

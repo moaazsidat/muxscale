@@ -370,3 +370,58 @@ func TestTypedKeysReachTheShellAsTyped(t *testing.T) {
 	g, _ := m.ScreenClone(sh.ID)
 	t.Fatalf("the command did not run:\n%s", g.Text())
 }
+
+// An interrupt reaches a shell as Ctrl-C: a command that would run for half a
+// minute stops, and the next one runs at once.
+func TestInterruptStopsWhatIsRunning(t *testing.T) {
+	m, reg, _ := testManager(t)
+	parent := agentSession(t, reg, t.TempDir())
+	sh, err := m.RunShell(parent.ID, 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { waitForShellExit(t, m, sh.ID) })
+
+	if err := m.SendRaw(sh.ID, []byte("sleep 30\r"), "test"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if err := m.Interrupt(sh.ID, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SendRaw(sh.ID, []byte("echo back-$((1+1))\r"), "test"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if g, ok := m.ScreenClone(sh.ID); ok && strings.Contains(g.Text(), "back-2") {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	g, _ := m.ScreenClone(sh.ID)
+	t.Fatalf("the sleep was not interrupted:\n%s", g.Text())
+}
+
+func TestInterruptKeyPerAgent(t *testing.T) {
+	for agent, want := range map[string]attach.NamedKey{
+		"claude-code": attach.KeyEscape,
+		"codex":       attach.KeyEscape,
+		"opencode":    attach.KeyEscape,
+		ShellAgentID:  attach.KeyCtrlC,
+	} {
+		if got := interruptKey(agent); got != want {
+			t.Errorf("%s: interrupt with %q, want %q", agent, got, want)
+		}
+	}
+}
+
+// Esc at a held permission prompt would answer it behind the hook's back.
+func TestInterruptRefusedWhileAnApprovalIsPending(t *testing.T) {
+	m, reg, _ := testManager(t)
+	s := agentSession(t, reg, t.TempDir())
+	reg.SetState(s.ID, protocol.StateGuess{State: protocol.StateWaitingApproval, Confidence: 1, At: time.Now()})
+	if err := m.Interrupt(s.ID, "test"); err == nil || !strings.Contains(err.Error(), "deny") {
+		t.Fatalf("got %v, want a refusal that says to deny", err)
+	}
+}

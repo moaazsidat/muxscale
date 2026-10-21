@@ -564,6 +564,32 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 		writeJSON(w, map[string]bool{"delivered": true})
 	})
 
+	// POST /v1/sessions/interrupt {"session_id":"..."}: stop the current turn.
+	// The daemon picks the key; see Manager.Interrupt.
+	d.handle(mux, "/v1/sessions/interrupt", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			SessionID string `json:"session_id"`
+			By        string `json:"by"`
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		actor := body.By
+		if actor == "" {
+			actor = "cli"
+		}
+		if err := d.mgr.Interrupt(body.SessionID, actor); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, map[string]bool{"delivered": true})
+	})
+
 	// POST /v1/sessions/rename {"session_id":"...","name":"..."}; an empty
 	// name clears it.
 	d.handle(mux, "/v1/sessions/rename", func(w http.ResponseWriter, r *http.Request) {
