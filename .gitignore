@@ -13,8 +13,9 @@ dist/
 # Rust build output
 rust/target/
 
-# Node dependencies.
+# Node dependencies, and Wrangler's cache from tools/release.sh.
 node_modules/
+.wrangler/
 
 # Key and certificate material. Nothing here is tracked and nothing should be.
 #

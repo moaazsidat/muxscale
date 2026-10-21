@@ -111,7 +111,9 @@ if [ "$dry" = 1 ]; then
   exit 0
 fi
 
-wrangler() { (cd "$root/site" && npx wrangler "$@"); }
+# Pinned, so a release does not depend on whatever Wrangler a checkout has.
+# Uses the account `wrangler login` signed in to.
+wrangler() { npx --yes wrangler@4.126.0 "$@"; }
 
 for f in "$out"/muxscale_*; do
   name=$(basename "$f")
