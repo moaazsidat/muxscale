@@ -1,6 +1,7 @@
 package tsnode
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -27,5 +28,14 @@ func TestHTTPSProblem(t *testing.T) {
 	}
 	if p := httpsProblem(&ipnstate.Status{BackendState: "NeedsLogin"}); p != "" {
 		t.Errorf("not up yet is not a verdict: %q", p)
+	}
+}
+
+func TestCertProblem(t *testing.T) {
+	if p := certProblem(errors.New("Access denied: cert access denied")); !strings.Contains(p, "--operator=$USER") {
+		t.Errorf("denied: %q", p)
+	}
+	if p := certProblem(errors.New("timeout")); !strings.Contains(p, DNSAdminURL) {
+		t.Errorf("other failure: %q", p)
 	}
 }

@@ -217,11 +217,21 @@ func (s *SystemNode) Status(ctx context.Context) (Status, error) {
 	out.Login = selfLogin(st)
 	out.HTTPSProblem = httpsProblem(st)
 	if out.HTTPSProblem == "" && s.certErr != nil {
-		// The tailnet allows certificates but this one was not issued: a
-		// Tailscale too old to fetch one, or control unreachable just then.
-		out.HTTPSProblem = "Tailscale would not issue this machine a certificate (" +
-			s.certErr.Error() + "). Check HTTPS is on at " + DNSAdminURL +
-			", then restart muxscale (`muxscale up`)"
+		out.HTTPSProblem = certProblem(s.certErr)
 	}
 	return out, nil
+}
+
+// certProblem explains a certificate the tailnet allows but tailscaled did not
+// hand over. The common case on Linux is the daemon refusing a non-root caller
+// that is not its operator; otherwise a Tailscale too old to fetch one, or
+// control unreachable just then.
+func certProblem(err error) string {
+	if strings.Contains(err.Error(), "access denied") {
+		return "Tailscale would not issue this machine a certificate (" + err.Error() +
+			"): tailscaled only gives certificates to root or its operator. Run " +
+			"`sudo tailscale set --operator=$USER` once, then restart muxscale (`muxscale up`)"
+	}
+	return "Tailscale would not issue this machine a certificate (" + err.Error() +
+		"). Check HTTPS is on at " + DNSAdminURL + ", then restart muxscale (`muxscale up`)"
 }
