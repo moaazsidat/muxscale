@@ -271,8 +271,12 @@ func (r *Registry) SetState(sessionID string, g protocol.StateGuess) bool {
 		// lost with it, and showing it as still to come would mislead.
 		s.Queued = nil
 	}
-	s.StateSince = time.Now()
-	s.LastEventAt = s.StateSince
+	now := time.Now()
+	s.StateSince = now
+	if !g.Since.IsZero() && g.Since.Before(now) {
+		s.StateSince = g.Since
+	}
+	s.LastEventAt = now
 	cp := *s
 	r.broadcast(Change{Kind: ChangeStateChange, Session: &cp, Prev: prev})
 	return true

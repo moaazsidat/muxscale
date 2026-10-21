@@ -62,6 +62,12 @@ type StateGuess struct {
 	Reason     string       `json:"reason"`
 	Evidence   string       `json:"evidence,omitempty"`
 	At         time.Time    `json:"at"`
+
+	// Since is when the evidence says the state began, when that is earlier
+	// than the guess: a transcript read says the agent went quiet when it
+	// last wrote, not when the daemon happened to look. Zero means now. It
+	// becomes the session's StateSince and is not sent on its own.
+	Since time.Time `json:"-"`
 }
 
 // Session is the daemon's view of one agent conversation.

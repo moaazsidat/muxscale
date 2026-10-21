@@ -1877,6 +1877,13 @@ func (m *Manager) infer(sessionID string, h *tailHandle, events []protocol.Trans
 		// that the agent is still busy adds nothing to its own word.
 		return protocol.StateGuess{}, false
 	}
+	if ok && g.State.Waiting() && len(events) > 0 {
+		// A transcript read can come long after the agent stopped -- after a
+		// restart, or after something touched the file and it looked busy for
+		// a moment. The agent started waiting when it last wrote, and that is
+		// what the phone orders its Needs you list by.
+		g.Since = events[len(events)-1].At
+	}
 	return g, ok
 }
 
