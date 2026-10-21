@@ -16,7 +16,7 @@ func TestConnectLinkRoundTrips(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Host "connect" is how expo-router sees muxscale://connect as the
-	// /connect route; app/src/lib/connect.ts depends on exactly this shape.
+	// /connect route; the app depends on exactly this shape.
 	if u.Scheme != "muxscale" || u.Host != "connect" {
 		t.Fatalf("link %q: scheme %q host %q", link, u.Scheme, u.Host)
 	}

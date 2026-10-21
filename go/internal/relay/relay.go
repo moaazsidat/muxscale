@@ -1,11 +1,10 @@
 // Package relay implements the rendezvous that carries traffic when a phone
 // cannot reach the daemon directly over the tailnet.
 //
-// This Go implementation is the reference and the test harness. Production runs
-// the same protocol as a Cloudflare Durable Object (see cloud/relay), one per
-// host, using WebSocket Hibernation so a daemon connected 24/7 but quiet for 23
-// hours costs nothing. Having both means the protocol can be tested end to end
-// locally, without deploying anything.
+// This Go implementation is the reference and the test harness. The hosted
+// relay runs the same protocol as a Cloudflare Durable Object, one per host.
+// Having both means the protocol can be tested end to end locally, without
+// deploying anything.
 //
 // The relay's job is deliberately small: authenticate both ends, check the
 // device is still permitted, and forward opaque frames. It cannot read what it

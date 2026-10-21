@@ -15,7 +15,7 @@
 //
 // The event half (an installed extension POSTing lifecycle events) only raises
 // the state confidence; it is not required for discovery, transcripts, or
-// metadata. Verified against omp 18.12.2; see docs/20261018-omp-adapter.md.
+// metadata. Verified against omp 18.12.2.
 package omp
 
 import (

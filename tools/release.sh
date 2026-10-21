@@ -1,6 +1,6 @@
 #!/bin/sh
 # Builds, signs and publishes a muxscale release to dl.muxscale.com, in the
-# layout site/public/install.sh reads:
+# layout install.sh reads:
 #
 #   channels/<channel>                          the version the channel is on
 #   <version>/muxscale_<version>_<os>-<arch>.tar.gz
@@ -52,8 +52,15 @@ out="$root/dist/release/$version"
 
 [ -f "$key" ] || die "no signing key at $key"
 pubkey=$(tail -n 1 "$pub")
-grep -q "$pubkey" "$root/site/public/install.sh" ||
+grep -q "$pubkey" "$root/install.sh" ||
   die "install.sh does not carry the key in tools/minisign.pub; installs would fail verification"
+# muxscale.com serves its own copy; point MUXSCALE_SERVED_INSTALL at it to
+# check the two match.
+served="${MUXSCALE_SERVED_INSTALL:-}"
+if [ -n "$served" ]; then
+  cmp -s "$root/install.sh" "$served" ||
+    die "$served differs from install.sh; copy it over and redeploy the site"
+fi
 command -v minisign >/dev/null || die "minisign is not installed (brew install minisign)"
 
 if [ "$dry" = 0 ] && [ -n "$(git -C "$root" status --porcelain -- go)" ]; then

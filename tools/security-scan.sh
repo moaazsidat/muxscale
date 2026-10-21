@@ -75,37 +75,6 @@ fi
 rm -f "$clippy_log"
 
 echo
-echo "=== pnpm: audit (app) ==="
-# The app has by far the largest dependency graph in the repo, and until it
-# existed there was nothing here to scan. Only production dependencies are
-# considered: a vulnerability in a test runner is not a vulnerability in a
-# shipped app.
-#
-# Advisories that are genuinely unreachable are listed in
-# tools/npm-audit-allow.txt with a reason and a date, rather than the threshold
-# being lowered or the whole scan skipped -- the same rule the secret sweep
-# follows with its `notasecret` markers. An advisory not on that list fails.
-if [ ! -d app/node_modules ]; then
-  echo "  skipped: app/node_modules is absent (run pnpm install in app/)"
-else
-  allow=tools/npm-audit-allow.txt
-  # `|| true` because both npm and pnpm exit non-zero when they find
-  # anything; the reviewer decides what counts, not the exit code.
-  audit_json=$(cd app && pnpm audit --prod --json 2>/dev/null || true)
-
-  # The reviewer exits 1 when it finds something *or* when it cannot make sense
-  # of the input, so a broken check fails loudly instead of reporting clean.
-  if unexpected=$(printf '%s' "$audit_json" | python3 tools/npm-audit-review.py "$allow"); then
-    echo "  no unreviewed advisories"
-  else
-    echo "  UNREVIEWED ADVISORY:"
-    printf '%s\n' "$unexpected" | sed 's|^|    |'
-    echo "  Fix it, or add the GHSA id to $allow with a reason if it is unreachable."
-    status=1
-  fi
-fi
-
-echo
 echo "=== secrets: nothing credential-shaped in tracked files ==="
 # A narrow, high-signal sweep. Broad entropy scanning belongs in a dedicated
 # tool; this exists to catch the specific mistake of committing a real key while

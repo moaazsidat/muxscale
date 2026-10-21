@@ -5,16 +5,15 @@ Monitor and unblock your coding agents from your phone.
 Agents run autonomously for minutes, then block — on a permission prompt, an ambiguous
 requirement, a failing test. You're away from the keyboard and the work is stranded behind
 an SSH session you can't comfortably reach. muxscale watches every agent session on your
-machines, notifies you the moment one blocks, and lets you unblock it with a sentence.
+machines, shows you which ones are blocked, and lets you unblock it with a sentence.
 
-**Status: M0 complete, M1 mostly complete.** Claude Code, omp, and Codex, terminal only —
-no phone app and no cloud yet. See [the technical spec](docs/20260729-technical-spec.md) for the full
-design, [§13 Milestones](docs/20260729-technical-spec.md#13-milestones) for what lands
-when, [the omp adapter spec](docs/20261018-omp-adapter.md), and [the Codex adapter
-spec](docs/20261018-codex-adapter.md). Adopting agents that are *already running* is specified and partly built in
-[the adoption spec](docs/20260925-adopting-existing-sessions.md). pi, OpenCode, Gemini CLI, GitHub Copilot CLI, Kimi
-Code, Kiro CLI and IBM Bob are read too, most of them not yet verified against a real install; see
-[more agents](docs/20261019-more-agents.md) for what each one gives and where its format came from.
+This repo is the open part of muxscale: the daemon and CLI, the agent adapters, the
+installer, and the protocol the iPhone app speaks (`go/internal/protocol`). Anything that
+speaks the daemon's API can be a client.
+
+Claude Code, omp, and Codex are fully supported. pi, OpenCode, Gemini CLI, GitHub Copilot CLI,
+Kimi Code, Kiro CLI and IBM Bob are read too, most of them not yet verified against a real
+install; `muxscale debug adapter <id>` checks one against this machine.
 
 ## What works today
 
@@ -207,18 +206,16 @@ go/         daemon + CLI
   internal/vt/                   headless VT emulator, grid diffing
   internal/protocol/             shared types
 rust/       client core: codec, crypto, grid model (M3)
-app/        Expo iOS/Android app (M3)
-cloud/      Workers control plane, relay, push notary (M2)
 adapters/   signed manifests
 fixtures/   shared test data across implementations
-docs/       spec + docs site source
+install.sh  the installer muxscale.com serves
 ```
 
 ## Releases
 
 `tools/release.sh 0.1.0` builds every platform, signs each tarball with the release key, uploads
 them to the `muxscale-dl` R2 bucket behind dl.muxscale.com, and moves the `stable` channel to the
-new version, which is what `install.sh` (served from `site/public/`) installs. `--no-promote` uploads
+new version, which is what `install.sh` (served at muxscale.com/install.sh) installs. `--no-promote` uploads
 without moving the channel; `--dry-run` only builds and signs into `dist/release/`.
 
 The signing key is `~/.minisign/muxscale.key`, its password in the macOS Keychain as

@@ -198,8 +198,8 @@ func httpsProblem(tn tailnetView) string {
 	return ""
 }
 
-// connectLink is the deep link the app opens. Its shape is mirrored in
-// app/src/lib/connect.ts; the two must agree.
+// connectLink is the deep link the app opens. The app parses exactly this
+// shape; changing it breaks scanning for every installed app.
 func connectLink(base string) string {
 	return "muxscale://connect?url=" + url.QueryEscape(base)
 }

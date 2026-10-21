@@ -8,7 +8,8 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/../rust"
-OUT="../app/modules/muxscale-core/generated"
+# The mobile app is not in this repo; say where its bindings directory is.
+OUT="${MUXSCALE_BINDINGS_OUT:?set MUXSCALE_BINDINGS_OUT to modules/muxscale-core/generated in the app}"
 
 cargo build --release --lib
 
