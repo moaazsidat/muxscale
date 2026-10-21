@@ -41,6 +41,13 @@ func cmdUp(args []string) error {
 		return err
 	}
 	_, alreadyUp := daemonReachable()
+	// A daemon answering while the service runs is the service's own, not a
+	// stray one; `up` restarts it so it picks up changes such as a newly
+	// issued certificate.
+	svc, _ := setup.ServiceStatus()
+	if svc.Running {
+		alreadyUp = false
+	}
 
 	plan, err := setup.BuildServicePlan(bin, false)
 	if err != nil {
@@ -48,6 +55,11 @@ func cmdUp(args []string) error {
 	}
 	if err := plan.Apply(); err != nil {
 		return fmt.Errorf("installing the %s service: %w", plan.Kind, err)
+	}
+	if svc.Running {
+		if err := setup.RestartService(); err != nil {
+			return fmt.Errorf("restarting the %s service: %w", plan.Kind, err)
+		}
 	}
 	fmt.Printf("Installed %s, which starts muxscale at login and restarts it if it exits.\n", plan.Path)
 	if hint := setup.LingerHint(); hint != "" {

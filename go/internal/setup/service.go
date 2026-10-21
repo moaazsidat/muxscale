@@ -287,6 +287,18 @@ func ServiceStatus() (Service, error) {
 	return Service{}, fmt.Errorf("unsupported platform %s", runtime.GOOS)
 }
 
+// RestartService restarts a running service. launchd needs nothing here:
+// Apply already unloads and reloads it, which restarts the daemon.
+func RestartService() error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	if out, err := exec.Command("systemctl", "--user", "restart", "muxscaled.service").CombinedOutput(); err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 // LingerHint explains how to make a systemd user service survive logout.
 // Worth surfacing explicitly: without it, the daemon dies when the user logs
 // out of an SSH session, which looks like muxscale randomly stopping.
