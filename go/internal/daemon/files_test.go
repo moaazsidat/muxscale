@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -330,5 +331,36 @@ func TestWritingStaysInTheProject(t *testing.T) {
 	}
 	if fi, _ := os.Lstat(filepath.Join(dir, "alias.md")); fi.Mode()&os.ModeSymlink == 0 {
 		t.Error("the link was replaced by a file")
+	}
+}
+
+// The index is what a person would search: the project's own files, without
+// what git ignores or a walk would drown in.
+func TestIndexListsTheProjectsOwnFiles(t *testing.T) {
+	d, mux := authDaemon(t)
+
+	repo := t.TempDir()
+	git(t, repo, "init", "-q", "-b", "main")
+	write(t, repo, ".gitignore", "dist/\n")
+	write(t, repo, "src/app.ts", "")
+	write(t, repo, "dist/app.js", "")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-q", "-m", "init")
+	write(t, repo, "src/new.ts", "") // untracked, not ignored
+	s := d.reg.Upsert("codex", "pid:1", func(s *protocol.Session) { s.Cwd = repo })
+	got := decode[protocol.FileIndex](t, getFiles(t, mux, "/v1/files/index", s.ID, ""))
+	sort.Strings(got.Files)
+	if strings.Join(got.Files, " ") != ".gitignore src/app.ts src/new.ts" {
+		t.Errorf("git index = %v", got.Files)
+	}
+
+	plain := t.TempDir()
+	write(t, plain, "notes/plan.md", "")
+	write(t, plain, "node_modules/x/index.js", "")
+	write(t, plain, ".git/config", "")
+	s2 := d.reg.Upsert("codex", "pid:2", func(s *protocol.Session) { s.Cwd = filepath.Join(plain, "notes") })
+	got = decode[protocol.FileIndex](t, getFiles(t, mux, "/v1/files/index", s2.ID, ""))
+	if strings.Join(got.Files, " ") != "notes/plan.md" {
+		t.Errorf("walked index = %v", got.Files)
 	}
 }

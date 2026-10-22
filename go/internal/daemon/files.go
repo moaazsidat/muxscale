@@ -49,6 +49,9 @@ const (
 	maxTextRead = 2 << 20
 	// maxRawRead caps a file sent as bytes, for an image.
 	maxRawRead = 16 << 20
+	// maxIndex caps a project's file index: enough for a large monorepo's
+	// source, and a couple of megabytes over the wire at most.
+	maxIndex = 50000
 	// maxChanges caps the changed-files list.
 	maxChanges = 500
 	// maxToolCalls is how many of a session's tool calls are read for the
@@ -260,6 +263,17 @@ func (d *Daemon) filesRoutes(mux *http.ServeMux) {
 		writeJSON(w, saved)
 	})
 
+	// GET /v1/files/index?session=ID -- every file, for search by name.
+	d.handle(mux, "/v1/files/index", func(w http.ResponseWriter, r *http.Request) {
+		root, dir, _, ok := d.sessionRoot(w, r)
+		if !ok {
+			return
+		}
+		defer root.Close()
+		files, truncated := projectIndex(r.Context(), root, dir)
+		writeJSON(w, protocol.FileIndex{Root: dir, Files: files, Truncated: truncated})
+	})
+
 	// GET /v1/files/changes?session=ID
 	d.handle(mux, "/v1/files/changes", func(w http.ResponseWriter, r *http.Request) {
 		sess, ok := d.reg.Get(r.URL.Query().Get("session"))
@@ -366,6 +380,62 @@ func markIgnored(dir, rel string, entries []protocol.FileEntry) {
 			entries[i].Ignored = true
 		}
 	}
+}
+
+// skipDirs are never walked into outside git: what is in them was installed
+// or built, not written, and there is a lot of it.
+var skipDirs = map[string]bool{
+	".git": true, "node_modules": true, ".next": true, "dist": true, "build": true,
+	"target": true, ".venv": true, "venv": true, "__pycache__": true, ".cache": true,
+	".gradle": true, "Pods": true, ".turbo": true, ".expo": true, "vendor": true,
+}
+
+// projectIndex lists a project's files, slash-separated and relative to its
+// root. Git knows the answer already, and much faster than a walk: tracked
+// files and untracked ones it does not ignore.
+func projectIndex(ctx context.Context, root *os.Root, dir string) ([]string, bool) {
+	files := []string{}
+	if isGitRoot(dir) {
+		ctx, cancel := context.WithTimeout(ctx, gitTimeout)
+		defer cancel()
+		out, err := exec.CommandContext(ctx, "git", "-C", dir, "ls-files", "-z", "--cached", "--others", "--exclude-standard").Output()
+		if err == nil {
+			seen := map[string]bool{}
+			for _, p := range strings.Split(string(out), "\x00") {
+				if p == "" || seen[p] {
+					continue
+				}
+				seen[p] = true
+				if len(files) == maxIndex {
+					return files, true
+				}
+				files = append(files, p)
+			}
+			return files, false
+		}
+	}
+	truncated := false
+	_ = fs.WalkDir(root.FS(), ".", func(p string, de fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if de.IsDir() {
+			if p != "." && skipDirs[de.Name()] {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if !de.Type().IsRegular() && de.Type()&fs.ModeSymlink == 0 {
+			return nil
+		}
+		if len(files) == maxIndex {
+			truncated = true
+			return fs.SkipAll
+		}
+		files = append(files, p)
+		return nil
+	})
+	return files, truncated
 }
 
 func isGitRoot(dir string) bool {

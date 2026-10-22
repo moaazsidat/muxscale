@@ -347,3 +347,12 @@ type FileChanges struct {
 	Changes   []FileChange `json:"changes"`
 	Truncated bool         `json:"truncated,omitempty"`
 }
+
+// FileIndex is every file in a project, for finding one by name. In a git
+// work tree it is what git tracks plus what it would (untracked, not
+// ignored); elsewhere, a walk that skips dependency and build folders.
+type FileIndex struct {
+	Root      string   `json:"root"`
+	Files     []string `json:"files"`
+	Truncated bool     `json:"truncated,omitempty"`
+}
