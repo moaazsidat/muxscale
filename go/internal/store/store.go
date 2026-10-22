@@ -425,6 +425,32 @@ ORDER BY seq ASC LIMIT ?`, sessionID, sinceSeq, limit)
 	return out, rows.Err()
 }
 
+// ToolCalls returns up to limit of a session's tool calls, oldest first.
+func (s *Store) ToolCalls(sessionID string, limit int) ([]protocol.TranscriptEvent, error) {
+	rows, err := s.db.Query(`
+SELECT payload FROM transcript
+WHERE session_id = ? AND kind = ?
+ORDER BY seq ASC LIMIT ?`, sessionID, string(protocol.EventToolCall), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []protocol.TranscriptEvent
+	for rows.Next() {
+		var payload string
+		if err := rows.Scan(&payload); err != nil {
+			return nil, err
+		}
+		var e protocol.TranscriptEvent
+		if err := json.Unmarshal([]byte(payload), &e); err != nil {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 // TranscriptBefore returns up to limit of a session's events with seq below
 // before -- the newest ones when before is 0 -- in order, and whether older
 // ones remain.

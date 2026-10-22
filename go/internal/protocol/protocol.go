@@ -287,3 +287,63 @@ type ApprovalDecision struct {
 	// DecidedBy records which device answered, for the audit log.
 	DecidedBy string `json:"decided_by,omitempty"`
 }
+
+// Files: a session's project, as the phone browses it. Every path here is
+// relative to the project root, slash-separated, and "." for the root itself.
+
+// FileEntry is one item in a directory listing.
+type FileEntry struct {
+	Name string `json:"name"`
+	// Kind is "dir" or "file"; "link" for a symlink that leads outside the
+	// project or nowhere, which cannot be opened.
+	Kind     string    `json:"kind"`
+	Link     bool      `json:"link,omitempty"`
+	Size     int64     `json:"size,omitempty"`
+	Modified time.Time `json:"modified"`
+	// Ignored reports that git ignores it: build output, dependencies.
+	Ignored bool `json:"ignored,omitempty"`
+}
+
+// FileListing is a directory's contents, folders first.
+type FileListing struct {
+	Root      string      `json:"root"`
+	Path      string      `json:"path"`
+	Entries   []FileEntry `json:"entries"`
+	Truncated bool        `json:"truncated,omitempty"`
+}
+
+// FileContent is a file opened to read. Text is set for a UTF-8 file small
+// enough to show; otherwise Binary or TooLarge says why it is not.
+type FileContent struct {
+	Path     string    `json:"path"`
+	Size     int64     `json:"size"`
+	Modified time.Time `json:"modified"`
+	MIME     string    `json:"mime"`
+	// SHA256 of the content, so a later save can tell the file changed under it.
+	SHA256   string `json:"sha256,omitempty"`
+	Text     string `json:"text,omitempty"`
+	Binary   bool   `json:"binary,omitempty"`
+	TooLarge bool   `json:"too_large,omitempty"`
+}
+
+// FileChange is a file the agent touched, or one git sees as changed.
+type FileChange struct {
+	Path string `json:"path"`
+	// Status is git's view: "added", "modified", "deleted", "untracked",
+	// "conflict", or empty when the file has no uncommitted change.
+	Status string `json:"status,omitempty"`
+	// ByAgent reports that the session's own tool calls wrote it; At is the
+	// last time they did.
+	ByAgent bool       `json:"by_agent,omitempty"`
+	At      *time.Time `json:"at,omitempty"`
+	Exists  bool       `json:"exists"`
+}
+
+// FileChanges lists what a session changed: the agent's own writes first,
+// newest first, then anything else git sees as changed.
+type FileChanges struct {
+	Root      string       `json:"root"`
+	Git       bool         `json:"git"`
+	Changes   []FileChange `json:"changes"`
+	Truncated bool         `json:"truncated,omitempty"`
+}

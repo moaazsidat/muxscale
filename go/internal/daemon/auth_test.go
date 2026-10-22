@@ -69,6 +69,10 @@ func controlRoutes() []struct {
 		{http.MethodPost, "/v1/sessions/shell", `{"session_id":"x"}`},
 		{http.MethodPost, "/v1/sessions/resize", `{"session_id":"x","cols":80,"rows":24}`},
 		{http.MethodGet, "/v1/sessions/screen/stream?session=x", ""},
+		{http.MethodGet, "/v1/files/list?session=x", ""},
+		{http.MethodGet, "/v1/files/read?session=x&path=a", ""},
+		{http.MethodGet, "/v1/files/raw?session=x&path=a", ""},
+		{http.MethodGet, "/v1/files/changes?session=x", ""},
 	}
 }
 
