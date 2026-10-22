@@ -1514,6 +1514,21 @@ func (m *Manager) Merge(keepID, dropID string) {
 			}
 		})
 	}
+	// The dropped row's keys lead to the kept one, and its terminal pane
+	// goes with them. Without this, the next scan found no row for the
+	// process, made a new one and adopted the pane again, and the next hook
+	// folded that away: a session in kitty changed id every few seconds while
+	// it worked, and replies went to ids already gone.
+	if keepOK {
+		m.reg.Redirect(dropID, keepID)
+		m.mu.Lock()
+		if t, ok := m.termctlTargets[dropID]; ok {
+			if _, has := m.termctlTargets[keepID]; !has && m.tmuxTargets[keepID] == "" && m.wrapped[keepID] == nil {
+				m.termctlTargets[keepID] = t
+			}
+		}
+		m.mu.Unlock()
+	}
 	m.Drop(dropID)
 	if path != "" {
 		m.Retail(keepID, path)

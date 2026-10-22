@@ -238,6 +238,22 @@ func (r *Registry) Alias(agentID, naturalKey, id string) bool {
 	return true
 }
 
+// Redirect makes every key that leads to from lead to to instead, for a row
+// being folded into another: the ways the dropped row was found are ways of
+// finding the kept one.
+func (r *Registry) Redirect(from, to string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.sessions[to]; !ok {
+		return
+	}
+	for k, v := range r.byNatural {
+		if v == from {
+			r.byNatural[k] = to
+		}
+	}
+}
+
 // FindByTranscript returns sessions following a given transcript file.
 func (r *Registry) FindByTranscript(path string) []protocol.Session {
 	r.mu.RLock()

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/muxscale/muxscale/go/internal/attach"
 	"github.com/muxscale/muxscale/go/internal/protocol"
 	"github.com/muxscale/muxscale/go/internal/store"
 )
@@ -153,8 +154,11 @@ func TestReconcileFoldsEqualFidelityAndKeepsTheName(t *testing.T) {
 
 	m.Reconcile(keep.ID, path)
 
-	if _, ok := reg.IDFor("claude-code", "cdef6772"); ok {
+	if len(reg.List()) != 1 {
 		t.Fatal("duplicate row survived the reconcile")
+	}
+	if id, _ := reg.IDFor("claude-code", "cdef6772"); id != keep.ID {
+		t.Errorf("the folded row's key leads to %q, want the kept row %s", id, keep.ID)
 	}
 	got, ok := reg.Get(keep.ID)
 	if !ok {
@@ -188,5 +192,39 @@ func TestRestoreOnlyDetachesWrappedSessions(t *testing.T) {
 	}
 	if got, _ := m.reg.Get("transcript"); got.State != protocol.StateUnknown || got.Guess.Confidence >= 1 {
 		t.Errorf("transcript session = %s/%v", got.State, got.Guess.Confidence)
+	}
+}
+
+// Regression: a Claude Code session in kitty changed id every few seconds
+// while it worked. Each hook folded the scan's row away, taking the pid key
+// and the kitty target with it; the next scan, finding no row for the pid,
+// made a new one and adopted the pane again, and the next hook dropped that.
+// A phone holding the session sent its reply to an id that was already gone.
+func TestMergeHandsTheDroppedRowsKeysAndTerminalToTheKeptOne(t *testing.T) {
+	m, reg := reconcileFixture(t)
+	const transcript = "/t/abc.jsonl"
+
+	scanned := reg.Upsert("claude-code", "pid:1234", func(s *protocol.Session) {
+		s.TranscriptPath = transcript
+		s.Attachment = protocol.AttachTermctl
+		s.Fidelity = protocol.FidelityStructured
+	})
+	m.termctlTargets[scanned.ID] = attach.TermTarget{Kind: attach.TermKitty, ID: "2", Socket: "unix:/tmp/kitty-1"}
+	hooked := reg.Upsert("claude-code", "sess-abc", func(s *protocol.Session) {
+		s.TranscriptPath = transcript
+		s.Attachment = protocol.AttachNative
+		s.Fidelity = protocol.FidelityNativeFull
+	})
+
+	m.Reconcile(hooked.ID, transcript)
+
+	if again := reg.Upsert("claude-code", "pid:1234", nil); again.ID != hooked.ID {
+		t.Errorf("the next scan made row %s; the pid should lead to the kept row %s", again.ID, hooked.ID)
+	}
+	if len(reg.List()) != 1 {
+		t.Errorf("%d rows, want 1", len(reg.List()))
+	}
+	if tgt, ok := m.termctlTargets[hooked.ID]; !ok || tgt.ID != "2" {
+		t.Errorf("the kept row lost the kitty pane it can be replied through: %+v", m.termctlTargets)
 	}
 }
