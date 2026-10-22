@@ -327,7 +327,12 @@ func cmdLs(args []string) error {
 			if len(a.ToolInput) > 0 {
 				fmt.Printf("      %s\n", indent(daemon.FormatToolInput(a.ToolInput), "      "))
 			}
-			fmt.Printf("      muxscale approve %s   (or deny), %s left\n", a.ID, humanDur(time.Until(a.Deadline)))
+			if a.Deadline.IsZero() {
+				// Asked at the agent's own keyboard: it waits as long as it takes.
+				fmt.Printf("      muxscale approve %s   (or deny)\n", a.ID)
+			} else {
+				fmt.Printf("      muxscale approve %s   (or deny), %s left\n", a.ID, humanDur(time.Until(a.Deadline)))
+			}
 		}
 	}
 	return nil
