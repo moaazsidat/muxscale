@@ -242,3 +242,93 @@ func TestChangesPutTheAgentsOwnFilesFirst(t *testing.T) {
 		t.Errorf("changes =\n  %s\nwant\n  %s", strings.Join(rows, " "), want)
 	}
 }
+
+func postWrite(t *testing.T, mux *http.ServeMux, session, p, text, base string) *httptest.ResponseRecorder {
+	t.Helper()
+	b, _ := json.Marshal(map[string]string{"session": session, "path": p, "text": text, "base_sha256": base, "by": "phone"})
+	req := httptest.NewRequest(http.MethodPost, "/v1/files/write", strings.NewReader(string(b)))
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	return rec
+}
+
+// A save lands only on the file the phone opened. If the agent changed it
+// in the meantime, the save is refused with what is there now, rather than
+// silently undoing the agent's work.
+func TestWritingRefusesAFileThatChangedUnderIt(t *testing.T) {
+	d, mux := authDaemon(t)
+	dir := t.TempDir()
+	write(t, dir, "src/app.ts", "let a = 1\n")
+	if err := os.Chmod(filepath.Join(dir, "src", "app.ts"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	s := d.reg.Upsert("claude-code", "pid:1", func(s *protocol.Session) { s.Cwd = dir })
+
+	opened := decode[protocol.FileContent](t, getFiles(t, mux, "/v1/files/read", s.ID, "src/app.ts"))
+	saved := decode[protocol.FileContent](t, postWrite(t, mux, s.ID, "src/app.ts", "let a = 2\n", opened.SHA256))
+	if b, _ := os.ReadFile(filepath.Join(dir, "src", "app.ts")); string(b) != "let a = 2\n" {
+		t.Fatalf("file holds %q", b)
+	}
+	if saved.SHA256 == opened.SHA256 || saved.Size != 10 {
+		t.Errorf("saved %+v", saved)
+	}
+	if fi, _ := os.Stat(filepath.Join(dir, "src", "app.ts")); fi.Mode().Perm() != 0o640 {
+		t.Errorf("mode %v, want the file's own 0640", fi.Mode().Perm())
+	}
+	if entries, _ := os.ReadDir(filepath.Join(dir, "src")); len(entries) != 1 {
+		t.Errorf("left behind: %v", entries)
+	}
+
+	// The agent writes; the phone saves from the old copy.
+	write(t, dir, "src/app.ts", "let a = 3 // the agent\n")
+	rec := postWrite(t, mux, s.ID, "src/app.ts", "let a = 4\n", saved.SHA256)
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "the agent") {
+		t.Fatalf("stale save: %d %s", rec.Code, rec.Body)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "src", "app.ts")); string(b) != "let a = 3 // the agent\n" {
+		t.Errorf("the agent's change was overwritten: %q", b)
+	}
+
+	log, err := d.store.AuditLog(10)
+	if err != nil || len(log) == 0 || log[0].Action != "file_written" || !strings.Contains(log[0].Detail, "src/app.ts") || strings.Contains(log[0].Detail, "let a") {
+		t.Errorf("audit %+v %v", log, err)
+	}
+}
+
+func TestWritingStaysInTheProject(t *testing.T) {
+	d, mux := authDaemon(t)
+	dir := t.TempDir()
+	outside := t.TempDir()
+	write(t, outside, "secret.txt", "mine")
+	write(t, dir, "real.md", "# real\n")
+	if err := os.Symlink(filepath.Join(outside, "secret.txt"), filepath.Join(dir, "escape.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("real.md", filepath.Join(dir, "alias.md")); err != nil {
+		t.Fatal(err)
+	}
+	s := d.reg.Upsert("claude-code", "pid:1", func(s *protocol.Session) { s.Cwd = dir })
+
+	for _, p := range []string{"escape.txt", "../x", "/etc/hosts", "missing.txt"} {
+		if rec := postWrite(t, mux, s.ID, p, "pwned", "x"); rec.Code == http.StatusOK {
+			t.Errorf("write %q: 200", p)
+		}
+	}
+	if b, _ := os.ReadFile(filepath.Join(outside, "secret.txt")); string(b) != "mine" {
+		t.Fatalf("wrote outside the project: %q", b)
+	}
+	if rec := postWrite(t, mux, s.ID, "real.md", "x", ""); rec.Code != http.StatusBadRequest {
+		t.Errorf("no base hash: %d", rec.Code)
+	}
+
+	// A link inside the project is written through, and stays a link.
+	opened := decode[protocol.FileContent](t, getFiles(t, mux, "/v1/files/read", s.ID, "alias.md"))
+	decode[protocol.FileContent](t, postWrite(t, mux, s.ID, "alias.md", "# edited\n", opened.SHA256))
+	if b, _ := os.ReadFile(filepath.Join(dir, "real.md")); string(b) != "# edited\n" {
+		t.Errorf("target holds %q", b)
+	}
+	if fi, _ := os.Lstat(filepath.Join(dir, "alias.md")); fi.Mode()&os.ModeSymlink == 0 {
+		t.Error("the link was replaced by a file")
+	}
+}

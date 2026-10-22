@@ -73,6 +73,7 @@ func controlRoutes() []struct {
 		{http.MethodGet, "/v1/files/read?session=x&path=a", ""},
 		{http.MethodGet, "/v1/files/raw?session=x&path=a", ""},
 		{http.MethodGet, "/v1/files/changes?session=x", ""},
+		{http.MethodPost, "/v1/files/write", `{"session":"x","path":"a","text":"b","base_sha256":"c"}`},
 	}
 }
 

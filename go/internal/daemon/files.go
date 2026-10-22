@@ -11,14 +11,19 @@ package daemon
 // leads out of the root. A crafted path, or a link an agent or a cloned repo
 // planted in the project, cannot reach the rest of the disk.
 //
-// Read-only for now.
+// Writes replace a file the phone opened, and only if it is still the file
+// the phone opened: the save names the content's hash as it read it, and a
+// file changed since -- by the agent, usually -- is refused, not overwritten.
 
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"mime"
@@ -116,7 +121,11 @@ func cleanRel(p string) (string, error) {
 // sessionRoot finds the session a request names and opens its project.
 func (d *Daemon) sessionRoot(w http.ResponseWriter, r *http.Request) (*os.Root, string, string, bool) {
 	q := r.URL.Query()
-	sess, ok := d.reg.Get(q.Get("session"))
+	return d.openProject(w, q.Get("session"), q.Get("path"))
+}
+
+func (d *Daemon) openProject(w http.ResponseWriter, sessionID, p string) (*os.Root, string, string, bool) {
+	sess, ok := d.reg.Get(sessionID)
 	if !ok {
 		http.Error(w, "unknown session", http.StatusNotFound)
 		return nil, "", "", false
@@ -126,7 +135,7 @@ func (d *Daemon) sessionRoot(w http.ResponseWriter, r *http.Request) (*os.Root, 
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return nil, "", "", false
 	}
-	rel, err := cleanRel(q.Get("path"))
+	rel, err := cleanRel(p)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return nil, "", "", false
@@ -195,6 +204,60 @@ func (d *Daemon) filesRoutes(mux *http.ServeMux) {
 		}
 		defer root.Close()
 		serveRaw(w, r, root, rel)
+	})
+
+	// POST /v1/files/write {"session":ID,"path":REL,"text":...,"base_sha256":...,"by":...}
+	d.handle(mux, "/v1/files/write", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST required", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			Session    string `json:"session"`
+			Path       string `json:"path"`
+			Text       string `json:"text"`
+			BaseSHA256 string `json:"base_sha256"`
+			By         string `json:"by"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxTextRead+64<<10)).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if len(body.Text) > maxTextRead {
+			http.Error(w, "file too large to save from here", http.StatusRequestEntityTooLarge)
+			return
+		}
+		if body.BaseSHA256 == "" {
+			http.Error(w, "base_sha256 required: the hash of the content the edit started from", http.StatusBadRequest)
+			return
+		}
+		root, _, rel, ok := d.openProject(w, body.Session, body.Path)
+		if !ok {
+			return
+		}
+		defer root.Close()
+
+		saved, current, err := writeFile(root, rel, body.Text, body.BaseSHA256)
+		switch {
+		case errors.Is(err, errChanged):
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "the file changed since it was opened", "current": current})
+			return
+		case errors.Is(err, errNotAFile):
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		case err != nil:
+			fileError(w, err)
+			return
+		}
+		actor := body.By
+		if actor == "" {
+			actor = "cli"
+		}
+		// The path and size, never the content, as with input.
+		_ = d.store.Audit(actor, "file_written", body.Session, fmt.Sprintf("%s bytes=%d", rel, saved.Size))
+		writeJSON(w, saved)
 	})
 
 	// GET /v1/files/changes?session=ID
@@ -347,6 +410,80 @@ func readFile(root *os.Root, rel string) (protocol.FileContent, error) {
 	}
 	out.Text = string(data)
 	return out, nil
+}
+
+var errChanged = errors.New("the file changed since it was opened")
+
+// writeFile replaces rel with text if its content still hashes to base. On a
+// mismatch it returns errChanged and the file as it is now, so the client can
+// show what changed instead of guessing.
+//
+// The new content goes to a temporary file beside it, renamed over the old:
+// a reader -- the agent, a build watching the tree -- sees the old file or the
+// new one, never half of either. A symlink is written through instead, so
+// the link stays a link.
+func writeFile(root *os.Root, rel, text, base string) (protocol.FileContent, protocol.FileContent, error) {
+	current, err := readFile(root, rel)
+	if err != nil {
+		return protocol.FileContent{}, protocol.FileContent{}, err
+	}
+	if current.TooLarge || current.Binary {
+		return protocol.FileContent{}, protocol.FileContent{}, errNotAFile
+	}
+	if current.SHA256 != base {
+		return protocol.FileContent{}, current, errChanged
+	}
+	lfi, err := root.Lstat(rel)
+	if err != nil {
+		return protocol.FileContent{}, protocol.FileContent{}, err
+	}
+	fi, err := root.Stat(rel)
+	if err != nil {
+		return protocol.FileContent{}, protocol.FileContent{}, err
+	}
+
+	if lfi.Mode()&fs.ModeSymlink != 0 {
+		f, err := root.OpenFile(rel, os.O_WRONLY|os.O_TRUNC, 0)
+		if err != nil {
+			return protocol.FileContent{}, protocol.FileContent{}, err
+		}
+		_, err = io.WriteString(f, text)
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			return protocol.FileContent{}, protocol.FileContent{}, err
+		}
+	} else {
+		var nonce [6]byte
+		_, _ = rand.Read(nonce[:])
+		tmp := path.Join(path.Dir(rel), fmt.Sprintf(".%s.muxscale-%s.tmp", path.Base(rel), hex.EncodeToString(nonce[:])))
+		f, err := root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, fi.Mode().Perm())
+		if err != nil {
+			return protocol.FileContent{}, protocol.FileContent{}, err
+		}
+		_, err = io.WriteString(f, text)
+		if err == nil {
+			err = f.Sync()
+		}
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+		if err == nil {
+			err = root.Rename(tmp, rel)
+		}
+		if err != nil {
+			_ = root.Remove(tmp)
+			return protocol.FileContent{}, protocol.FileContent{}, err
+		}
+	}
+
+	saved, err := readFile(root, rel)
+	if err != nil {
+		return protocol.FileContent{}, protocol.FileContent{}, err
+	}
+	saved.Text = "" // the client has it; the hash is what it needs
+	return saved, protocol.FileContent{}, nil
 }
 
 // looksBinary is git's test: a NUL in the first 8 KB.
