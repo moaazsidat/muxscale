@@ -97,7 +97,7 @@ func TestQuestionAnsweredFromThePhone(t *testing.T) {
 				Decision struct {
 					Behavior     string `json:"behavior"`
 					UpdatedInput struct {
-						Questions []any           `json:"questions"`
+						Questions []any             `json:"questions"`
 						Answers   map[string]string `json:"answers"`
 					} `json:"updatedInput"`
 				} `json:"decision"`

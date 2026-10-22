@@ -250,8 +250,8 @@ func TestCommandMarshalsFlat(t *testing.T) {
 func TestSessionSlug(t *testing.T) {
 	cases := map[string]string{
 		"/Users/sam/dev/shop": "--Users-sam-dev-shop--",
-		"/home/dev/app":                    "--home-dev-app--",
-		"/a/b/":                            "--a-b--",
+		"/home/dev/app":       "--home-dev-app--",
+		"/a/b/":               "--a-b--",
 	}
 	for in, want := range cases {
 		if got := SessionSlug(in); got != want {

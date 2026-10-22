@@ -160,8 +160,8 @@ func TestTailerSeekEnd(t *testing.T) {
 func TestProjectSlug(t *testing.T) {
 	cases := map[string]string{
 		"/Users/sam/dev/muxscale": "-Users-sam-dev-muxscale",
-		"/home/dev/app":             "-home-dev-app",
-		"/a/b/c/":                   "-a-b-c",
+		"/home/dev/app":           "-home-dev-app",
+		"/a/b/c/":                 "-a-b-c",
 	}
 	for in, want := range cases {
 		if got := ProjectSlug(in); got != want {
