@@ -70,7 +70,8 @@ install; `muxscale debug adapter <id>` checks one against this machine.
 
 ## Quick start
 
-You need a Mac or Linux machine, an iPhone, and [Tailscale](https://tailscale.com) on both,
+You need a Mac or Linux machine, an iPhone with the [muxscale app](https://muxscale.com) (free,
+in TestFlight beta), and [Tailscale](https://tailscale.com) on both,
 signed in to the same account, with HTTPS turned on for the tailnet (`connect` says if not).
 
 ```bash
@@ -119,7 +120,7 @@ Restarting the daemon is only ever necessary for `muxscale run` sessions — tho
 ones it holds a PTY for. Sessions in iTerm2, tmux, or a plain terminal survive and are
 re-adopted.
 
-### Gotchas
+### Running the daemon
 
 - **A daemon you started by hand is supervised by nobody.** Nothing restarts it when it
   exits, and nothing replaces the binary when you rebuild — so an old build keeps running
@@ -152,10 +153,9 @@ re-adopted.
   pgrep -P "$(pgrep -f 'muxscale.*daemon' | head -1)"   # its children; empty = nothing to lose
   ```
 
-> **Heads-up before installing globally.** The decision hooks hold a permission prompt open
-> for up to the configured hold window (default 120s) while waiting for an answer. Until the
-> phone app exists, answer from `muxscale ls` and `muxscale approve` or the prompt falls through to Claude
-> Code's own after the timeout. Start with `--hold 10s` if that sounds annoying.
+> **The hold window.** A permission prompt is held open for up to `--hold` (default 120s)
+> while muxscale waits for your answer, from the app or from `muxscale approve`. After that it
+> falls through to Claude Code's own prompt. Start with `--hold 10s` if that sounds annoying.
 
 ## Design commitments
 
@@ -195,33 +195,28 @@ These are constraints, not aspirations. Each has tests.
 ## Layout
 
 ```
-proto/      wire protocol (source of truth; M2)
 go/         daemon + CLI
+  cmd/muxscale/                  the muxscale command
+  internal/adapter/<agent>/      one package per agent: discovery, transcripts, hooks
   internal/adapter/claudecode/   hooks, transcript parser + tailer, version gate, installer
   internal/adapter/omp/          session parser + tailer, writer lease, extension installer
   internal/adapter/codex/        thread index + rollout parser, process join, hook installer
   internal/attach/               pty wrap, input encoding + fencing, discovery, tmux
-  internal/daemon/               hook listener, registry, manager, state machine
+  internal/daemon/               HTTP API, hook listener, registry, manager, state machine
   internal/store/                SQLite: sessions, transcripts, approvals, audit
+  internal/tsnode/               serving over Tailscale: the system's, or an embedded node
   internal/vt/                   headless VT emulator, grid diffing
-  internal/protocol/             shared types
-rust/       client core: codec, crypto, grid model (M3)
-adapters/   signed manifests
+  internal/protocol/             the types the API speaks; what a client builds against
+rust/       client core: codec, crypto, grid model
 fixtures/   shared test data across implementations
+packaging/  Homebrew formula and Linux packages
+tools/      release, SBOM and test scripts
 install.sh  the installer muxscale.com serves
 ```
 
-## Releases
-
-`tools/release.sh 0.1.0` builds every platform, signs each tarball with the release key, uploads
-them to the `muxscale-dl` R2 bucket behind dl.muxscale.com, and moves the `stable` channel to the
-new version, which is what `install.sh` (served at muxscale.com/install.sh) installs. `--no-promote` uploads
-without moving the channel; `--dry-run` only builds and signs into `dist/release/`.
-
-The signing key is `~/.minisign/muxscale.key`, its password in the macOS Keychain as
-`muxscale-release-minisign`. The public key is `tools/minisign.pub` and is baked into `install.sh`;
-the script refuses to release if the two differ. Lose the private key and existing installs can no
-longer verify new releases, so keep a backup of both the key file and its password.
+Releases are signed with minisign, and `install.sh` checks every download against the public
+key in `tools/minisign.pub` before installing it. How releases are made is in
+[RELEASING.md](RELEASING.md).
 
 ## Tests
 
