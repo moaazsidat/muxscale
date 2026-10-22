@@ -417,6 +417,20 @@ func InferState(events []protocol.TranscriptEvent, lastMod time.Time, quiescence
 
 	last := events[len(events)-1]
 
+	// A question with no answer yet is the agent waiting on a person, however
+	// long ago it asked. Read as a tool in flight, it showed Working for its
+	// first minutes and then nothing at all.
+	if last.Kind == protocol.EventToolCall && last.ToolName == "AskUserQuestion" {
+		reason := "asked a question"
+		if q := firstQuestion(last.ToolInput); q != "" {
+			reason = "asked: " + q
+		}
+		return protocol.StateGuess{
+			State: protocol.StateWaitingInput, Confidence: 0.6,
+			Reason: reason, Evidence: "transcript:trailing tool_use AskUserQuestion", At: now,
+		}
+	}
+
 	// A tool call with no result yet means work is in flight.
 	if last.Kind == protocol.EventToolCall && idle < quiescence {
 		return protocol.StateGuess{
@@ -498,4 +512,15 @@ func InferState(events []protocol.TranscriptEvent, lastMod time.Time, quiescence
 		Evidence: "transcript:idle " + idle.Round(time.Second).String() + " last=" + string(last.Kind),
 		At:       now,
 	}
+}
+
+// firstQuestion is the text of an AskUserQuestion call's first question.
+func firstQuestion(in map[string]any) string {
+	qs, _ := in["questions"].([]any)
+	if len(qs) == 0 {
+		return ""
+	}
+	q, _ := qs[0].(map[string]any)
+	text, _ := q["question"].(string)
+	return text
 }

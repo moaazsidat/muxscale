@@ -74,6 +74,11 @@ type Manager struct {
 	// that covers the common case: an agent already running in an ordinary
 	// terminal window, started long before the daemon, in no multiplexer.
 	termctlTargets map[string]attach.TermTarget
+	// questionMu makes posting a keyboard question one step with checking
+	// that none is up, so two polls cannot post it twice.
+	questionMu sync.Mutex
+	// typedQuestions are the tool calls of questions answered by typing.
+	typedQuestions map[string]bool
 
 	// termctlWarnOnce keeps a standing failure -- almost always a denied
 	// Automation permission -- from being logged on every scan.
@@ -114,6 +119,7 @@ func NewManager(reg *Registry, adapters *adapter.Registry, st *store.Store, log 
 		closing:        map[string]bool{},
 		tmuxTargets:    map[string]string{},
 		termctlTargets: map[string]attach.TermTarget{},
+		typedQuestions: map[string]bool{},
 		sampled:        map[string]*vt.Emulator{},
 		screenChanged:  map[string]chan struct{}{},
 		typedAudit:     map[string]time.Time{},
@@ -1778,6 +1784,7 @@ func (m *Manager) tailLoop(sessionID string, h *tailHandle) {
 			// went quiet. Without this a session stayed Working forever after
 			// its turn ended, unless a hook happened to correct it.
 			m.reinfer(sessionID, h, last)
+			m.syncKeyboardQuestion(sessionID, last, true)
 			continue
 		}
 		last = append(last, events...)
@@ -1797,6 +1804,7 @@ func (m *Manager) tailLoop(sessionID string, h *tailHandle) {
 		if !m.ingest(sessionID, h, events) {
 			return // replaced while reading; these belong to a transcript being rebuilt
 		}
+		m.syncKeyboardQuestion(sessionID, last, false)
 		for i := range events {
 			m.reg.AppendEvent(events[i])
 		}

@@ -424,6 +424,14 @@ type KeyApprover interface {
 	ApprovalKeys(req protocol.ApprovalRequest, d protocol.ApprovalDecision) ([]byte, error)
 }
 
+// KeyStepper is a KeyApprover whose answer is several inputs the agent takes
+// one at a time: a choice that opens a text field, then the text. Sent as one
+// burst, a TUI reads them as a single paste. The daemon types each step on its
+// own, a moment apart.
+type KeyStepper interface {
+	ApprovalKeySteps(req protocol.ApprovalRequest, d protocol.ApprovalDecision) ([][]byte, error)
+}
+
 // HookKind is a normalized event an agent's installed integration reports.
 //
 // The daemon's state machine speaks these, not any one agent's event names.

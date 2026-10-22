@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/muxscale/muxscale/go/internal/adapter"
+	"github.com/muxscale/muxscale/go/internal/adapter/claudecode"
 	"github.com/muxscale/muxscale/go/internal/adapter/omp"
 	"github.com/muxscale/muxscale/go/internal/protocol"
 	"github.com/muxscale/muxscale/go/internal/store"
@@ -214,5 +215,84 @@ func TestOMPQueueReachesTheSession(t *testing.T) {
 	o.hook("session_shutdown", "", nil)
 	if s, _ := o.reg.Get(id); len(s.Queued) != 0 {
 		t.Errorf("an exited session still shows %+v", s.Queued)
+	}
+}
+
+// A Claude Code question that has fallen through to its terminal -- the hold
+// ran out, or the daemon restarted -- stays on the phone while the transcript
+// says it is unanswered, and the answer is typed into the dialog.
+func TestKeyboardQuestionFollowsTheTranscript(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	reg := NewRegistry()
+	adapters := adapter.NewRegistry()
+	adapters.MustRegister(claudecode.New())
+	m := NewManager(reg, adapters, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	var typed []string
+	m.typeKeys = func(_ string, keys []byte) error { typed = append(typed, string(keys)); return nil }
+
+	sess := reg.Upsert("claude-code", "s1", nil)
+	ask := protocol.TranscriptEvent{Kind: protocol.EventToolCall, ToolName: askUserQuestion, ToolUseID: "toolu_1",
+		ToolInput: map[string]any{"questions": []any{map[string]any{
+			"question": "Pick a color",
+			"options":  []any{map[string]any{"label": "red"}, map[string]any{"label": "green"}},
+		}}}}
+	pending := func() []protocol.ApprovalRequest { return reg.SessionApprovals(sess.ID) }
+
+	m.syncKeyboardQuestion(sess.ID, []protocol.TranscriptEvent{ask}, false)
+	if len(pending()) != 0 {
+		t.Fatal("posted while the transcript was still being read")
+	}
+	m.syncKeyboardQuestion(sess.ID, []protocol.TranscriptEvent{ask}, true)
+	m.syncKeyboardQuestion(sess.ID, []protocol.TranscriptEvent{ask}, true)
+	if p := pending(); len(p) != 1 || p[0].Source != protocol.ApprovalHook || p[0].Kind != "question" {
+		t.Fatalf("want one keyboard question, got %+v", p)
+	}
+
+	id := pending()[0].ID
+	err = m.AnswerByKeys(id, protocol.ApprovalDecision{Behavior: "allow",
+		Answers: map[string]string{"Pick a color": "teal"}}, "phone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(typed, "|") != "3|teal|\r" {
+		t.Errorf("typed %q, want Type something, the words, then Enter", typed)
+	}
+	// The agent has not written the answer down yet.
+	m.syncKeyboardQuestion(sess.ID, []protocol.TranscriptEvent{ask}, true)
+	if len(pending()) != 0 {
+		t.Error("asked again before the agent recorded the answer")
+	}
+
+	// Answered at the keyboard instead: the card goes.
+	ask2 := ask
+	ask2.ToolUseID = "toolu_2"
+	m.syncKeyboardQuestion(sess.ID, []protocol.TranscriptEvent{ask2}, true)
+	if len(pending()) != 1 {
+		t.Fatal("a new question was not posted")
+	}
+	result := protocol.TranscriptEvent{Kind: protocol.EventToolResult, ToolUseID: "toolu_2"}
+	m.syncKeyboardQuestion(sess.ID, []protocol.TranscriptEvent{ask2, result}, false)
+	if len(pending()) != 0 {
+		t.Error("the card outlived the question")
+	}
+}
+
+// While a hook holds the question, the phone already has it as data.
+func TestKeyboardQuestionDefersToAHeldOne(t *testing.T) {
+	m, reg := reconcileFixture(t)
+	adapters := adapter.NewRegistry()
+	adapters.MustRegister(claudecode.New())
+	m.adapters = adapters
+	sess := reg.Upsert("claude-code", "s1", nil)
+	reg.AskApproval(&protocol.ApprovalRequest{ID: "held", SessionID: sess.ID, Source: protocol.ApprovalNative, Kind: "question"})
+	ask := protocol.TranscriptEvent{Kind: protocol.EventToolCall, ToolName: askUserQuestion, ToolUseID: "toolu_1",
+		ToolInput: map[string]any{"questions": []any{map[string]any{"question": "Q", "options": []any{map[string]any{"label": "a"}}}}}}
+	m.syncKeyboardQuestion(sess.ID, []protocol.TranscriptEvent{ask}, true)
+	if p := reg.SessionApprovals(sess.ID); len(p) != 1 || p[0].ID != "held" {
+		t.Errorf("want only the held question, got %+v", p)
 	}
 }

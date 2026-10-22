@@ -106,25 +106,114 @@ func (m *Manager) AnswerByKeys(id string, d protocol.ApprovalDecision, actor str
 	if !ok {
 		return fmt.Errorf("unknown session %s", req.SessionID)
 	}
-	var ka adapter.KeyApprover
-	if m.adapters != nil {
-		if a, ok := m.adapters.Get(sess.AgentID); ok {
-			ka, _ = a.(adapter.KeyApprover)
-		}
-	}
-	if ka == nil {
-		return fmt.Errorf("muxscale has no way to answer %s's prompt", sess.AgentID)
-	}
-	keys, err := ka.ApprovalKeys(req, d)
+	steps, err := m.answerKeys(sess.AgentID, req, d)
 	if err != nil {
 		return err
 	}
-	if err := m.typeKeys(req.SessionID, keys); err != nil {
-		return fmt.Errorf("could not type the answer into the session: %w", err)
+	for i, keys := range steps {
+		if i > 0 {
+			time.Sleep(keyStepDelay)
+		}
+		if err := m.typeKeys(req.SessionID, keys); err != nil {
+			return fmt.Errorf("could not type the answer into the session: %w", err)
+		}
+	}
+	if req.Kind == "question" && req.ToolUseID != "" {
+		// Until the agent writes the answer down, its transcript still ends
+		// in the question; without this, the next quiet poll asks it again.
+		m.questionMu.Lock()
+		m.typedQuestions[req.ToolUseID] = true
+		m.questionMu.Unlock()
 	}
 	d.DecidedBy = actor
 	m.reg.ResolveApproval(id, d)
 	_ = m.store.Audit(actor, "approval_typed", req.SessionID,
 		fmt.Sprintf("behavior=%s subject=%q", d.Behavior, req.Subject))
 	return nil
+}
+
+// keyStepDelay separates the steps of a typed answer: long enough for a
+// dialog to have moved to its next tab or opened its text field before the
+// next key arrives.
+const keyStepDelay = 300 * time.Millisecond
+
+// answerKeys asks the session's adapter for the keys that give an answer, as
+// the steps they must be typed in.
+func (m *Manager) answerKeys(agentID string, req protocol.ApprovalRequest, d protocol.ApprovalDecision) ([][]byte, error) {
+	var a adapter.Adapter
+	if m.adapters != nil {
+		a, _ = m.adapters.Get(agentID)
+	}
+	switch k := a.(type) {
+	case adapter.KeyStepper:
+		return k.ApprovalKeySteps(req, d)
+	case adapter.KeyApprover:
+		keys, err := k.ApprovalKeys(req, d)
+		return [][]byte{keys}, err
+	}
+	return nil, fmt.Errorf("muxscale has no way to answer %s's prompt", agentID)
+}
+
+// syncKeyboardQuestion keeps a question the agent is asking at its own
+// keyboard on the phone, for as long as it is being asked.
+//
+// Claude Code's question reaches the phone through a hook the daemon holds;
+// once the hold runs out, the dialog is on the terminal and the phone's card
+// went with the hold. A restart lost it the same way. The transcript is what
+// says a question is still open -- it ends in the call, with nothing after --
+// so the card follows it: posted when the transcript has gone quiet on an
+// unanswered question (caughtUp, so a question long since answered is not
+// posted while history is read), and withdrawn once anything follows it. The
+// answer is typed into the dialog as its own keys.
+func (m *Manager) syncKeyboardQuestion(sessionID string, last []protocol.TranscriptEvent, caughtUp bool) {
+	var ask *protocol.TranscriptEvent
+	if n := len(last); n > 0 && last[n-1].Kind == protocol.EventToolCall && last[n-1].ToolName == askUserQuestion {
+		ask = &last[n-1]
+	}
+	m.questionMu.Lock()
+	defer m.questionMu.Unlock()
+	held := false
+	for _, a := range m.reg.SessionApprovals(sessionID) {
+		if a.Kind != "question" {
+			continue
+		}
+		if a.Source != protocol.ApprovalHook {
+			held = true // a hook is holding it; the phone already has it
+			continue
+		}
+		if ask == nil || (a.ToolUseID != "" && a.ToolUseID != ask.ToolUseID) {
+			m.reg.ResolveApproval(a.ID, protocol.ApprovalDecision{Reason: "answered at the keyboard"})
+			continue
+		}
+		held = true
+	}
+	if ask == nil || held || !caughtUp || m.typedQuestions[ask.ToolUseID] {
+		return
+	}
+	s, ok := m.reg.Get(sessionID)
+	if !ok || s.State.Terminal() {
+		return
+	}
+	qs := parseQuestions(ask.ToolName, ask.ToolInput)
+	if len(qs) == 0 {
+		return
+	}
+	if _, err := m.answerKeys(s.AgentID, protocol.ApprovalRequest{Kind: "question"}, protocol.ApprovalDecision{Behavior: "deny"}); err != nil {
+		return // nothing could type the answer, so there is nothing to offer
+	}
+	req := &protocol.ApprovalRequest{
+		ID:        newID(),
+		SessionID: sessionID,
+		Source:    protocol.ApprovalHook,
+		Kind:      "question",
+		ToolName:  ask.ToolName,
+		ToolInput: ask.ToolInput,
+		ToolUseID: ask.ToolUseID,
+		Subject:   questionSubject(qs),
+		Questions: qs,
+		Options:   []string{},
+		AskedAt:   ask.At,
+	}
+	m.reg.AskApproval(req)
+	m.log.Info("question waiting at the keyboard", "session", sessionID, "subject", req.Subject)
 }

@@ -239,3 +239,14 @@ func TestProjectSlugReplacesDots(t *testing.T) {
 		}
 	}
 }
+
+func TestInferStateAQuestionIsWaitingNotWorking(t *testing.T) {
+	ask := protocol.TranscriptEvent{Kind: protocol.EventToolCall, ToolName: "AskUserQuestion",
+		ToolInput: map[string]any{"questions": []any{map[string]any{"question": "Which Chrome?"}}}}
+	for _, quiet := range []time.Duration{time.Second, time.Hour} {
+		g := InferState([]protocol.TranscriptEvent{ask}, time.Now().Add(-quiet), 6*time.Second)
+		if g.State != protocol.StateWaitingInput || g.Reason != "asked: Which Chrome?" {
+			t.Errorf("quiet %s: %+v", quiet, g)
+		}
+	}
+}
