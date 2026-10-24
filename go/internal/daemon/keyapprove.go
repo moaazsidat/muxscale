@@ -3,6 +3,7 @@ package daemon
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/muxscale/muxscale/go/internal/adapter"
@@ -127,9 +128,27 @@ func (m *Manager) AnswerByKeys(id string, d protocol.ApprovalDecision, actor str
 	}
 	d.DecidedBy = actor
 	m.reg.ResolveApproval(id, d)
+	if req.Kind == "question" {
+		m.resumed(req.SessionID, "answered from the phone")
+	}
 	_ = m.store.Audit(actor, "approval_typed", req.SessionID,
 		fmt.Sprintf("behavior=%s subject=%q", d.Behavior, req.Subject))
 	return nil
+}
+
+// resumed puts a session back to working once the question that had it
+// waiting is answered -- only if that question is what said it was waiting,
+// so a turn that ended meanwhile is not undone. The agent's next hook, or its
+// transcript, takes it from there.
+func (m *Manager) resumed(sessionID, reason string) {
+	s, ok := m.reg.Get(sessionID)
+	if !ok || !strings.HasPrefix(s.Guess.Evidence, "transcript:trailing ") {
+		return
+	}
+	m.reg.SetState(sessionID, protocol.StateGuess{
+		State: protocol.StateRunning, Confidence: 1.0,
+		Reason: reason, Evidence: "question answered", At: time.Now(),
+	})
 }
 
 // keyStepDelay separates the steps of a typed answer: long enough for a
@@ -157,7 +176,9 @@ func (m *Manager) answerKeys(agentID string, req protocol.ApprovalRequest, d pro
 // syncKeyboardQuestion keeps a question the agent is asking at its own
 // keyboard on the phone, for as long as it is being asked.
 //
-// Claude Code's question reaches the phone through a hook the daemon holds;
+// omp's ask tool only ever asks there: no hook carries it, and while it waits
+// omp's own state says a tool is running. Claude Code's question reaches the
+// phone through a hook the daemon holds;
 // once the hold runs out, the dialog is on the terminal and the phone's card
 // went with the hold. A restart lost it the same way. The transcript is what
 // says a question is still open -- it ends in the call, with nothing after --
@@ -167,7 +188,7 @@ func (m *Manager) answerKeys(agentID string, req protocol.ApprovalRequest, d pro
 // answer is typed into the dialog as its own keys.
 func (m *Manager) syncKeyboardQuestion(sessionID string, last []protocol.TranscriptEvent, caughtUp bool) {
 	var ask *protocol.TranscriptEvent
-	if n := len(last); n > 0 && last[n-1].Kind == protocol.EventToolCall && last[n-1].ToolName == askUserQuestion {
+	if n := len(last); n > 0 && last[n-1].Kind == protocol.EventToolCall && isQuestionTool(last[n-1].ToolName) {
 		ask = &last[n-1]
 	}
 	m.questionMu.Lock()
@@ -183,6 +204,7 @@ func (m *Manager) syncKeyboardQuestion(sessionID string, last []protocol.Transcr
 		}
 		if ask == nil || (a.ToolUseID != "" && a.ToolUseID != ask.ToolUseID) {
 			m.reg.ResolveApproval(a.ID, protocol.ApprovalDecision{Reason: "answered at the keyboard"})
+			m.resumed(sessionID, "answered at the keyboard")
 			continue
 		}
 		held = true
@@ -215,5 +237,15 @@ func (m *Manager) syncKeyboardQuestion(sessionID string, last []protocol.Transcr
 		AskedAt:   ask.At,
 	}
 	m.reg.AskApproval(req)
+	// The session is waiting on the person, whatever its last hook said: a
+	// tool running, for omp, whose ask is a tool. Dated from the question, so
+	// Needs you puts it where it belongs.
+	if s.State != protocol.StateWaitingInput && s.State != protocol.StateWaitingApproval {
+		m.reg.SetState(sessionID, protocol.StateGuess{
+			State: protocol.StateWaitingInput, Confidence: 1.0,
+			Reason: "asked a question: " + req.Subject, Evidence: "transcript:trailing " + ask.ToolName,
+			At: time.Now(), Since: ask.At,
+		})
+	}
 	m.log.Info("question waiting at the keyboard", "session", sessionID, "subject", req.Subject)
 }

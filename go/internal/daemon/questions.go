@@ -21,11 +21,21 @@ import (
 // askUserQuestion is the tool whose permission request is really a question.
 const askUserQuestion = "AskUserQuestion"
 
-// parseQuestions reads AskUserQuestion's input. Nil when it is not one, or
-// has nothing a person could answer -- it is then shown as an approval, the
-// safe old behaviour.
+// ompAsk is omp's question tool. It never reaches a permission prompt; it is
+// seen in the transcript, and answered at omp's keyboard.
+const ompAsk = "ask"
+
+// isQuestionTool reports a tool whose call is a question for the person.
+func isQuestionTool(name string) bool {
+	return name == askUserQuestion || name == ompAsk
+}
+
+// parseQuestions reads a question tool's input: AskUserQuestion's, or omp's
+// ask, which has the same shape but says "multi" for "multiSelect". Nil when
+// it is not one, or has nothing a person could answer -- it is then shown as
+// an approval, the safe old behaviour.
 func parseQuestions(toolName string, in map[string]any) []protocol.Question {
-	if toolName != askUserQuestion {
+	if !isQuestionTool(toolName) {
 		return nil
 	}
 	raw, _ := in["questions"].([]any)
@@ -39,6 +49,9 @@ func parseQuestions(toolName string, in map[string]any) []protocol.Question {
 		q := protocol.Question{Question: text, Options: []protocol.QuestionOption{}}
 		q.Header, _ = m["header"].(string)
 		q.MultiSelect, _ = m["multiSelect"].(bool)
+		if multi, ok := m["multi"].(bool); ok {
+			q.MultiSelect = multi
+		}
 		opts, _ := m["options"].([]any)
 		for _, o := range opts {
 			om, _ := o.(map[string]any)

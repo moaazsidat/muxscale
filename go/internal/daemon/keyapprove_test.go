@@ -298,3 +298,56 @@ func TestKeyboardQuestionDefersToAHeldOne(t *testing.T) {
 		t.Errorf("want only the held question, got %+v", p)
 	}
 }
+
+// omp's ask never reaches a hook: it is seen in the transcript, put on the
+// phone with the session waiting on the person, and answered with the
+// dialog's keys, after which the session is working again.
+func TestOmpAskIsAQuestionOnThePhone(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	reg := NewRegistry()
+	adapters := adapter.NewRegistry()
+	adapters.MustRegister(omp.New())
+	m := NewManager(reg, adapters, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(m.StopPersisting)
+	var typed []string
+	m.typeKeys = func(_ string, keys []byte) error { typed = append(typed, string(keys)); return nil }
+
+	sess := reg.Upsert("omp", "s1", nil)
+	reg.SetState(sess.ID, protocol.StateGuess{State: protocol.StateRunning, Confidence: 1, Reason: "running ask", Evidence: "hook:tool_call", At: time.Now()})
+	asked := time.Now().Add(-time.Minute)
+	ask := protocol.TranscriptEvent{Kind: protocol.EventToolCall, ToolName: "ask", ToolUseID: "call_1", At: asked,
+		ToolInput: map[string]any{"questions": []any{map[string]any{
+			"id": "key_access", "header": "Cast key", "multi": false, "recommended": float64(0),
+			"question": "How do you want to hand it to the tool?",
+			"options": []any{
+				map[string]any{"label": "I'll run `cast login`", "description": "one command"},
+				map[string]any{"label": "Put it in tadabbur/.env"},
+				map[string]any{"label": "Paste it in chat"},
+			},
+		}}}}
+
+	m.syncKeyboardQuestion(sess.ID, []protocol.TranscriptEvent{ask}, true)
+	p := reg.SessionApprovals(sess.ID)
+	if len(p) != 1 || p[0].Kind != "question" || len(p[0].Questions) != 1 || len(p[0].Questions[0].Options) != 3 {
+		t.Fatalf("want omp's question on the phone, got %+v", p)
+	}
+	if s, _ := reg.Get(sess.ID); s.State != protocol.StateWaitingInput || !s.StateSince.Equal(asked) {
+		t.Errorf("state %s since %v, want waiting since the question", s.State, s.StateSince)
+	}
+
+	err = m.AnswerByKeys(p[0].ID, protocol.ApprovalDecision{Behavior: "allow",
+		Answers: map[string]string{"How do you want to hand it to the tool?": "Put it in tadabbur/.env"}}, "phone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(typed, "|") != "\x1b[B|\r" {
+		t.Errorf("typed %q, want one down from the recommended option, then Enter", typed)
+	}
+	if s, _ := reg.Get(sess.ID); s.State != protocol.StateRunning {
+		t.Errorf("state %s after the answer, want running", s.State)
+	}
+}
