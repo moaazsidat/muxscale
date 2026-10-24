@@ -24,6 +24,7 @@ func TestScreenQueueReadsTheTerminal(t *testing.T) {
 	adapters := adapter.NewRegistry()
 	adapters.MustRegister(codex.New())
 	m := NewManager(reg, adapters, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(m.StopPersisting)
 
 	parent := agentSession(t, reg, t.TempDir())
 	sh, err := m.RunShell(parent.ID, 80, 24)

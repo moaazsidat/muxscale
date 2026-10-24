@@ -21,7 +21,9 @@ func reconcileFixture(t *testing.T) (*Manager, *Registry) {
 	}
 	t.Cleanup(func() { st.Close() })
 	reg := NewRegistry()
-	return NewManager(reg, nil, st, slog.New(slog.NewTextHandler(io.Discard, nil))), reg
+	m := NewManager(reg, nil, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(m.StopPersisting)
+	return m, reg
 }
 
 // Regression: one real Claude Code session appeared twice -- once from the

@@ -23,6 +23,12 @@ import (
 // Manager owns wrapped sessions and the discovery loop, and persists
 // everything the registry sees.
 type Manager struct {
+	// persistStop ends persistLoop's subscription; persistDone closes once
+	// the loop has written what it had. See StopPersisting.
+	persistStop func()
+	persistDone chan struct{}
+	persistOnce sync.Once
+
 	reg      *Registry
 	adapters *adapter.Registry
 	store    *store.Store
@@ -125,7 +131,9 @@ func NewManager(reg *Registry, adapters *adapter.Registry, st *store.Store, log 
 		typedAudit:     map[string]time.Time{},
 	}
 	m.typeKeys = m.deliver
-	go m.persistLoop()
+	ch, cancel := m.reg.Subscribe()
+	m.persistStop, m.persistDone = cancel, make(chan struct{})
+	go m.persistLoop(ch)
 	go m.screenQueueLoop()
 	return m
 }
@@ -144,9 +152,8 @@ const defaultPoll = 750 * time.Millisecond
 // persistLoop mirrors registry changes into SQLite. It runs in its own
 // goroutine so a slow disk cannot stall a hook handler that is holding an
 // agent's request open.
-func (m *Manager) persistLoop() {
-	ch, cancel := m.reg.Subscribe()
-	defer cancel()
+func (m *Manager) persistLoop(ch <-chan Change) {
+	defer close(m.persistDone)
 	for c := range ch {
 		switch c.Kind {
 		case ChangeSessionUpsert, ChangeStateChange:
@@ -2068,6 +2075,15 @@ func (m *Manager) hasWrappedPid(pid int) bool {
 }
 
 // Shutdown closes wrapped sessions.
+// StopPersisting stops mirroring the registry into the store, once what has
+// already changed is written. The store can be closed after it, and not
+// before: a write still in flight would land in a closed database, or in a
+// directory being removed.
+func (m *Manager) StopPersisting() {
+	m.persistOnce.Do(m.persistStop)
+	<-m.persistDone
+}
+
 func (m *Manager) Shutdown(grace time.Duration) {
 	m.mu.Lock()
 	ws := make([]*attach.Wrapped, 0, len(m.wrapped))

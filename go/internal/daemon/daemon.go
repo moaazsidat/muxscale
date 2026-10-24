@@ -265,6 +265,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 	}
 
+	// The store closes when this returns; what the registry has changed is
+	// written first.
+	defer d.mgr.StopPersisting()
 	select {
 	case err := <-errCh:
 		return err

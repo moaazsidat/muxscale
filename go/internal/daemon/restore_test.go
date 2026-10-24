@@ -25,7 +25,9 @@ func testManager(t *testing.T) (*Manager, *Registry, *store.Store) {
 	// session's adapter rather than assuming every transcript is Claude Code's.
 	adapters := adapter.NewRegistry()
 	adapters.MustRegister(claudecode.New())
-	return NewManager(reg, adapters, st, log), reg, st
+	m := NewManager(reg, adapters, st, log)
+	t.Cleanup(m.StopPersisting)
+	return m, reg, st
 }
 
 // Regression: Upsert mints a fresh ID, so restoring through it left the map key
@@ -48,6 +50,7 @@ func TestRestoreKeepsPersistedIDAndSetsState(t *testing.T) {
 	// Fresh manager over the same store, as after a daemon restart.
 	reg2 := NewRegistry()
 	m2 := NewManager(reg2, nil, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(m2.StopPersisting)
 	n, err := m2.Restore()
 	if err != nil {
 		t.Fatal(err)
@@ -90,6 +93,7 @@ func TestRestoreNativeSessionAwaitsHook(t *testing.T) {
 	}
 	reg := NewRegistry()
 	m := NewManager(reg, nil, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(m.StopPersisting)
 	if _, err := m.Restore(); err != nil {
 		t.Fatal(err)
 	}
@@ -113,6 +117,7 @@ func TestRestoreLongSilentNativeSessionAsEnded(t *testing.T) {
 	}
 	reg := NewRegistry()
 	m := NewManager(reg, nil, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(m.StopPersisting)
 	if _, err := m.Restore(); err != nil {
 		t.Fatal(err)
 	}
@@ -132,6 +137,7 @@ func TestRestoreSkipsTerminalSessions(t *testing.T) {
 	}
 	reg := NewRegistry()
 	m := NewManager(reg, nil, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(m.StopPersisting)
 	n, err := m.Restore()
 	if err != nil {
 		t.Fatal(err)
@@ -156,6 +162,7 @@ func TestRestoreDropsPendingApprovals(t *testing.T) {
 	}
 	reg := NewRegistry()
 	m := NewManager(reg, nil, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(m.StopPersisting)
 	if _, err := m.Restore(); err != nil {
 		t.Fatal(err)
 	}

@@ -66,6 +66,7 @@ func TestAdapterDiscoveryAdoptsOnlyLiveSessions(t *testing.T) {
 	adapters := adapter.NewRegistry()
 	adapters.MustRegister(omp.New())
 	m := NewManager(reg, adapters, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(m.StopPersisting)
 
 	m.lastAdapterScan = time.Time{}
 	m.discoverAdapters()

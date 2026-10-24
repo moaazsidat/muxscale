@@ -16,6 +16,7 @@ import (
 // why this reflects over the struct instead of listing the maps it knows.
 func TestNewManagerBuildsEveryMap(t *testing.T) {
 	m := NewManager(NewRegistry(), nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(m.StopPersisting)
 	v := reflect.ValueOf(m).Elem()
 	for i := 0; i < v.NumField(); i++ {
 		f := v.Field(i)

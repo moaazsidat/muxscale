@@ -43,6 +43,7 @@ func newOMPApprovals(t *testing.T) *ompApprovals {
 	adapters := adapter.NewRegistry()
 	adapters.MustRegister(omp.New())
 	m := NewManager(reg, adapters, st, log)
+	t.Cleanup(m.StopPersisting)
 	o := &ompApprovals{t: t, mux: http.NewServeMux(), reg: reg}
 	m.typeKeys = func(_ string, keys []byte) error {
 		o.mu.Lock()
@@ -231,6 +232,7 @@ func TestKeyboardQuestionFollowsTheTranscript(t *testing.T) {
 	adapters := adapter.NewRegistry()
 	adapters.MustRegister(claudecode.New())
 	m := NewManager(reg, adapters, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(m.StopPersisting)
 	var typed []string
 	m.typeKeys = func(_ string, keys []byte) error { typed = append(typed, string(keys)); return nil }
 
