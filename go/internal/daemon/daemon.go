@@ -632,7 +632,13 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 			return
 		}
 		if err := d.mgr.Kill(body.SessionID); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			// 409 for a session in someone else's terminal, so a client can
+			// say where to close it instead of showing an error.
+			status := http.StatusBadRequest
+			if errors.Is(err, errNotOurs) {
+				status = http.StatusConflict
+			}
+			http.Error(w, err.Error(), status)
 			return
 		}
 		writeJSON(w, map[string]bool{"killed": true})

@@ -71,6 +71,11 @@ type Manager struct {
 	// reported as "closed" rather than "crashed".
 	closing map[string]bool
 
+	// discover lists the agent processes running now, and parentOf names a
+	// process's parent: the process table, swapped out in tests.
+	discover func() ([]attach.Process, error)
+	parentOf func(pid int) int
+
 	// tmuxTargets maps a session to an adopted tmux pane, which is how an
 	// already-running session becomes writable without changing anyone's habits.
 	tmuxTargets map[string]string
@@ -131,6 +136,8 @@ func NewManager(reg *Registry, adapters *adapter.Registry, st *store.Store, log 
 		typedAudit:     map[string]time.Time{},
 	}
 	m.typeKeys = m.deliver
+	m.discover = attach.Discover
+	m.parentOf = parentPid
 	ch, cancel := m.reg.Subscribe()
 	m.persistStop, m.persistDone = cancel, make(chan struct{})
 	go m.persistLoop(ch)
@@ -890,13 +897,14 @@ func (m *Manager) deliver(sessionID string, payload []byte) error {
 	return nil
 }
 
-// Kill terminates a wrapped session.
+// Kill ends a session: one muxscale runs, or an agent started inside a
+// shell muxscale runs (see stopAgentInShell).
 func (m *Manager) Kill(sessionID string) error {
 	m.mu.RLock()
 	w := m.wrapped[sessionID]
 	m.mu.RUnlock()
 	if w == nil {
-		return fmt.Errorf("session %s is not a wrapped session", sessionID)
+		return m.stopAgentInShell(sessionID)
 	}
 	m.mu.Lock()
 	m.closing[sessionID] = true
@@ -992,7 +1000,7 @@ func (m *Manager) scanOnce() {
 func (m *Manager) scanOnceLocked() {
 	tmuxPanes, panesKnown := m.scanTmux()
 
-	procs, err := attach.Discover()
+	procs, err := m.discover()
 	if err != nil {
 		m.log.Debug("discovery failed", "err", err)
 		return

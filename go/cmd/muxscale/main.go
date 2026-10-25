@@ -106,7 +106,7 @@ Sessions
   muxscale deny ID             Deny one
   muxscale send ID "text"      Reply to a session
   muxscale run -- CMD          Start CMD as a session muxscale owns
-  muxscale kill ID             End a session started with run
+  muxscale kill ID             End a session muxscale runs, or an agent in one of its shells
 
 More
   muxscale acl [allow|deny U]  Who besides you may connect over Tailscale
