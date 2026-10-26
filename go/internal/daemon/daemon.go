@@ -777,6 +777,34 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 		writeJSON(w, d.mgr.AdoptNow())
 	})
 
+	// GET  /v1/terminals/iterm2   whether macOS lets the daemon control iTerm2
+	// POST /v1/terminals/iterm2   ask, raising macOS's prompt if undecided
+	//
+	// The daemon asks for itself, since macOS records the answer against the
+	// process that asks -- the service, not the terminal `muxscale up` ran in.
+	// The POST waits on the user's answer. Local only: a phone must not be able
+	// to raise a dialog on the computer.
+	d.handle(mux, "/v1/terminals/iterm2", func(w http.ResponseWriter, r *http.Request) {
+		check := attach.ITerm2Automation
+		if r.Method == http.MethodPost {
+			if _, remote := tsnode.IdentityFrom(r); remote {
+				http.Error(w, "only from this computer", http.StatusForbidden)
+				return
+			}
+			check = attach.RequestITerm2Automation
+		}
+		a, err := check()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if a == attach.AutomationAllowed && r.Method == http.MethodPost {
+			// Adopt the iTerm2 panes now rather than at the next scan.
+			go d.mgr.AdoptNow()
+		}
+		writeJSON(w, map[string]any{"automation": a})
+	})
+
 	// GET  /v1/acl              list
 	// POST /v1/acl {"allow"|"deny": "user@example.com"}
 	//

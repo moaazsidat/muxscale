@@ -33,6 +33,28 @@ import (
 // loop, which runs on a ticker and has other sessions to get to.
 const itermTimeout = 5 * time.Second
 
+// iTerm2 is asked one thing at a time, and never again in a hurry after it
+// has been slow. An Apple event iTerm2 has received stays parked on one of its
+// threads until iTerm2 answers it, whether or not anyone is still waiting for
+// the answer -- so killing a slow osascript and asking again leaks a thread
+// per attempt. iTerm2 has 512 of them; at one per scan a wedged iTerm2 runs
+// out within hours, after which it cannot recover even once whatever wedged it
+// clears. Instead a slow osascript is left to finish (or reach AppleScript's
+// own timeout) in the background, holding the slot while it does, and the
+// next call after it waits out a backoff that doubles while iTerm2 stays slow.
+var (
+	// itermSlot is held from the moment an osascript starts until it exits.
+	itermSlot = make(chan struct{}, 1)
+	// itermQuietUntil and itermBackoff belong to whoever holds itermSlot.
+	itermQuietUntil time.Time
+	itermBackoff    time.Duration
+)
+
+const (
+	itermBackoffMin = 10 * time.Second
+	itermBackoffMax = 5 * time.Minute
+)
+
 // ITerm2Session is one iTerm2 session (a pane, in its terminology).
 type ITerm2Session struct {
 	// ID is iTerm2's own session id -- a UUID, stable for the session's life.
@@ -261,8 +283,31 @@ func parsePlace(out string) (itermPlace, error) {
 //
 // Via stdin rather than -e so a script carrying arbitrary user text cannot run
 // into argv limits or the shell's idea of quoting.
+//
+// Only once macOS has allowed it (iTerm2Gate): an event sent before that
+// raises the Automation prompt from a daemon nobody is watching, and waits on
+// it. Nor to an iTerm2 that isn't running, which `tell application` would
+// launch.
 func runOsascript(script string) (string, error) {
-	cmd := exec.Command("osascript", "-")
+	if err := iTerm2Gate(); err != nil {
+		return "", err
+	}
+	return runITerm2Call(exec.Command("osascript", "-"), script, itermTimeout)
+}
+
+// runITerm2Call is runOsascript with the command and timeout supplied, so the
+// gating can be tested without iTerm2.
+func runITerm2Call(cmd *exec.Cmd, script string, timeout time.Duration) (string, error) {
+	select {
+	case itermSlot <- struct{}{}:
+	case <-time.After(timeout):
+		return "", fmt.Errorf("iTerm2 is still working on an earlier request")
+	}
+	if wait := time.Until(itermQuietUntil); wait > 0 {
+		<-itermSlot
+		return "", fmt.Errorf("iTerm2 stopped answering; trying again in %s", wait.Round(time.Second))
+	}
+
 	cmd.Stdin = strings.NewReader(script)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -270,18 +315,28 @@ func runOsascript(script string) (string, error) {
 
 	done := make(chan error, 1)
 	if err := cmd.Start(); err != nil {
+		<-itermSlot
 		return "", err
 	}
-	go func() { done <- cmd.Wait() }()
+	started := time.Now()
+	go func() {
+		err := cmd.Wait()
+		if time.Since(started) > timeout {
+			itermBackoff = min(max(2*itermBackoff, itermBackoffMin), itermBackoffMax)
+			itermQuietUntil = time.Now().Add(itermBackoff)
+		} else {
+			itermBackoff = 0
+		}
+		<-itermSlot
+		done <- err
+	}()
 	select {
 	case err := <-done:
 		if err != nil {
 			return "", osascriptError(stderr.String(), err)
 		}
-	case <-time.After(itermTimeout):
-		_ = cmd.Process.Kill()
-		<-done
-		return "", fmt.Errorf("iTerm2 did not answer within %s", itermTimeout)
+	case <-time.After(timeout):
+		return "", fmt.Errorf("iTerm2 did not answer within %s", timeout)
 	}
 	// osascript terminates its result with a newline of its own, which is not
 	// part of the value.

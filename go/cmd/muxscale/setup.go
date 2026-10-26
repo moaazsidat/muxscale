@@ -80,6 +80,7 @@ func cmdUp(args []string) error {
 	for wait := 0; wait < 10; wait++ {
 		if _, ok := daemonReachable(); ok {
 			fmt.Println("\nmuxscale is running. To use it from your phone:  muxscale connect")
+			askForITerm2()
 			return nil
 		}
 		time.Sleep(500 * time.Millisecond)
@@ -87,6 +88,52 @@ func cmdUp(args []string) error {
 	fmt.Println("\nThe service is installed but the daemon has not answered yet;")
 	fmt.Println("`muxscale status` will say why.")
 	return nil
+}
+
+// askForITerm2 gets macOS's answer on whether the service may control iTerm2,
+// while someone is at the screen to give it.
+//
+// The daemon never raises the prompt by itself: sent from a background
+// service, it sat unanswered with an Apple event parked behind it until
+// iTerm2 had to be quit. So `up`, run by a person, has the daemon ask -- the
+// answer is recorded against the process that asks, which has to be the
+// service -- and says what the dialog is before it appears.
+func askForITerm2() {
+	if !attach.ITerm2Installed() {
+		return
+	}
+	var st struct {
+		Automation attach.Automation `json:"automation"`
+	}
+	if err := apiGet("/v1/terminals/iterm2", &st); err != nil {
+		return
+	}
+	switch st.Automation {
+	case attach.AutomationNotRunning:
+		fmt.Println("\nTo use agents running in iTerm2 from your phone, open iTerm2 and run")
+		fmt.Println("`muxscale up` again: macOS will ask to let muxscale control it.")
+	case attach.AutomationDenied:
+		fmt.Println("\nmuxscale can't read or type into agents in iTerm2: macOS has it turned off.")
+		fmt.Println("Turn it on in System Settings > Privacy & Security > Automation, under muxscale.")
+	case attach.AutomationNotAsked:
+		fmt.Println("\nTo read and type into agents running in iTerm2, muxscale needs macOS's")
+		fmt.Println("permission to control iTerm2. macOS is asking now -- click OK.")
+		resp, err := apiPost("/v1/terminals/iterm2", "")
+		if err != nil {
+			fmt.Printf("Could not ask: %v\n", err)
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || json.NewDecoder(resp.Body).Decode(&st) != nil {
+			fmt.Println("Could not ask; `muxscale status` will say more.")
+			return
+		}
+		if st.Automation == attach.AutomationAllowed {
+			fmt.Println("Allowed. Agents in iTerm2 show up on your phone within a few seconds.")
+		} else {
+			fmt.Println("Not allowed. To change that: System Settings > Privacy & Security > Automation.")
+		}
+	}
 }
 
 // installShims writes the PATH shims, for agents started after this.

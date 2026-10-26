@@ -1,6 +1,8 @@
 package attach
 
 import (
+	"errors"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -178,5 +180,87 @@ func TestParsePlace(t *testing.T) {
 	// A closed session reads as one, so its target is dropped as stale.
 	if _, err := parsePlace("gone"); err == nil || !IsTargetStale(markStale(err)) {
 		t.Errorf("gone: %v, want a stale target", err)
+	}
+}
+
+// resetITerm2Gate gives a test the gate as a fresh daemon would have it.
+func resetITerm2Gate(t *testing.T) {
+	t.Helper()
+	itermSlot = make(chan struct{}, 1)
+	itermQuietUntil, itermBackoff = time.Time{}, 0
+	// A slow call outlives its test, by design. Waited for at the end, so it
+	// does not release a slot the next test has taken.
+	slot := itermSlot
+	t.Cleanup(func() {
+		slot <- struct{}{}
+		<-slot
+	})
+}
+
+// A wedged iTerm2 keeps every Apple event it has been sent, so a slow call
+// must hold the slot until it really ends rather than be killed and retried.
+func TestITerm2CallHoldsTheSlotWhileASlowCallRuns(t *testing.T) {
+	resetITerm2Gate(t)
+	if _, err := runITerm2Call(exec.Command("sleep", "0.5"), "", 50*time.Millisecond); err == nil {
+		t.Fatal("slow call reported success")
+	}
+	_, err := runITerm2Call(exec.Command("true"), "", 50*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "earlier request") {
+		t.Fatalf("second call while the first runs: err = %v", err)
+	}
+}
+
+func TestITerm2CallBacksOffAfterASlowCall(t *testing.T) {
+	resetITerm2Gate(t)
+	runITerm2Call(exec.Command("sleep", "0.2"), "", 50*time.Millisecond)
+	time.Sleep(400 * time.Millisecond) // let the slow call end
+	_, err := runITerm2Call(exec.Command("true"), "", 50*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "trying again") {
+		t.Fatalf("call after a slow one: err = %v", err)
+	}
+	if itermBackoff != itermBackoffMin {
+		t.Fatalf("backoff = %s, want %s", itermBackoff, itermBackoffMin)
+	}
+}
+
+func TestITerm2CallBackoffClearsOnAPromptAnswer(t *testing.T) {
+	resetITerm2Gate(t)
+	itermBackoff = time.Minute
+	if _, err := runITerm2Call(exec.Command("true"), "", time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if itermBackoff != 0 {
+		t.Fatalf("backoff = %s after a prompt answer, want 0", itermBackoff)
+	}
+}
+
+// Nothing reaches iTerm2 that macOS has not already allowed: a script sent
+// before then raises the Automation prompt from a daemon nobody is watching.
+func TestNoScriptWithoutPermission(t *testing.T) {
+	closed := errors.New("not allowed")
+	old := iTerm2Gate
+	iTerm2Gate = func() error { return closed }
+	defer func() { iTerm2Gate = old }()
+
+	if _, err := ITerm2Sessions(); !errors.Is(err, closed) {
+		t.Fatalf("ITerm2Sessions: got %v, want the gate's error", err)
+	}
+	if err := ITerm2SendText("w0t0p0:ABC", "/dev/ttys001", []byte("hi")); err == nil {
+		t.Fatal("ITerm2SendText went ahead without permission")
+	}
+}
+
+func TestAutomationErrorSaysWhatToDo(t *testing.T) {
+	if automationError(AutomationAllowed) != nil {
+		t.Fatal("allowed should not be an error")
+	}
+	for a, want := range map[Automation]string{
+		AutomationNotAsked:   "muxscale up",
+		AutomationDenied:     "System Settings",
+		AutomationNotRunning: "not running",
+	} {
+		if err := automationError(a); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: got %v, want it to mention %q", a, err, want)
+		}
 	}
 }

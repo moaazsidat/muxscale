@@ -108,26 +108,26 @@ func detectITerm2() TermCapability {
 	}
 	c.Available = true
 
-	// Probe the path muxscale actually uses: AppleScript session enumeration.
-	//
-	// Reporting "needs the Python API enabled" while the daemon was adopting
-	// panes over AppleScript made doctor contradict the daemon's own
-	// behaviour -- it said no terminal control while five sessions were
-	// writable. The probe is one Apple event, and the first one raises macOS's
-	// Automation prompt, which is exactly the moment to raise it: a user
-	// running doctor has asked what is missing and is watching the screen.
-	sessions, err := ITerm2Sessions()
+	// Whether macOS lets this process script iTerm2, asked without a prompt.
+	// It used to probe with an Apple event, whose first one raised the
+	// Automation prompt -- from the daemon, a background service, where it sat
+	// unanswered with the event parked behind it. The prompt is `muxscale
+	// up`'s to raise now (RequestITerm2Automation).
+	a, err := ITerm2Automation()
 	switch {
-	case err != nil && strings.Contains(err.Error(), "is not running"):
-		c.Reason = "iTerm2 is not running"
-		c.HowToFix = "open iTerm2; muxscale picks up its sessions within a few seconds"
 	case err != nil:
 		c.Reason = err.Error()
-		c.HowToFix = "grant muxscale permission to control iTerm2 in " +
-			"System Settings > Privacy & Security > Automation"
-	default:
-		_ = sessions
+	case a == AutomationAllowed:
 		c.Enabled = true
+	case a == AutomationNotRunning:
+		c.Reason = "iTerm2 is not running"
+		c.HowToFix = "open iTerm2; muxscale picks up its sessions within a few seconds"
+	case a == AutomationNotAsked:
+		c.Reason = "muxscale has not been allowed to control iTerm2 yet"
+		c.HowToFix = "run `muxscale up` and click OK when macOS asks"
+	default:
+		c.Reason = "macOS has not allowed muxscale to control iTerm2"
+		c.HowToFix = "turn it on in System Settings > Privacy & Security > Automation, under muxscale"
 	}
 	return c
 }
