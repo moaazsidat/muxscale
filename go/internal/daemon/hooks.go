@@ -194,7 +194,7 @@ func (h *HookServer) link(e *adapter.HookEvent, r *http.Request) int {
 		if h.mgr != nil {
 			h.mgr.Merge(procID, hookID)
 		} else {
-			h.reg.Remove(hookID)
+			h.reg.RemoveInto(hookID, procID)
 		}
 		h.log.Info("merged a session found twice", "kept", procID, "dropped", hookID, "pid", pid)
 	case hasHook && !hasProc:

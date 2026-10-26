@@ -1571,7 +1571,7 @@ func (m *Manager) Merge(keepID, dropID string) {
 		}
 		m.mu.Unlock()
 	}
-	m.Drop(dropID)
+	m.Drop(dropID, keepID)
 	if path != "" {
 		m.Retail(keepID, path)
 	}
@@ -1615,9 +1615,9 @@ func (m *Manager) ingest(sessionID string, h *tailHandle, events []protocol.Tran
 }
 
 // Drop removes a session that turned out to be another one found twice,
-// along with everything following it.
-func (m *Manager) Drop(id string) {
-	m.reg.Remove(id)
+// along with everything following it; clients follow it to into.
+func (m *Manager) Drop(id, into string) {
+	m.reg.RemoveInto(id, into)
 	m.mu.Lock()
 	delete(m.tailers, id)
 	delete(m.termctlTargets, id)

@@ -97,6 +97,11 @@ func TestTwoRowsForOneProcessMerge(t *testing.T) {
 		select {
 		case c := <-ch:
 			if c.Kind == ChangeSessionRemove && c.Session.ID == dup.ID {
+				// Named, so a phone showing the duplicate follows it to
+				// the row it now is rather than losing it.
+				if c.Into != scanned.ID {
+					t.Fatalf("removal says it went into %q, want %q", c.Into, scanned.ID)
+				}
 				return
 			}
 		case <-deadline:

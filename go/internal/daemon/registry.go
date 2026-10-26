@@ -57,7 +57,10 @@ type Change struct {
 	Event    *protocol.TranscriptEvent `json:"event,omitempty"`
 	Approval *protocol.ApprovalRequest `json:"approval,omitempty"`
 	Prev     protocol.SessionState     `json:"prev,omitempty"`
-	At       time.Time                 `json:"at"`
+	// Into, on a session_remove, is the row it was folded into: a client
+	// showing the removed one follows it there rather than losing it.
+	Into string    `json:"into,omitempty"`
+	At   time.Time `json:"at"`
 }
 
 // NewRegistry builds an empty registry.
@@ -215,7 +218,11 @@ func (r *Registry) Update(id string, mutate func(*protocol.Session)) *protocol.S
 // once by process scan and once by its own hooks, because the two paths key on
 // different things. Whichever attachment is weaker gets dropped, so a phone
 // shows one row per agent rather than two.
-func (r *Registry) Remove(id string) bool {
+func (r *Registry) Remove(id string) bool { return r.RemoveInto(id, "") }
+
+// RemoveInto is Remove for a row folded into another, which clients are told
+// to follow.
+func (r *Registry) RemoveInto(id, into string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	s, ok := r.sessions[id]
@@ -230,7 +237,7 @@ func (r *Registry) Remove(id string) bool {
 		}
 	}
 	gone := *s
-	r.broadcast(Change{Kind: ChangeSessionRemove, Session: &gone})
+	r.broadcast(Change{Kind: ChangeSessionRemove, Session: &gone, Into: into})
 	return true
 }
 
