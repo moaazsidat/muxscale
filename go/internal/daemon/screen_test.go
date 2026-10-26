@@ -254,6 +254,28 @@ func TestScreenStream404sForASessionWithNoScreen(t *testing.T) {
 	}
 }
 
+// A polled screen is read again straight after a keystroke, so the echo
+// reaches the phone without waiting for the next tick.
+func TestTypingWakesAPolledScreen(t *testing.T) {
+	d, _ := testDaemon(t, testToken)
+	parent := agentSession(t, d.reg, t.TempDir())
+
+	changed := d.mgr.ScreenChanged(parent.ID)
+	go d.mgr.lookAfterTyping(parent.ID)
+	select {
+	case <-changed:
+	case <-time.After(150 * time.Millisecond):
+		t.Fatal("typing did not wake the screen's stream")
+	}
+	// And once more, for a program that redraws a moment later.
+	again := d.mgr.ScreenChanged(parent.ID)
+	select {
+	case <-again:
+	case <-time.After(time.Second):
+		t.Fatal("no second look after typing")
+	}
+}
+
 func TestClampFPS(t *testing.T) {
 	cases := map[string]int{
 		"":         defaultFPS,

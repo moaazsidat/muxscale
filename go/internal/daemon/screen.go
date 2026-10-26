@@ -219,10 +219,13 @@ func (d *Daemon) screenRoutes(mux *http.ServeMux) {
 		}
 
 		// Anything else is a terminal muxscale reads the contents of and
-		// cannot be told about, so it is polled.
+		// cannot be told about, so it is polled -- and read again straight
+		// after someone types into it (lookAfterTyping), so the echo does not
+		// wait for the next tick.
 		ticker := time.NewTicker(time.Second / time.Duration(clampFPS(r.URL.Query().Get("fps"))))
 		defer ticker.Stop()
 		for {
+			typed := d.mgr.ScreenChanged(id)
 			select {
 			case <-r.Context().Done():
 				return
@@ -234,6 +237,11 @@ func (d *Daemon) screenRoutes(mux *http.ServeMux) {
 				if !frame() {
 					return
 				}
+			case <-typed:
+				if !frame() {
+					return
+				}
+				ticker.Reset(time.Second / time.Duration(clampFPS(r.URL.Query().Get("fps"))))
 			}
 		}
 	})

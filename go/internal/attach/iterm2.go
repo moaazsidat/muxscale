@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
@@ -118,32 +119,16 @@ func ITerm2SendText(sessionID, wantTTY string, data []byte) error {
 	if len(data) == 0 {
 		return nil
 	}
-	script := fmt.Sprintf(`
-tell application "iTerm2"
-  repeat with w in windows
-    repeat with t in tabs of w
-      repeat with s in sessions of t
-        if (id of s) is %s then
-          if (tty of s) is not %s then return "moved"
-          tell s to write text %s newline NO
-          return "ok"
-        end if
-      end repeat
-    end repeat
-  end repeat
-  return "gone"
-end tell
-`, quoteAppleScript(sessionID), quoteAppleScript(wantTTY), appleScriptBytes(data))
-
-	out, err := runOsascript(script)
+	out, err := atITerm2Session(sessionID, fmt.Sprintf(`
+  if (tty of s) is not %s then return "moved"
+  tell s to write text %s newline NO
+  return "ok"`, quoteAppleScript(wantTTY), appleScriptBytes(data)))
 	if err != nil {
 		return err
 	}
 	switch strings.TrimSpace(out) {
 	case "ok":
 		return nil
-	case "gone":
-		return fmt.Errorf("the iTerm2 window for this session has been closed")
 	case "moved":
 		return fmt.Errorf(
 			"the iTerm2 window for this session is no longer on %s; not typing into it", wantTTY)
@@ -153,19 +138,123 @@ end tell
 
 // ITerm2Text reads a session's visible screen.
 func ITerm2Text(sessionID string) (string, error) {
-	script := fmt.Sprintf(`
+	out, err := atITerm2Session(sessionID, `
+  return "ok:" & (text of s)`)
+	if err != nil {
+		return "", err
+	}
+	text, ok := strings.CutPrefix(out, "ok:")
+	if !ok {
+		return "", fmt.Errorf("iTerm2 gave an unexpected answer: %q", out)
+	}
+	return text, nil
+}
+
+// Where each session was last found: its window's id and its tab's and its
+// own position there.
+//
+// Typing and reading go to a session by id, and AppleScript has no way to
+// name a session by id directly. Walking every window, tab and session to
+// find it is one Apple event per session: about a second with forty open,
+// paid on every keystroke and every frame of a polled screen, which is what
+// made typing into an adopted pane feel like typing into treacle. Found once
+// in bulk, a session is then addressed by where it is; the id is checked on
+// arrival, and a session that has moved -- a tab closed or dragged before it
+// -- is looked for again.
+var (
+	itermPlacesMu sync.Mutex
+	itermPlaces   = map[string]itermPlace{}
+)
+
+type itermPlace struct {
+	window       string
+	tab, session int
+}
+
+// atITerm2Session runs body with `s` bound to the session, and returns what
+// it returns.
+func atITerm2Session(sessionID, body string) (string, error) {
+	itermPlacesMu.Lock()
+	place, known := itermPlaces[sessionID]
+	itermPlacesMu.Unlock()
+	for attempt := 0; attempt < 2; attempt++ {
+		if !known {
+			var err error
+			if place, err = locateITerm2Session(sessionID); err != nil {
+				return "", err
+			}
+			itermPlacesMu.Lock()
+			itermPlaces[sessionID] = place
+			itermPlacesMu.Unlock()
+		}
+		out, err := runOsascript(fmt.Sprintf(`
 tell application "iTerm2"
-  repeat with w in windows
-    repeat with t in tabs of w
-      repeat with s in sessions of t
-        if (id of s) is %s then return (text of s)
-      end repeat
+  try
+    set s to session %d of tab %d of window id %s
+    if (id of s) is not %s then error "elsewhere"
+  on error
+    return "%s"
+  end try
+%s
+end tell
+`, place.session, place.tab, place.window, quoteAppleScript(sessionID), itermElsewhere, body))
+		if err != nil {
+			return "", err
+		}
+		if out != itermElsewhere {
+			return out, nil
+		}
+		itermPlacesMu.Lock()
+		delete(itermPlaces, sessionID)
+		itermPlacesMu.Unlock()
+		known = false
+	}
+	return "", fmt.Errorf("the iTerm2 window for this session has been closed")
+}
+
+// itermElsewhere is what the script says when the session is not where it
+// was; it cannot be mistaken for a screen, which starts "ok:".
+const itermElsewhere = "elsewhere"
+
+// locateITerm2Session finds a session in one bulk read of every id, as
+// ITerm2Sessions does, and walks the lists here rather than in iTerm2.
+func locateITerm2Session(sessionID string) (itermPlace, error) {
+	out, err := runOsascript(fmt.Sprintf(`
+tell application "iTerm2"
+  set wids to id of every window
+  set ids to id of every session of every tab of every window
+end tell
+if (count of wids) is not (count of ids) then return "mismatch"
+repeat with wi from 1 to count of ids
+  set tabList to item wi of ids
+  repeat with ti from 1 to count of tabList
+    set sessionList to item ti of tabList
+    repeat with si from 1 to count of sessionList
+      if (item si of sessionList) is %s then return ((item wi of wids) as text) & " " & ti & " " & si
     end repeat
   end repeat
-  error "no such session"
-end tell
-`, quoteAppleScript(sessionID))
-	return runOsascript(script)
+end repeat
+return "gone"
+`, quoteAppleScript(sessionID)))
+	if err != nil {
+		return itermPlace{}, err
+	}
+	return parsePlace(out)
+}
+
+func parsePlace(out string) (itermPlace, error) {
+	switch out = strings.TrimSpace(out); out {
+	case "gone":
+		return itermPlace{}, fmt.Errorf("the iTerm2 window for this session has been closed")
+	case "mismatch":
+		return itermPlace{}, fmt.Errorf("iTerm2's windows changed while muxscale was looking; try again")
+	}
+	var p itermPlace
+	if _, err := fmt.Sscanf(out, "%s %d %d", &p.window, &p.tab, &p.session); err != nil ||
+		p.tab < 1 || p.session < 1 || strings.Trim(p.window, "0123456789") != "" {
+		return itermPlace{}, fmt.Errorf("iTerm2 gave an unexpected answer: %q", out)
+	}
+	return p, nil
 }
 
 // runOsascript runs a script read from stdin.

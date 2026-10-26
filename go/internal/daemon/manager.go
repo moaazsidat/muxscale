@@ -805,6 +805,9 @@ func (m *Manager) SendRaw(sessionID string, data []byte, actor string) error {
 	if err := m.deliver(sessionID, data); err != nil {
 		return err
 	}
+	if !m.HasLiveScreen(sessionID) {
+		go m.lookAfterTyping(sessionID)
+	}
 	now := time.Now()
 	m.mu.Lock()
 	due := now.Sub(m.typedAudit[sessionID]) >= time.Minute
@@ -816,6 +819,24 @@ func (m *Manager) SendRaw(sessionID string, data []byte, actor string) error {
 		_ = m.store.Audit(actor, "input_typed", sessionID, "keystrokes from a terminal")
 	}
 	return nil
+}
+
+// typedLooks are when a screen muxscale polls is read again after a
+// keystroke: soon, for a program that echoes as it reads, and once more for
+// one that redraws on a timer of its own (Claude Code's input box). Each read
+// of an iTerm2 pane is an osascript, about a tenth of a second, so the second
+// is the last.
+var typedLooks = []time.Duration{30 * time.Millisecond, 200 * time.Millisecond}
+
+// lookAfterTyping wakes the streams polling a session's screen, so what was
+// typed shows on the phone when it is on the terminal, not on the next tick.
+func (m *Manager) lookAfterTyping(sessionID string) {
+	var waited time.Duration
+	for _, at := range typedLooks {
+		time.Sleep(at - waited)
+		waited = at
+		m.notifyScreen(sessionID)
+	}
 }
 
 // PasteBytes encodes pasted text for a session's terminal: inside paste

@@ -164,3 +164,19 @@ func TestSendTextRefusesWhenTheAgentHasExited(t *testing.T) {
 		t.Errorf("a vanished pid was not treated as stale: %v", err)
 	}
 }
+
+func TestParsePlace(t *testing.T) {
+	p, err := parsePlace("270 14 1\n")
+	if err != nil || p != (itermPlace{window: "270", tab: 14, session: 1}) {
+		t.Fatalf("got %+v, %v", p, err)
+	}
+	for _, bad := range []string{"", "270 14", "270 0 1", `270" & x 1 1`, "w 1 1 extra junk"} {
+		if _, err := parsePlace(bad); err == nil {
+			t.Errorf("%q: want an error", bad)
+		}
+	}
+	// A closed session reads as one, so its target is dropped as stale.
+	if _, err := parsePlace("gone"); err == nil || !IsTargetStale(markStale(err)) {
+		t.Errorf("gone: %v, want a stale target", err)
+	}
+}
