@@ -14,6 +14,9 @@ import (
 
 func testManager(t *testing.T) (*Manager, *Registry, *store.Store) {
 	t.Helper()
+	// Not this machine's home: the Claude Code adapter reads its process
+	// records from there, and this machine's say nothing of a test's sessions.
+	t.Setenv("HOME", t.TempDir())
 	st, err := store.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)

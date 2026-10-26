@@ -102,6 +102,9 @@ func (*Adapter) Discover(context.Context) ([]adapter.Discovered, error) {
 		return nil, err
 	}
 
+	// Whether a process is in each conversation, where that can be read; the
+	// age of its file where it cannot.
+	running, runningKnown := liveConversations()
 	var out []adapter.Discovered
 	for _, p := range projects {
 		if !p.IsDir() {
@@ -118,6 +121,10 @@ func (*Adapter) Discover(context.Context) ([]adapter.Discovered, error) {
 			}
 			path := filepath.Join(dir, f.Name())
 			info, statErr := f.Info()
+			live := statErr == nil && time.Since(info.ModTime()) < liveWindow
+			if runningKnown {
+				live = running[strings.TrimSuffix(f.Name(), ".jsonl")]
+			}
 			out = append(out, adapter.Discovered{
 				NaturalKey: strings.TrimSuffix(f.Name(), ".jsonl"),
 				// Read from the file's first record rather than un-slugging the
@@ -126,7 +133,7 @@ func (*Adapter) Discover(context.Context) ([]adapter.Discovered, error) {
 				// most checkouts do.
 				Cwd:  headerCwd(path),
 				Ref:  path,
-				Live: statErr == nil && time.Since(info.ModTime()) < liveWindow,
+				Live: live,
 			})
 		}
 	}
@@ -135,7 +142,8 @@ func (*Adapter) Discover(context.Context) ([]adapter.Discovered, error) {
 }
 
 // liveWindow is how recently a transcript must have changed for the session to
-// count as live. Generous on purpose: a session blocked on a human is idle by
+// count as live, where Claude Code's process records cannot be read
+// (liveConversations). Generous on purpose: a session blocked on a human is idle by
 // definition, and a tight window would hide exactly those.
 const liveWindow = 12 * time.Hour
 
@@ -227,11 +235,26 @@ func (*Adapter) MatchTranscript(cwd string, started time.Time, claimed map[strin
 // not come through here: it produces an exact state directly, and routing it
 // through inference would only be an opportunity to lose confidence.
 func (*Adapter) InferState(in adapter.StateInput) (protocol.StateGuess, bool) {
+	if in.Live != nil && !*in.Live && in.Idle >= endedQuiet {
+		// No process is in the conversation, whatever its last line says: a
+		// session cut off by its terminal closing ends on an interrupted
+		// turn, which read as waiting for you. Not while the file is still
+		// being written, which only a running process does.
+		return protocol.StateGuess{
+			State: protocol.StateExited, Confidence: 0.85,
+			Reason:   "no Claude Code process is in this conversation",
+			Evidence: "procrecord:none", At: time.Now(),
+		}, true
+	}
 	if len(in.Recent) == 0 {
 		return protocol.StateGuess{}, false
 	}
 	return InferState(in.Recent, time.Now().Add(-in.Idle), in.Quiescence), true
 }
+
+// endedQuiet is how long a transcript must have been still before a
+// conversation with no process record is taken to have ended.
+const endedQuiet = 30 * time.Second
 
 func (*Adapter) PlanInstall(context.Context) (adapter.InstallPlan, error) {
 	return BuildInstall(InstallOptions{})

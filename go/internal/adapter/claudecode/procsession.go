@@ -2,9 +2,12 @@ package claudecode
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"syscall"
 	"time"
 )
 
@@ -78,4 +81,65 @@ func ProcessTranscript(pid int, started time.Time, cwd string) string {
 		}
 	}
 	return ""
+}
+
+// liveConversations returns the conversations a running Claude Code process
+// is in, from the record each one keeps in ~/.claude/sessions. known is false
+// when the records cannot be read, so a permissions problem can never mark
+// every session ended.
+//
+// This is how a conversation is known to have ended. Its transcript says
+// nothing of the kind: one cut off by its terminal closing ends on an
+// interrupted turn, which reads as waiting for you.
+func liveConversations() (live map[string]bool, known bool) {
+	dir, err := sessionsDir()
+	if err != nil {
+		return nil, false
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		// Missing too: a Claude Code from before it kept them may be running.
+		return nil, false
+	}
+	live = map[string]bool{}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || filepath.Ext(name) != ".json" {
+			continue
+		}
+		pid, err := strconv.Atoi(strings.TrimSuffix(name, ".json"))
+		if err != nil || pid <= 0 || !processAlive(pid) {
+			continue // a record left by a process that did not clean up
+		}
+		b, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			continue
+		}
+		var rec struct {
+			PID       int    `json:"pid"`
+			SessionID string `json:"sessionId"`
+		}
+		if json.Unmarshal(b, &rec) != nil || rec.PID != pid || rec.SessionID == "" {
+			continue
+		}
+		live[rec.SessionID] = true
+	}
+	return live, true
+}
+
+// processAlive reports whether a process exists. EPERM means it does, owned
+// by someone else.
+func processAlive(pid int) bool {
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+// Live reports whether a Claude Code process is in the conversation a
+// transcript records (adapter.Liveness).
+func (*Adapter) Live(ref string) (bool, bool) {
+	live, known := liveConversations()
+	if !known {
+		return false, false
+	}
+	return live[strings.TrimSuffix(filepath.Base(ref), ".jsonl")], true
 }
