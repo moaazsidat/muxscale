@@ -138,7 +138,7 @@ func NewManager(reg *Registry, adapters *adapter.Registry, st *store.Store, log 
 	m.typeKeys = m.deliver
 	m.discover = attach.Discover
 	m.parentOf = parentPid
-	ch, cancel := m.reg.Subscribe()
+	ch, cancel := m.reg.SubscribeInternal()
 	m.persistStop, m.persistDone = cancel, make(chan struct{})
 	go m.persistLoop(ch)
 	go m.screenQueueLoop()

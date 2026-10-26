@@ -22,7 +22,7 @@ type Registry struct {
 	// handler is waiting on.
 	approvals map[string]*pendingApproval
 
-	subs   map[int]chan Change
+	subs   map[int]subscriber
 	nextID int
 }
 
@@ -66,12 +66,29 @@ func NewRegistry() *Registry {
 		sessions:  map[string]*protocol.Session{},
 		byNatural: map[string]string{},
 		approvals: map[string]*pendingApproval{},
-		subs:      map[int]chan Change{},
+		subs:      map[int]subscriber{},
 	}
 }
 
-// Subscribe returns a channel of changes and a cancel func.
-func (r *Registry) Subscribe() (<-chan Change, func()) {
+// subscriber is one Subscribe call's channel, and what to do when it is full.
+type subscriber struct {
+	ch chan Change
+	// cutOff closes the channel when it falls a buffer behind, rather than
+	// dropping the change (see broadcast).
+	cutOff bool
+}
+
+// Subscribe returns a channel of changes and a cancel func, for a client: one
+// that falls a whole buffer behind has its channel closed (see broadcast), and
+// reads every session afresh on reconnecting.
+func (r *Registry) Subscribe() (<-chan Change, func()) { return r.subscribe(true) }
+
+// SubscribeInternal is Subscribe for the daemon's own consumers, which have no
+// reconnect to fall back on: a full buffer drops the change and the channel
+// stays open.
+func (r *Registry) SubscribeInternal() (<-chan Change, func()) { return r.subscribe(false) }
+
+func (r *Registry) subscribe(cutOff bool) (<-chan Change, func()) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	id := r.nextID
@@ -79,24 +96,36 @@ func (r *Registry) Subscribe() (<-chan Change, func()) {
 	// Buffered: a slow subscriber must not stall the hook handler, which is
 	// holding an agent's request open.
 	ch := make(chan Change, 256)
-	r.subs[id] = ch
+	r.subs[id] = subscriber{ch: ch, cutOff: cutOff}
 	return ch, func() {
 		r.mu.Lock()
 		defer r.mu.Unlock()
-		if c, ok := r.subs[id]; ok {
+		if sub, ok := r.subs[id]; ok {
 			delete(r.subs, id)
-			close(c)
+			close(sub.ch)
 		}
 	}
 }
 
 // broadcast must be called with the lock held.
+//
+// A client that has fallen a whole buffer behind is cut off, not skipped.
+// Skipping drops changes from a stream that stays open, so a phone holding it
+// never learns it missed them: after a burst -- iTerm2 restarting, every
+// session ending and coming back at once -- one showed a running session as
+// ended until the app happened to reconnect. A closed stream is one the app
+// reconnects to straight away, reading every session afresh. Never blocks:
+// the hook handler calling this is holding an agent's request open.
 func (r *Registry) broadcast(c Change) {
 	c.At = time.Now()
-	for _, ch := range r.subs {
+	for id, sub := range r.subs {
 		select {
-		case ch <- c:
-		default: // drop for slow subscribers rather than block
+		case sub.ch <- c:
+		default:
+			if sub.cutOff {
+				delete(r.subs, id)
+				close(sub.ch)
+			}
 		}
 	}
 }
