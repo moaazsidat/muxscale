@@ -109,6 +109,10 @@ type Manager struct {
 	// every file header, and running that for every agent every three seconds
 	// would make an idle daemon the busiest thing on the machine.
 	lastAdapterScan time.Time
+	// The agent processes the last full scan found, once scanned is true.
+	// Written by the scan, read by reconciles from hooks too, so under mu.
+	lastRunning map[int]bool
+	scanned     bool
 }
 
 // adapterScanEvery is how often adapters enumerate their own sessions. Slow
@@ -134,6 +138,7 @@ func NewManager(reg *Registry, adapters *adapter.Registry, st *store.Store, log 
 		sampled:        map[string]*vt.Emulator{},
 		screenChanged:  map[string]chan struct{}{},
 		typedAudit:     map[string]time.Time{},
+		lastRunning:    map[int]bool{},
 	}
 	m.typeKeys = m.deliver
 	m.discover = attach.Discover
@@ -1028,7 +1033,12 @@ func (m *Manager) scanOnceLocked() {
 	}
 	panes := m.terminalPanes(procs)
 	running := map[int]bool{}
-	defer func() { m.markEnded(running, tmuxPanes, panesKnown) }()
+	defer func() {
+		m.markEnded(running, tmuxPanes, panesKnown)
+		m.mu.Lock()
+		m.lastRunning, m.scanned = running, true
+		m.mu.Unlock()
+	}()
 	for _, p := range procs {
 		agentID := m.identify(p.Command, p.Args)
 		if agentID == "" || helperProcess(p.Args) {
@@ -1489,6 +1499,24 @@ func (m *Manager) Reconcile(keepID, transcriptPath string) {
 		if other.ID == keepID {
 			continue
 		}
+		// A row whose process is gone can do nothing for the conversation,
+		// whatever it was attached by; the one with a process in it is the
+		// session. Without this, resuming a conversation in a new process
+		// left the old row -- hooked, so "stronger" -- holding the name and
+		// the hooks, and the scan ended it for its old process every few
+		// seconds while the new one worked.
+		switch keepGone, otherGone := m.processGone(keep), m.processGone(other); {
+		case keepGone && !otherGone:
+			m.log.Debug("folding a session into the process now in it",
+				"kept", other.ID, "dropped", keepID, "transcript", transcriptPath)
+			m.Merge(other.ID, keepID)
+			return
+		case otherGone && !keepGone:
+			m.log.Debug("folding a session into the process now in it",
+				"kept", keepID, "dropped", other.ID, "transcript", transcriptPath)
+			m.Merge(keepID, other.ID)
+			continue
+		}
 		if capabilityRank(other) > capabilityRank(keep) {
 			// A stronger row owns this conversation. The caller is a process
 			// scan or hook that should have found the stronger attachment;
@@ -1499,6 +1527,27 @@ func (m *Manager) Reconcile(keepID, transcriptPath string) {
 			"kept", keepID, "dropped", other.ID, "transcript", transcriptPath)
 		m.Merge(keepID, other.ID)
 	}
+}
+
+// processGone says whether a row has ended, or is keyed by a process that is
+// no longer running: a row the scan is about to end. Gone means the last scan
+// did not find it and it is not running now; before any scan, nothing is.
+func (m *Manager) processGone(s protocol.Session) bool {
+	if s.State.Terminal() {
+		return true
+	}
+	pid, ok := strings.CutPrefix(s.NaturalKey, "pid:")
+	if !ok {
+		return false
+	}
+	n, err := strconv.Atoi(pid)
+	if err != nil {
+		return false
+	}
+	m.mu.Lock()
+	scanned, found := m.scanned, m.lastRunning[n]
+	m.mu.Unlock()
+	return scanned && !found && !alive(n)
 }
 
 // capabilityRank orders two rows for the same conversation by what they can

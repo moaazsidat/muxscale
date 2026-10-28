@@ -4,7 +4,9 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -229,4 +231,59 @@ func TestMergeHandsTheDroppedRowsKeysAndTerminalToTheKeptOne(t *testing.T) {
 	if tgt, ok := m.termctlTargets[hooked.ID]; !ok || tgt.ID != "2" {
 		t.Errorf("the kept row lost the kitty pane it can be replied through: %+v", m.termctlTargets)
 	}
+}
+
+// A conversation resumed in a new process: the old row is hooked, so it
+// outranks the new process's, but its process is gone. It used to win, keep
+// the name and the hooks, and be ended by the scan while the new process
+// worked, so a live session showed as done. Whichever row the reconcile
+// starts from, the one with a running process is kept, under the old name.
+func TestReconcileKeepsTheRowWithAProcessInIt(t *testing.T) {
+	const transcript = "/t/resumed.jsonl"
+	gone := "pid:" + strconv.Itoa(deadPID(t))
+	live := "pid:" + strconv.Itoa(os.Getpid())
+
+	for _, fromOld := range []bool{false, true} {
+		m, reg := reconcileFixture(t)
+		m.lastRunning, m.scanned = map[int]bool{os.Getpid(): true}, true // as a scan found them
+		old := reg.Upsert("claude-code", gone, func(s *protocol.Session) {
+			s.Name = "named"
+			s.TranscriptPath = transcript
+			s.Attachment = protocol.AttachNative
+			s.Fidelity = protocol.FidelityNativeFull
+		})
+		reg.Alias("claude-code", "sess-resumed", old.ID)
+		fresh := reg.Upsert("claude-code", live, func(s *protocol.Session) {
+			s.TranscriptPath = transcript
+			s.Attachment = protocol.AttachTermctl
+			s.Fidelity = protocol.FidelityStructured
+		})
+
+		if fromOld {
+			m.Reconcile(old.ID, transcript)
+		} else {
+			m.Reconcile(fresh.ID, transcript)
+		}
+
+		got := reg.List()
+		if len(got) != 1 || got[0].ID != fresh.ID {
+			t.Fatalf("fromOld=%v: kept %+v, want only the live process's row %s", fromOld, got, fresh.ID)
+		}
+		if got[0].Name != "named" {
+			t.Errorf("fromOld=%v: name %q, want the old row's", fromOld, got[0].Name)
+		}
+		if id, ok := reg.IDFor("claude-code", "sess-resumed"); !ok || id != fresh.ID {
+			t.Errorf("fromOld=%v: the conversation's hooks lead to %q, want %s", fromOld, id, fresh.ID)
+		}
+	}
+}
+
+// deadPID returns the pid of a process that has exited.
+func deadPID(t *testing.T) int {
+	t.Helper()
+	cmd := exec.Command("true")
+	if err := cmd.Run(); err != nil {
+		t.Skip("cannot run a process:", err)
+	}
+	return cmd.Process.Pid
 }
