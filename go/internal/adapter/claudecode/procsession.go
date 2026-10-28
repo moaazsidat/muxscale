@@ -67,6 +67,7 @@ func ProcessTranscript(pid int, started time.Time, cwd string) string {
 	}
 	// The process may have moved; the transcript lives under the directory it
 	// recorded, falling back to the one the scan saw.
+	name := filepath.Base(rec.SessionID) + ".jsonl"
 	for _, d := range []string{rec.Cwd, cwd} {
 		if d == "" {
 			continue
@@ -75,12 +76,35 @@ func ProcessTranscript(pid int, started time.Time, cwd string) string {
 		if err != nil {
 			continue
 		}
-		t := filepath.Join(proj, filepath.Base(rec.SessionID)+".jsonl")
+		t := filepath.Join(proj, name)
 		if _, err := os.Stat(t); err == nil {
 			return t
 		}
 	}
-	return ""
+	return transcriptAnywhere(name)
+}
+
+// transcriptAnywhere finds a session file in whichever project holds it.
+//
+// A conversation resumed from another directory goes on writing to the file
+// it began in, under the project it started in, not the one the process now
+// runs from. Looking only under the process's own directory found nothing:
+// the process was a row with no conversation, and the conversation's row was
+// ended because its old process was gone. Only reached when the record names
+// a session and neither directory has it, so the walk is rare.
+func transcriptAnywhere(name string) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	matches, _ := filepath.Glob(filepath.Join(home, ".claude", "projects", "*", name))
+	best, bestMod := "", time.Time{}
+	for _, m := range matches {
+		if fi, err := os.Stat(m); err == nil && fi.Mode().IsRegular() && fi.ModTime().After(bestMod) {
+			best, bestMod = m, fi.ModTime()
+		}
+	}
+	return best
 }
 
 // liveConversations returns the conversations a running Claude Code process

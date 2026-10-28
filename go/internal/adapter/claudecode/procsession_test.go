@@ -56,3 +56,29 @@ func TestProcessTranscriptIsTheFileTheProcessRecorded(t *testing.T) {
 		t.Fatalf("got %q for a transcript that does not exist", got)
 	}
 }
+
+// A conversation resumed from another directory keeps writing to the file it
+// began in, under the project it started in. The process's record names the
+// new directory, where there is no such file.
+func TestProcessTranscriptFollowsAConversationResumedElsewhere(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	began, now := "/work/first", "/work/second"
+	proj := filepath.Join(home, ".claude", "projects", ProjectSlug(began))
+	sessions := filepath.Join(home, ".claude", "sessions")
+	for _, d := range []string{proj, sessions, filepath.Join(home, ".claude", "projects", ProjectSlug(now), "ccc")} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	started := time.Now().Add(-time.Hour)
+	writeTranscript(t, filepath.Join(proj, "ccc.jsonl"), "ccc", started.Add(-48*time.Hour), time.Now())
+	body := `{"pid":201,"sessionId":"ccc","cwd":"` + now + `"}`
+	if err := os.WriteFile(filepath.Join(sessions, "201.json"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, want := ProcessTranscript(201, started, now), filepath.Join(proj, "ccc.jsonl"); got != want {
+		t.Fatalf("got %q, want %q: the conversation's own file, wherever it began", got, want)
+	}
+}
