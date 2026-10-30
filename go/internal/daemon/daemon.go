@@ -21,6 +21,7 @@ import (
 	"github.com/muxscale/muxscale/go/internal/adapter/claudecode"
 	"github.com/muxscale/muxscale/go/internal/attach"
 	"github.com/muxscale/muxscale/go/internal/protocol"
+	"github.com/muxscale/muxscale/go/internal/push"
 	"github.com/muxscale/muxscale/go/internal/store"
 	"github.com/muxscale/muxscale/go/internal/tsnode"
 )
@@ -59,6 +60,11 @@ type Config struct {
 	// in short, it gives up per-service tailnet ACLs and works on machines
 	// where registering a new node does not.
 	UseSystemTS bool
+
+	// NoPush turns notifications off: phones can't register, and nothing is
+	// ever sent to the push notary. PushURL overrides the notary's address.
+	NoPush  bool
+	PushURL string
 }
 
 // DefaultStateDir follows platform convention.
@@ -93,6 +99,7 @@ type Daemon struct {
 	node    *tsnode.Node
 	sysnode *tsnode.SystemNode
 	acl     *tsnode.ACL
+	push    *notifier
 	log     *slog.Logger
 	srv     *http.Server
 	addr    string
@@ -197,6 +204,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.log.Info("re-read transcripts the daemon had stored only in part", "sessions", n)
 	}
 	d.mgr = NewManager(d.reg, d.cfg.Adapters, st, d.log)
+	if !d.cfg.NoPush {
+		d.push = newNotifier(d.reg, st, push.NewNotary(d.cfg.PushURL))
+		go d.push.run(ctx)
+	}
 	d.stateDir = stateDir
 
 	if n, err := d.mgr.Restore(); err != nil {
@@ -396,6 +407,7 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 	d.screenRoutes(mux)
 	d.uploadRoute(mux)
 	d.filesRoutes(mux)
+	d.pushRoutes(mux)
 
 	d.handle(mux, "/v1/sessions", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"sessions": d.reg.List()})
@@ -654,6 +666,10 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 	d.handle(mux, "/v1/sessions/transcript", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		id := q.Get("session")
+		// A phone reading this session doesn't need to be told about it.
+		if _, phone := tsnode.IdentityFrom(r); phone {
+			d.push.lookedAt(id)
+		}
 		if q.Has("before") {
 			before, _ := strconv.ParseUint(q.Get("before"), 10, 64)
 			events, more, err := d.store.TranscriptBefore(id, before, 500)

@@ -58,6 +58,7 @@ func controlRoutes() []struct {
 		{http.MethodPost, "/v1/sessions/interrupt", `{"session_id":"x"}`},
 		{http.MethodPost, "/v1/sessions/rename", `{"session_id":"x","name":"y"}`},
 		{http.MethodPost, "/v1/sessions/upload?session=x&name=a.png", "bytes"},
+		{http.MethodGet, "/v1/push/devices", ""},
 		{http.MethodGet, "/v1/sessions/transcript?session=x", ""},
 		{http.MethodGet, "/v1/sessions/screen?session=x", ""},
 		{http.MethodGet, "/v1/status", ""},

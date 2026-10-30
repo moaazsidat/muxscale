@@ -92,6 +92,21 @@ CREATE TABLE IF NOT EXISTS audit (
 CREATE INDEX IF NOT EXISTS idx_audit_at ON audit(at DESC);
 
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+
+-- Phones that turned notifications on. The capability is what the push
+-- notary takes to reach one phone; the public key is what notifications are
+-- sealed to. Quiet hours are kept here because a phone can't hold back a
+-- notification once it has arrived.
+CREATE TABLE IF NOT EXISTS push_devices (
+  device_id    TEXT PRIMARY KEY,
+  host_ref     TEXT NOT NULL,
+  capability   TEXT NOT NULL,
+  public_key   BLOB NOT NULL,
+  quiet_start  TEXT NOT NULL DEFAULT '',
+  quiet_end    TEXT NOT NULL DEFAULT '',
+  identity     TEXT NOT NULL DEFAULT '',
+  created_at   INTEGER NOT NULL
+);
 `
 
 // Open opens (and migrates) the store at dir/state.db.
@@ -194,6 +209,60 @@ func (s *Store) Setting(key string) (string, error) {
 func (s *Store) SetSetting(key, value string) error {
 	_, err := s.db.Exec(`INSERT INTO meta (k, v) VALUES (?, ?)
 ON CONFLICT(k) DO UPDATE SET v = excluded.v`, "setting:"+key, value)
+	return err
+}
+
+// PushDevice is a phone registered for notifications.
+type PushDevice struct {
+	DeviceID string `json:"device_id"`
+	// HostRef is the phone's own name for this machine, echoed back in every
+	// notification so its actions find their way here.
+	HostRef    string `json:"host_ref"`
+	Capability string `json:"-"`
+	PublicKey  []byte `json:"-"`
+	QuietStart string `json:"quiet_start,omitempty"`
+	QuietEnd   string `json:"quiet_end,omitempty"`
+	// Identity is who registered it, from the tailnet.
+	Identity  string    `json:"identity,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// PutPushDevice registers a phone, or updates its registration.
+func (s *Store) PutPushDevice(d PushDevice) error {
+	_, err := s.db.Exec(`
+INSERT INTO push_devices (device_id, host_ref, capability, public_key, quiet_start, quiet_end, identity, created_at)
+VALUES (?,?,?,?,?,?,?,?)
+ON CONFLICT(device_id) DO UPDATE SET
+  host_ref=excluded.host_ref, capability=excluded.capability, public_key=excluded.public_key,
+  quiet_start=excluded.quiet_start, quiet_end=excluded.quiet_end, identity=excluded.identity`,
+		d.DeviceID, d.HostRef, d.Capability, d.PublicKey, d.QuietStart, d.QuietEnd, d.Identity, d.CreatedAt.UnixMilli())
+	return err
+}
+
+// PushDevices lists the registered phones.
+func (s *Store) PushDevices() ([]PushDevice, error) {
+	rows, err := s.db.Query(`SELECT device_id, host_ref, capability, public_key, quiet_start, quiet_end, identity, created_at
+FROM push_devices ORDER BY created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PushDevice
+	for rows.Next() {
+		var d PushDevice
+		var created int64
+		if err := rows.Scan(&d.DeviceID, &d.HostRef, &d.Capability, &d.PublicKey, &d.QuietStart, &d.QuietEnd, &d.Identity, &created); err != nil {
+			return nil, err
+		}
+		d.CreatedAt = time.UnixMilli(created)
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// DeletePushDevice forgets a phone. Forgetting one that isn't there is fine.
+func (s *Store) DeletePushDevice(deviceID string) error {
+	_, err := s.db.Exec(`DELETE FROM push_devices WHERE device_id = ?`, deviceID)
 	return err
 }
 

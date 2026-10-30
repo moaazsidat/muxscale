@@ -122,7 +122,7 @@ More
 func cmdDaemon(args []string) error {
 	addr := defaultAddr
 	hold := 120 * time.Second
-	var tailnet, useSystemTS, noHooks bool
+	var tailnet, useSystemTS, noHooks, noPush bool
 	var tsHostname, tsAuthKey string
 	tsPort := 4443
 	for i := 0; i < len(args); i++ {
@@ -131,6 +131,8 @@ func cmdDaemon(args []string) error {
 			useSystemTS = true
 		case "--no-hooks":
 			noHooks = true
+		case "--no-push":
+			noPush = true
 		case "--tailnet":
 			tailnet = true
 		case "--tailnet-hostname":
@@ -173,7 +175,7 @@ func cmdDaemon(args []string) error {
 			// whole purpose is to change where the daemon binds, quietly using
 			// a different value than the one asked for is the wrong failure.
 			return fmt.Errorf("unknown option %q for `muxscale daemon`\n"+
-				"valid: --listen ADDR, --hold DURATION, --tailnet, --use-system-ts, --no-hooks, "+
+				"valid: --listen ADDR, --hold DURATION, --tailnet, --use-system-ts, --no-hooks, --no-push, "+
 				"--tailnet-hostname NAME, --tailnet-port PORT, --authkey KEY",
 				args[i])
 		}
@@ -205,6 +207,9 @@ func cmdDaemon(args []string) error {
 		Tailnet:  tailnet || useSystemTS, TailnetHostname: tsHostname,
 		TailnetAuthKey: tsAuthKey, TailnetPort: tsPort,
 		UseSystemTS: useSystemTS,
+		// Notifications go only to phones that turned them on. --no-push
+		// refuses them all; MUXSCALE_PUSH_URL points at another notary.
+		NoPush: noPush, PushURL: os.Getenv("MUXSCALE_PUSH_URL"),
 	})
 	if err != nil {
 		return err
