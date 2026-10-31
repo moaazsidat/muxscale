@@ -113,7 +113,7 @@ func TestAnApprovalReachesThePhoneSealed(t *testing.T) {
 	}
 	c := h.opened(t, p)
 	if c.ApprovalID != "ap1" || c.Host != "host-a" || c.Machine != "studio" || c.Tool != "Bash" ||
-		c.Title != "Rate-limit signup" || c.PromptID != "p1" || !strings.Contains(c.Detail, "pnpm test") {
+		c.Name != "Rate-limit signup" || c.PromptID != "p1" || !strings.Contains(c.Detail, "pnpm test") {
 		t.Errorf("content %+v", c)
 	}
 }

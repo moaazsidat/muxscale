@@ -126,7 +126,7 @@ func TestQuestionContent(t *testing.T) {
 		Question: "Keep the old URL?", Options: []protocol.QuestionOption{{Label: "Redirect"}, {Label: "Keep both"}},
 	}}}
 	c := ApprovalContent(protocol.Session{ID: "s", AgentID: "codex"}, a, "laptop")
-	if c.Kind != ContentQuestion || c.Body != "Keep the old URL?" || len(c.Options) != 2 || c.PromptID != "p1" || c.Agent != "Codex" {
+	if c.Kind != ContentQuestion || c.Body != "Keep the old URL?" || len(c.Options) != 2 || c.PromptID != "p1" || c.Agent != "codex" {
 		t.Errorf("%+v", c)
 	}
 }
@@ -175,5 +175,16 @@ func TestNotarySend(t *testing.T) {
 	status = http.StatusTooManyRequests
 	if err := n.Send(p); err == nil || !strings.Contains(err.Error(), "too many requests") {
 		t.Errorf("429 gave %v", err)
+	}
+}
+
+func TestContentCarriesTheListRow(t *testing.T) {
+	sess := protocol.Session{ID: "s", AgentID: "claude-code", Title: "Fix the upload", Cwd: "/work/site/", GitBranch: "fix-upload"}
+	c := WaitingContent(sess, "Done.", "studio")
+	if c.Name != "" || c.Title != "Fix the upload" || c.Project != "site" || c.Branch != "fix-upload" || c.Agent != "claude-code" {
+		t.Errorf("%+v", c)
+	}
+	if p := projectName(""); p != "" {
+		t.Errorf("projectName(\"\") = %q", p)
 	}
 }

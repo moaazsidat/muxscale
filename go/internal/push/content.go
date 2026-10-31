@@ -31,9 +31,15 @@ type Content struct {
 	// registered, so an action knows where to go.
 	Host    string `json:"h"`
 	Machine string `json:"m,omitempty"`
+	// The session as the app's list row shows it: the phone builds the same
+	// title (name, then title, then project) and line (machine, agent,
+	// project, branch) from these, with its own labels.
 	Agent   string `json:"a"`
 	Session string `json:"s"`
+	Name    string `json:"n,omitempty"`
 	Title   string `json:"t,omitempty"`
+	Project string `json:"pr,omitempty"`
+	Branch  string `json:"br,omitempty"`
 	// Body: the tool and what it wants to do, the question, or the agent's
 	// last words.
 	Body       string   `json:"b,omitempty"`
@@ -81,17 +87,19 @@ func WaitingContent(sess protocol.Session, last string, machine string) Content 
 }
 
 func base(sess protocol.Session, machine string) Content {
-	title := sess.Name
-	if title == "" {
-		title = sess.Title
+	return Content{
+		V: 1, Machine: machine, Agent: sess.AgentID, Session: sess.ID,
+		Name: sess.Name, Title: sess.Title, Project: projectName(sess.Cwd), Branch: sess.GitBranch,
 	}
-	return Content{V: 1, Machine: machine, Agent: displayAgent(sess.AgentID), Session: sess.ID, Title: title}
 }
 
 // Marshal renders the content for sealing, shortening the long fields until
 // it fits: the command first, then the body, then the options.
 func (c Content) Marshal() ([]byte, error) {
+	c.Name = clip(c.Name, 120)
 	c.Title = clip(c.Title, 120)
+	c.Project = clip(c.Project, 80)
+	c.Branch = clip(c.Branch, 80)
 	c.Body = clip(c.Body, 600)
 	c.Detail = clip(c.Detail, 900)
 	for i := range c.Options {
@@ -106,6 +114,7 @@ func (c Content) Marshal() ([]byte, error) {
 		func() { c.Body = clip(c.Body, 200) },
 		func() { c.Options = nil },
 		func() { c.Detail, c.Body = "", clip(c.Body, 80) },
+		func() { c.Title, c.Branch = "", "" },
 	} {
 		shrink()
 		b, err := json.Marshal(c)
@@ -118,6 +127,12 @@ func (c Content) Marshal() ([]byte, error) {
 	}
 	// Ids alone are far under the limit; reaching here means a huge id.
 	return json.Marshal(Content{V: 1, Kind: c.Kind, Host: clip(c.Host, 64), Session: clip(c.Session, 64)})
+}
+
+// projectName is the directory's last part, as the app's list shows it.
+func projectName(cwd string) string {
+	cwd = strings.TrimRight(cwd, "/")
+	return cwd[strings.LastIndexByte(cwd, '/')+1:]
 }
 
 func clip(s string, n int) string {
