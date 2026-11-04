@@ -1975,6 +1975,25 @@ func (m *Manager) infer(sessionID string, h *tailHandle, events []protocol.Trans
 			in.Live = &live
 		}
 	}
+	if ir, ok := a.(adapter.IdleReporter); ok && s.PendingApproval == nil {
+		if since, idle := ir.IdleSince(path); idle {
+			switch {
+			case s.State == protocol.StateRunning && since.After(s.Guess.At):
+				// The agent went idle after the turn began: it is over, however
+				// it ended. Escape sends no Stop, and before the model has said
+				// anything leaves the transcript as it was.
+				return protocol.StateGuess{
+					State: protocol.StateWaitingInput, Confidence: 0.9,
+					Reason:   "the agent's turn is over",
+					Evidence: "procrecord:idle", At: time.Now(), Since: since,
+				}, true
+			case s.State == protocol.StateWaitingInput:
+				// The agent says so too: a quiet transcript ending on a prompt
+				// must not read it back to Working.
+				return protocol.StateGuess{}, false
+			}
+		}
+	}
 	exact := s.Guess.Confidence >= 1
 	if exact && !staleRunning(s, fi.ModTime(), in.Idle) {
 		return protocol.StateGuess{}, false

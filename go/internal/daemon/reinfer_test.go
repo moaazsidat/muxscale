@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -219,5 +220,74 @@ func TestStaleHookRunningGivesWayToTheTranscript(t *testing.T) {
 	m.reinfer(s.ID, h, busy)
 	if got, _ := reg.Get(s.ID); got.State != protocol.StateRunning || got.Guess.Confidence != 1 {
 		t.Errorf("busy transcript replaced the hook: %+v", got.Guess)
+	}
+}
+
+// Regression: a prompt interrupted with Escape before the model said anything
+// sends no Stop hook and adds no line to the transcript, so neither the hook
+// nor the transcript ever said the turn was over: the session read Working
+// until its next prompt. Claude Code's own process record says it is idle.
+func TestIdleProcessEndsAHookedTurn(t *testing.T) {
+	m, reg, _ := testManager(t)
+	home, _ := os.UserHomeDir() // a temporary one, from testManager
+	dir := filepath.Join(home, ".claude", "sessions")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "conv-1.jsonl")
+	if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	record := func(status string, at time.Time) {
+		b := fmt.Sprintf(`{"pid":%d,"sessionId":"conv-1","status":%q,"statusUpdatedAt":%d}`,
+			os.Getpid(), status, at.UnixMilli())
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("%d.json", os.Getpid())), []byte(b), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h := &tailHandle{ref: path}
+	s := reg.Upsert("claude-code", "k", func(s *protocol.Session) { s.Attachment = protocol.AttachNative })
+	prompt := []protocol.TranscriptEvent{{Kind: protocol.EventUserMessage, Text: "go on"}}
+	hook := func(at time.Time) {
+		reg.SetState(s.ID, protocol.StateGuess{State: protocol.StateWaitingInput, Confidence: 1, At: at.Add(-time.Second)})
+		reg.SetState(s.ID, protocol.StateGuess{State: protocol.StateRunning, Confidence: 1, At: at})
+	}
+	state := func() protocol.SessionState { got, _ := reg.Get(s.ID); return got.State }
+
+	// Busy: the hook's word stands.
+	began := time.Now().Add(-time.Minute)
+	hook(began)
+	record("busy", began.Add(time.Second))
+	m.reinfer(s.ID, h, prompt)
+	if state() != protocol.StateRunning {
+		t.Fatalf("busy = %s", state())
+	}
+
+	// Idle since before the prompt: a record not yet rewritten for this turn.
+	record("idle", began.Add(-time.Second))
+	m.reinfer(s.ID, h, prompt)
+	if state() != protocol.StateRunning {
+		t.Fatalf("idle before the turn = %s", state())
+	}
+
+	// Idle two seconds after the prompt: interrupted.
+	record("idle", began.Add(2*time.Second))
+	m.reinfer(s.ID, h, prompt)
+	if got, _ := reg.Get(s.ID); got.State != protocol.StateWaitingInput || !got.StateSince.Equal(began.Add(2*time.Second).Truncate(time.Millisecond)) {
+		t.Fatalf("interrupted = %s since %s", got.State, got.StateSince)
+	}
+	// And it stays there, though the transcript ends on the prompt.
+	m.reinfer(s.ID, h, prompt)
+	if state() != protocol.StateWaitingInput {
+		t.Fatalf("read back to %s", state())
+	}
+
+	// Not over an approval a person has to answer.
+	hook(time.Now())
+	reg.Update(s.ID, func(s *protocol.Session) { s.PendingApproval = &protocol.ApprovalRequest{ID: "a"} })
+	record("idle", time.Now().Add(time.Second))
+	m.reinfer(s.ID, h, prompt)
+	if state() != protocol.StateRunning {
+		t.Errorf("with an approval pending = %s", state())
 	}
 }
