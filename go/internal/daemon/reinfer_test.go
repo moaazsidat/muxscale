@@ -282,6 +282,14 @@ func TestIdleProcessEndsAHookedTurn(t *testing.T) {
 		t.Fatalf("read back to %s", state())
 	}
 
+	// After a restart there is no hook's word, and a transcript ending on the
+	// prompt reads as unknown: the agent's idle settles it.
+	reg.SetState(s.ID, protocol.StateGuess{State: protocol.StateUnknown, Confidence: 0.4, At: time.Now()})
+	m.reinfer(s.ID, h, prompt)
+	if state() != protocol.StateWaitingInput {
+		t.Fatalf("unknown = %s", state())
+	}
+
 	// Not over an approval a person has to answer.
 	hook(time.Now())
 	reg.Update(s.ID, func(s *protocol.Session) { s.PendingApproval = &protocol.ApprovalRequest{ID: "a"} })

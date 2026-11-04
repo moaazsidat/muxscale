@@ -1978,10 +1978,13 @@ func (m *Manager) infer(sessionID string, h *tailHandle, events []protocol.Trans
 	if ir, ok := a.(adapter.IdleReporter); ok && s.PendingApproval == nil {
 		if since, idle := ir.IdleSince(path); idle {
 			switch {
-			case s.State == protocol.StateRunning && since.After(s.Guess.At):
+			case s.State == protocol.StateRunning && since.After(s.Guess.At),
+				s.State == protocol.StateUnknown || s.State == protocol.StateStarting:
 				// The agent went idle after the turn began: it is over, however
 				// it ended. Escape sends no Stop, and before the model has said
-				// anything leaves the transcript as it was.
+				// anything leaves the transcript as it was. A session the daemon
+				// has no reading of yet -- after a restart, on a transcript that
+				// ends on that prompt -- is waiting too.
 				return protocol.StateGuess{
 					State: protocol.StateWaitingInput, Confidence: 0.9,
 					Reason:   "the agent's turn is over",
