@@ -349,6 +349,16 @@ type Liveness interface {
 	Live(ref string) (live bool, known bool)
 }
 
+// IdleReporter reports when the agent's own runtime last said its turn was
+// over and the prompt was back: Claude Code's process record, for example.
+// known is false when it has no such record, or the record says it is busy.
+//
+// Unlike a hook, it needs nothing to be sent: an interrupted turn ends here
+// even when no hook fires and no line reaches the transcript.
+type IdleReporter interface {
+	IdleSince(ref string) (since time.Time, known bool)
+}
+
 // StateInferrer derives a session's state. Adapters declaring
 // Signals.State == SupportExact still implement this: the difference is the
 // confidence they return, not whether the method exists.

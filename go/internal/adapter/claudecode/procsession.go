@@ -115,7 +115,7 @@ func transcriptAnywhere(name string) string {
 // This is how a conversation is known to have ended. Its transcript says
 // nothing of the kind: one cut off by its terminal closing ends on an
 // interrupted turn, which reads as waiting for you.
-func liveConversations() (live map[string]bool, known bool) {
+func liveConversations() (live map[string]procRecord, known bool) {
 	dir, err := sessionsDir()
 	if err != nil {
 		return nil, false
@@ -125,7 +125,7 @@ func liveConversations() (live map[string]bool, known bool) {
 		// Missing too: a Claude Code from before it kept them may be running.
 		return nil, false
 	}
-	live = map[string]bool{}
+	live = map[string]procRecord{}
 	for _, e := range entries {
 		name := e.Name()
 		if e.IsDir() || filepath.Ext(name) != ".json" {
@@ -139,16 +139,23 @@ func liveConversations() (live map[string]bool, known bool) {
 		if err != nil {
 			continue
 		}
-		var rec struct {
-			PID       int    `json:"pid"`
-			SessionID string `json:"sessionId"`
-		}
+		var rec procRecord
 		if json.Unmarshal(b, &rec) != nil || rec.PID != pid || rec.SessionID == "" {
 			continue
 		}
-		live[rec.SessionID] = true
+		live[rec.SessionID] = rec
 	}
 	return live, true
+}
+
+// procRecord is the part of a process's record muxscale reads. Status is
+// "busy" during a turn and "idle" once the prompt is back; StatusUpdatedAt is
+// in milliseconds.
+type procRecord struct {
+	PID             int    `json:"pid"`
+	SessionID       string `json:"sessionId"`
+	Status          string `json:"status"`
+	StatusUpdatedAt int64  `json:"statusUpdatedAt"`
 }
 
 // processAlive reports whether a process exists. EPERM means it does, owned
@@ -165,5 +172,25 @@ func (*Adapter) Live(ref string) (bool, bool) {
 	if !known {
 		return false, false
 	}
-	return live[strings.TrimSuffix(filepath.Base(ref), ".jsonl")], true
+	_, ok := live[strings.TrimSuffix(filepath.Base(ref), ".jsonl")]
+	return ok, true
+}
+
+// IdleSince reports when the Claude Code process in a transcript's
+// conversation last went idle, by its own record (adapter.IdleReporter).
+//
+// It is the one end of a turn that needs nothing else to happen. A turn
+// interrupted with Escape sends no Stop hook, and one interrupted before the
+// model wrote anything leaves no line in the transcript either: the session
+// read Working until its next prompt.
+func (*Adapter) IdleSince(ref string) (time.Time, bool) {
+	live, known := liveConversations()
+	if !known {
+		return time.Time{}, false
+	}
+	rec, ok := live[strings.TrimSuffix(filepath.Base(ref), ".jsonl")]
+	if !ok || rec.Status != "idle" || rec.StatusUpdatedAt <= 0 {
+		return time.Time{}, false
+	}
+	return time.UnixMilli(rec.StatusUpdatedAt), true
 }

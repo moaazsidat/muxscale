@@ -30,6 +30,7 @@ var (
 	_ adapter.StateInferrer = (*Adapter)(nil)
 	_ adapter.Installer     = (*Adapter)(nil)
 	_ adapter.Locator       = (*Adapter)(nil)
+	_ adapter.IdleReporter  = (*Adapter)(nil)
 )
 
 func (*Adapter) Info() adapter.Info {
@@ -123,7 +124,7 @@ func (*Adapter) Discover(context.Context) ([]adapter.Discovered, error) {
 			info, statErr := f.Info()
 			live := statErr == nil && time.Since(info.ModTime()) < liveWindow
 			if runningKnown {
-				live = running[strings.TrimSuffix(f.Name(), ".jsonl")]
+				_, live = running[strings.TrimSuffix(f.Name(), ".jsonl")]
 			}
 			out = append(out, adapter.Discovered{
 				NaturalKey: strings.TrimSuffix(f.Name(), ".jsonl"),
