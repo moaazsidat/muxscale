@@ -24,6 +24,34 @@ type Registry struct {
 
 	subs   map[int]subscriber
 	nextID int
+
+	// recall names the conversation in a transcript file from what has been
+	// stored about it, "" when nothing named it. See recallName.
+	recall func(transcriptPath string) string
+}
+
+// SetRecall says where a row that takes up a transcript finds the name an
+// earlier row gave it.
+func (r *Registry) SetRecall(f func(transcriptPath string) string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.recall = f
+}
+
+// recallName gives an unnamed row the name its transcript was last known by,
+// when the row has only now taken up that transcript.
+//
+// Only rows still running are held in memory, so after a restart -- the
+// machine's, where every agent process ended -- a resumed conversation came
+// back as a new row with no name, and saving it overwrote the stored one that
+// had it. Claude Code got its name back from its own transcript; every other
+// agent's name was gone. A changed path is the trigger, so a name cleared on
+// purpose stays cleared. Called with r.mu held.
+func (r *Registry) recallName(s *protocol.Session, before string) {
+	if r.recall == nil || s.Name != "" || s.TranscriptPath == "" || s.TranscriptPath == before {
+		return
+	}
+	s.Name = r.recall(s.TranscriptPath)
 }
 
 // pendingApproval is a decision hook parked awaiting a human.
@@ -162,9 +190,11 @@ func (r *Registry) Upsert(agentID, naturalKey string, mutate func(*protocol.Sess
 		r.sessions[s.ID] = s
 		r.byNatural[key] = s.ID
 	}
+	before := s.TranscriptPath
 	if mutate != nil {
 		mutate(s)
 	}
+	r.recallName(s, before)
 	s.LastEventAt = time.Now()
 	announced := *s
 	r.broadcast(Change{Kind: ChangeSessionUpsert, Session: &announced})
@@ -203,9 +233,11 @@ func (r *Registry) Update(id string, mutate func(*protocol.Session)) *protocol.S
 	if !ok {
 		return nil
 	}
+	before := s.TranscriptPath
 	if mutate != nil {
 		mutate(s)
 	}
+	r.recallName(s, before)
 	s.LastEventAt = time.Now()
 	cp := *s
 	r.broadcast(Change{Kind: ChangeSessionUpsert, Session: &cp})

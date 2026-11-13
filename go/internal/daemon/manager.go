@@ -140,6 +140,15 @@ func NewManager(reg *Registry, adapters *adapter.Registry, st *store.Store, log 
 		typedAudit:     map[string]time.Time{},
 		lastRunning:    map[int]bool{},
 	}
+	if st != nil {
+		reg.SetRecall(func(path string) string {
+			name, err := st.NameForTranscript(path)
+			if err != nil {
+				log.Debug("recalling a session's name failed", "err", err)
+			}
+			return name
+		})
+	}
 	m.typeKeys = m.deliver
 	m.discover = attach.Discover
 	m.parentOf = parentPid

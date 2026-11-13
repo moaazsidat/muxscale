@@ -85,3 +85,41 @@ func TestRenameSyncsThroughTheTranscript(t *testing.T) {
 		t.Fatal("an over-long name was accepted")
 	}
 }
+
+// After a restart only rows still running are back in memory, so a resumed
+// conversation turns up as a new row. It takes the name its transcript was
+// last known by, rather than coming back unnamed and overwriting the stored
+// row that had the name.
+func TestAResumedConversationKeepsItsName(t *testing.T) {
+	m, reg, st := testManager(t)
+	path := filepath.Join(t.TempDir(), "conversation.jsonl")
+	now := time.Now()
+	ended := protocol.Session{
+		ID: "old", AgentID: "omp", NaturalKey: "pid:1", Name: "Ship it",
+		State: protocol.StateExited, StateSince: now, CreatedAt: now, LastEventAt: now,
+		TranscriptPath: path,
+	}
+	if err := st.SaveSession(&ended); err != nil {
+		t.Fatal(err)
+	}
+
+	s := reg.Upsert("omp", "pid:2", func(s *protocol.Session) { s.TranscriptPath = path })
+	if s.Name != "Ship it" {
+		t.Fatalf("resumed row named %q", s.Name)
+	}
+
+	// Taken up later, by a hook, works the same way.
+	later := reg.Upsert("omp", "pid:3", nil)
+	got := reg.Update(later.ID, func(s *protocol.Session) { s.TranscriptPath = path })
+	if got.Name != "Ship it" {
+		t.Fatalf("row given the transcript later named %q", got.Name)
+	}
+
+	// A name cleared on purpose stays cleared.
+	if _, err := m.Rename(s.ID, "", "phone"); err != nil {
+		t.Fatal(err)
+	}
+	if again := reg.Update(s.ID, func(s *protocol.Session) { s.Title = "moved on" }); again.Name != "" {
+		t.Fatalf("cleared name came back as %q", again.Name)
+	}
+}

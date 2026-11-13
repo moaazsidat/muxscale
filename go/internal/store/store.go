@@ -195,6 +195,19 @@ ON CONFLICT(agent_id, natural_key) DO UPDATE SET
 	return err
 }
 
+// NameForTranscript is the name last given to the conversation in a transcript
+// file, by whichever row was following it: "" when none was named.
+func (s *Store) NameForTranscript(path string) (string, error) {
+	var name string
+	err := s.db.QueryRow(`SELECT name FROM sessions
+WHERE transcript_path = ? AND name IS NOT NULL AND name <> ''
+ORDER BY last_event_at DESC LIMIT 1`, path).Scan(&name)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return name, err
+}
+
 // Setting reads a daemon setting, "" when it was never set.
 func (s *Store) Setting(key string) (string, error) {
 	var v string
