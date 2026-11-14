@@ -191,7 +191,10 @@ func (m Meta) CanRequestApproval() bool {
 	return m.ApprovalPolicy != "" && m.ApprovalPolicy != "never"
 }
 
-const excerptBytes = 4096
+// excerptBytes bounds any one text or tool output read from the file. The
+// daemon keeps less of most kinds and sends phones less still (see
+// daemon/excerpt.go): a message is kept whole up to this, for See all.
+const excerptBytes = 256 * 1024
 
 // ParseRollout reads a Codex rollout JSONL file.
 func ParseRollout(r io.Reader) ([]protocol.TranscriptEvent, Meta, error) {

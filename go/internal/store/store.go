@@ -507,6 +507,24 @@ ORDER BY seq ASC LIMIT ?`, sessionID, sinceSeq, limit)
 	return out, rows.Err()
 }
 
+// Event is one stored event, whole, and false when there is none.
+func (s *Store) Event(sessionID string, seq uint64) (protocol.TranscriptEvent, bool, error) {
+	var payload string
+	err := s.db.QueryRow(`SELECT payload FROM transcript WHERE session_id = ? AND seq = ?`,
+		sessionID, seq).Scan(&payload)
+	if errors.Is(err, sql.ErrNoRows) {
+		return protocol.TranscriptEvent{}, false, nil
+	}
+	if err != nil {
+		return protocol.TranscriptEvent{}, false, err
+	}
+	var e protocol.TranscriptEvent
+	if err := json.Unmarshal([]byte(payload), &e); err != nil {
+		return protocol.TranscriptEvent{}, false, err
+	}
+	return e, true, nil
+}
+
 // ToolCalls returns up to limit of a session's tool calls, oldest first.
 func (s *Store) ToolCalls(sessionID string, limit int) ([]protocol.TranscriptEvent, error) {
 	rows, err := s.db.Query(`

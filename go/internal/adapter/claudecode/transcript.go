@@ -101,10 +101,10 @@ type contentBlock struct {
 // adapter, which fills the same struct from a different format).
 type Meta = adapter.Meta
 
-// excerptBytes caps how much of any single text or tool output we retain
-// inline. The full body is fetched on demand (spec §5.3) -- shipping a 2 MB
-// tool result to a phone is never the right default.
-const excerptBytes = 4096
+// excerptBytes bounds any one text or tool output read from the file. The
+// daemon keeps less of most kinds and sends phones less still (see
+// daemon/excerpt.go): a message is kept whole up to this, for See all.
+const excerptBytes = 256 * 1024
 
 // summaryBytes is the larger cap for a compaction summary, which is the one
 // long text a reader catching up on a session actually wants whole.

@@ -1888,6 +1888,7 @@ func (m *Manager) tailLoop(sessionID string, h *tailHandle) {
 
 		for i := range events {
 			events[i].SessionID = sessionID
+			events[i] = kept(events[i])
 		}
 		// Stored here, whole, before anyone is told. They used to reach the
 		// store the way they reach phones, through the registry's change

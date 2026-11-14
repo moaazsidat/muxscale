@@ -381,7 +381,10 @@ const NoWorkingDirectory = "hermes does not record a working directory per sessi
 
 // ---- helpers ----
 
-const excerptBytes = 4096
+// excerptBytes bounds any one text or tool output read from the file. The
+// daemon keeps less of most kinds and sends phones less still (see
+// daemon/excerpt.go): a message is kept whole up to this, for See all.
+const excerptBytes = 256 * 1024
 
 // floatTime converts Hermes's REAL unix timestamps, which carry sub-second
 // precision, into a time.Time.

@@ -306,8 +306,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 //
 // v3: the same messages, when they carried an image: their prompt is content
 // blocks, not a string, and the parser dropped the whole line.
+//
+// v4: messages are stored whole, not cut at 4 KB, so See all has the rest of
+// what was cut before.
 func rereadTranscriptsOnce(st *store.Store) (int, error) {
-	const flag = "once:transcripts-reread-v3"
+	const flag = "once:transcripts-reread-v4"
 	if done, _ := st.Setting(flag); done != "" {
 		return 0, nil
 	}
@@ -326,6 +329,7 @@ func rereadTranscriptsOnce(st *store.Store) (int, error) {
 		}
 		for i := range events {
 			events[i].SessionID = s.ID
+			events[i] = kept(events[i])
 		}
 		if err := st.ReplaceTranscript(s.ID, events); err != nil {
 			return n, err
@@ -677,7 +681,7 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
-			writeJSON(w, map[string]any{"events": events, "more": more})
+			writeJSON(w, map[string]any{"events": sentAll(events), "more": more})
 			return
 		}
 		since, _ := strconv.ParseUint(q.Get("since"), 10, 64)
@@ -686,7 +690,29 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		writeJSON(w, map[string]any{"events": events})
+		writeJSON(w, map[string]any{"events": sentAll(events)})
+	})
+
+	// GET /v1/sessions/event?session=ID&seq=N
+	//
+	// One event, whole: what See all shows of a message sent cut short.
+	d.handle(mux, "/v1/sessions/event", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		seq, err := strconv.ParseUint(q.Get("seq"), 10, 64)
+		if err != nil {
+			http.Error(w, "seq is required", http.StatusBadRequest)
+			return
+		}
+		ev, ok, err := d.store.Event(q.Get("session"), seq)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !ok {
+			http.Error(w, "no such event", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, ev)
 	})
 
 	// GET /v1/sessions/screen?session=ID[&format=text]
@@ -913,6 +939,10 @@ func (d *Daemon) routes(mux *http.ServeMux) {
 			case c, ok := <-ch:
 				if !ok {
 					return
+				}
+				if c.Event != nil {
+					ev := sent(*c.Event)
+					c.Event = &ev
 				}
 				fmt.Fprint(w, "data: ")
 				if err := enc.Encode(c); err != nil {

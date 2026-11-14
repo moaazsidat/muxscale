@@ -141,10 +141,11 @@ type exitRecord struct {
 // ---- limits ----
 
 const (
-	// excerptBytes is the inline cap for a tool result or message, matching the
-	// other adapters: a 2 MB tool result is never the right thing to ship to a
-	// phone by default.
-	excerptBytes = 4096
+	// excerptBytes bounds any one text or tool output read from the file,
+	// matching the other adapters. The daemon keeps less of most kinds and
+	// sends phones less still (see daemon/excerpt.go): a message is kept
+	// whole up to this, for See all.
+	excerptBytes = 256 * 1024
 	// summaryBytes is larger because a compaction summary is the one long text
 	// a reader catching up actually wants whole.
 	summaryBytes = 32 * 1024
