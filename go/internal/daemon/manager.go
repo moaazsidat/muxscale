@@ -1348,6 +1348,18 @@ func helperProcess(argv []string) bool {
 			return true
 		}
 	}
+	// Antigravity CLI's background servers and management subcommands are not
+	// interactive conversations.
+	if len(argv) > 1 {
+		base := filepath.Base(argv[0])
+		if base == "agy" || base == "antigravity-cli" {
+			switch argv[1] {
+			case "acp", "remote-control", "mic-serve", "mcp", "plugin", "plugins",
+				"update", "install", "models", "agent", "agents", "changelog", "help":
+				return true
+			}
+		}
+	}
 	return false
 }
 

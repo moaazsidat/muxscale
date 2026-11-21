@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/muxscale/muxscale/go/internal/adapter"
+	"github.com/muxscale/muxscale/go/internal/adapter/antigravity"
 	"github.com/muxscale/muxscale/go/internal/adapter/bob"
 	"github.com/muxscale/muxscale/go/internal/adapter/claudecode"
 	"github.com/muxscale/muxscale/go/internal/adapter/codex"
@@ -191,6 +192,9 @@ func cmdDown(args []string) error {
 	if codex.HooksPresent() {
 		removing = append(removing, "muxscale's hooks in ~/.codex/hooks.json")
 	}
+	if antigravity.HooksPresent() {
+		removing = append(removing, "muxscale's hooks in ~/.gemini/config/hooks.json")
+	}
 	shims, _ := setup.InstalledShims()
 	if len(shims) > 0 {
 		removing = append(removing, "shims for "+strings.Join(shims, ", "))
@@ -241,6 +245,13 @@ func cmdDown(args []string) error {
 		fmt.Printf("bob hooks: %v\n", err)
 	} else if removed {
 		fmt.Println("removed muxscale's Bob hooks")
+	}
+	if antigravity.HooksPresent() {
+		if removed, err := antigravity.RemoveHooks(); err != nil {
+			fmt.Printf("antigravity hooks: %v\n", err)
+		} else if removed {
+			fmt.Println("removed muxscale's Antigravity hooks")
+		}
 	}
 	if len(shims) > 0 {
 		if removed, err := setup.UninstallShims(); err != nil {
@@ -372,6 +383,20 @@ func cmdStatus(args []string) error {
 		} else {
 			line("FAIL", "bob hooks", "not installed")
 			fix("restart the daemon; it installs Bob's hooks as it starts")
+		}
+	}
+
+	// Antigravity CLI, and the global hooks in ~/.gemini/config/hooks.json.
+	if v, err := antigravity.DetectVersion(); err != nil {
+		line(" -- ", "agy", "not on PATH")
+	} else {
+		info := antigravity.New().Info()
+		s := info.ClassifyVersion(v)
+		if s == adapter.VersionTooOld {
+			line("FAIL", "agy", info.VersionMessage(v, s))
+		} else {
+			line(" ok ", "agy", fmt.Sprintf("%s (%s)", v, s))
+			statusAntigravityHooks(line, fix)
 		}
 	}
 
@@ -544,4 +569,20 @@ func statusCodexHooks(line statusLine, fix func(string)) {
 	}
 	line("FAIL", "codex hooks", "not installed or out of date")
 	fix("restart the daemon; then run /hooks in Codex and trust muxscale's hooks")
+}
+
+// statusAntigravityHooks checks muxscale's global hooks in ~/.gemini/config/hooks.json.
+func statusAntigravityHooks(line statusLine, fix func(string)) {
+	exe, err := os.Executable()
+	if err != nil {
+		exe = "muxscale"
+	}
+	tokenPath := filepath.Join(stateDirOrEmpty(), "hook-token")
+	relay := antigravity.RelayCommand(exe, apiAddr(), tokenPath)
+	if antigravity.HooksInstalled(relay) {
+		line(" ok ", "agy hooks", "installed; new sessions report their state exactly")
+		return
+	}
+	line("FAIL", "agy hooks", "not installed or out of date")
+	fix("restart the daemon; it installs Antigravity's hooks as it starts")
 }

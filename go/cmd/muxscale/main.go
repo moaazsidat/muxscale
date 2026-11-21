@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/muxscale/muxscale/go/internal/adapter"
+	"github.com/muxscale/muxscale/go/internal/adapter/antigravity"
 	"github.com/muxscale/muxscale/go/internal/adapter/bob"
 	"github.com/muxscale/muxscale/go/internal/adapter/builtin"
 	"github.com/muxscale/muxscale/go/internal/adapter/claudecode"
@@ -288,6 +289,22 @@ func ensureHooks(addr, token string, log *slog.Logger) {
 		path, _ := bob.SettingsPath()
 		log.Info("set up Bob hooks; sessions in trusted workspaces report their state exactly",
 			"settings", path)
+	}
+
+	// Antigravity CLI loads global hooks from ~/.gemini/config/hooks.json.
+	// SessionStart, PreInvocation and Stop report exact turn boundaries and
+	// link each running `agy` process to its conversation.
+	if v, err := antigravity.DetectVersion(); err != nil {
+		log.Debug("agy not on PATH; skipping its hooks")
+	} else if info := antigravity.New().Info(); info.ClassifyVersion(v) == adapter.VersionTooOld {
+		log.Warn("Antigravity CLI is below the supported floor; hooks not installed",
+			"version", v, "floor", info.MinVersion)
+	} else if changed, err := antigravity.EnsureHooks(antigravity.RelayCommand(exe, addr, tokenPath)); err != nil {
+		log.Warn("Antigravity hooks not set up", "reason", err)
+	} else if changed {
+		path, _ := antigravity.HooksPath()
+		log.Info("set up Antigravity hooks; sessions started from now on report their state exactly",
+			"hooks", path)
 	}
 }
 
