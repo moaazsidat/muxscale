@@ -29,6 +29,11 @@ import (
 // keyboard usually answers within it, and then the phone stays quiet.
 var pushSettle = 3 * time.Second
 
+// reasonSessionStarted is the wait of an agent that has only just started.
+// Nothing finished, so nothing needs the person: a terminal reopening its
+// windows resumes every agent in them at once.
+const reasonSessionStarted = "session started"
+
 type pushSender interface {
 	Send(push.Push) error
 }
@@ -97,7 +102,8 @@ func (n *notifier) consider(c Change) {
 			n.notify(sess, push.ApprovalContent(sess, a, n.machine), 1)
 		})
 	case ChangeStateChange:
-		if c.Session == nil || c.Session.State != protocol.StateWaitingInput || c.Prev.Waiting() {
+		if c.Session == nil || c.Session.State != protocol.StateWaitingInput || c.Prev.Waiting() ||
+			c.Session.Guess.Reason == reasonSessionStarted {
 			return
 		}
 		id, since := c.Session.ID, c.Session.StateSince

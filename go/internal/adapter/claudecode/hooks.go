@@ -67,6 +67,9 @@ type HookPayload struct {
 	PermissionMode string `json:"permission_mode"`
 	HookEventName  string `json:"hook_event_name"`
 
+	// SessionStart: "startup", "resume", "clear" or "compact".
+	Source string `json:"source"`
+
 	// Subagent identity; present only for sidechain activity.
 	AgentID   string `json:"agent_id"`
 	AgentType string `json:"agent_type"`
@@ -197,6 +200,11 @@ func (*Adapter) DecodeHook(body []byte) (adapter.HookEvent, error) {
 	switch p.HookEventName {
 	case HookSessionStart:
 		e.Kind = adapter.HookSessionStart
+		if p.Source == "compact" {
+			// Compaction starts the session again, often partway through a
+			// turn that then carries on. It isn't the agent at its prompt.
+			e.Kind = adapter.HookNotice
+		}
 	case HookUserPromptSubmit:
 		e.Kind = adapter.HookUserPrompt
 	case HookPreToolUse:

@@ -267,7 +267,11 @@ func (h *HookServer) applyHook(e *adapter.HookEvent) *protocol.Session {
 
 	switch e.Kind {
 	case adapter.HookSessionStart:
-		h.reg.SetState(sess.ID, guess(protocol.StateRunning, "session started"))
+		// An agent that has just started, or been resumed, is at its prompt.
+		// This read as RUNNING, and a resume writes nothing to the transcript
+		// for staleRunning to go on: omp sessions restored with kitty's
+		// windows showed Working for hours until their next turn.
+		h.reg.SetState(sess.ID, guess(protocol.StateWaitingInput, reasonSessionStarted))
 
 	case adapter.HookTurnStart:
 		h.reg.SetState(sess.ID, guess(protocol.StateRunning, "agent started working"))

@@ -60,8 +60,14 @@ func TestOMPLifecycleHooksDriveState(t *testing.T) {
 	if !ok {
 		t.Fatal("session not registered")
 	}
-	if s, _ := reg.Get(id); s.State != protocol.StateRunning || s.Guess.Confidence != 1 {
+	if s, _ := reg.Get(id); s.State != protocol.StateWaitingInput || s.Guess.Confidence != 1 {
 		t.Fatalf("after start = %+v", s)
+	}
+
+	base["event"] = "agent_start"
+	post(base)
+	if s, _ := reg.Get(id); s.State != protocol.StateRunning {
+		t.Fatalf("after agent_start = %+v", s)
 	}
 
 	base["event"] = "turn_end"

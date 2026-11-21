@@ -339,3 +339,30 @@ func hookAdapters() *adapter.Registry {
 	r.MustRegister(claudecode.New())
 	return r
 }
+
+// Regression: an agent resumed by a terminal reopening its windows sent only
+// its session start, which read as RUNNING with the agent's own authority,
+// and nothing written to the transcript came after it to say otherwise. robo
+// and control-room showed Working for hours while omp sat at its prompt.
+// Compaction is the exception: Claude Code starts the session again partway
+// through a turn, and the turn is still running.
+func TestASessionStartIsTheAgentAtItsPrompt(t *testing.T) {
+	srv, reg := testServer(t, time.Second)
+	post := func(ev, source string) protocol.Session {
+		t.Helper()
+		postHook(t, srv, "secret-token", map[string]any{
+			"session_id": "s1", "hook_event_name": ev, "source": source, "cwd": "/app",
+		})
+		id, _ := reg.IDFor("claude-code", "s1")
+		s, _ := reg.Get(id)
+		return s
+	}
+
+	if s := post(claudecode.HookSessionStart, "resume"); s.State != protocol.StateWaitingInput {
+		t.Fatalf("after a resume = %s, want WAITING_INPUT", s.State)
+	}
+	post(claudecode.HookUserPromptSubmit, "")
+	if s := post(claudecode.HookSessionStart, "compact"); s.State != protocol.StateRunning {
+		t.Errorf("compaction mid-turn = %s, want the turn still RUNNING", s.State)
+	}
+}

@@ -237,3 +237,18 @@ func TestRegisteringAPhone(t *testing.T) {
 		t.Errorf("GET = %s", rec.Body.String())
 	}
 }
+
+// An agent that has only started needs nobody. Without this, reopening a
+// terminal's windows resumed every agent in them and each one buzzed the phone.
+func TestAStartedSessionDoesntNotify(t *testing.T) {
+	h := newPushHarness(t)
+	s := h.reg.Update("s1", func(s *protocol.Session) {
+		s.State, s.StateSince = protocol.StateWaitingInput, time.Now()
+		s.Guess = protocol.StateGuess{State: protocol.StateWaitingInput, Confidence: 1, Reason: reasonSessionStarted}
+	})
+	h.n.consider(Change{Kind: ChangeStateChange, Session: s, Prev: protocol.StateExited})
+	time.Sleep(3 * pushSettle)
+	if len(h.notary.all()) != 0 {
+		t.Fatal("notified that a session had started")
+	}
+}
