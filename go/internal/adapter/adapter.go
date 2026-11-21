@@ -530,22 +530,32 @@ func (e HookEvent) Subject() string {
 	switch e.ToolName {
 	case "":
 		return e.EventName
-	case "bash", "Bash":
-		if cmd, ok := e.ToolInput["command"].(string); ok {
+	case "bash", "Bash", "run_command":
+		cmd, _ := e.ToolInput["command"].(string)
+		if cmd == "" {
+			cmd, _ = e.ToolInput["CommandLine"].(string)
+		}
+		if cmd != "" {
 			return "bash: " + collapseWS(cmd, 80)
 		}
-	case "edit", "Edit", "write", "Write", "NotebookEdit":
+	case "edit", "Edit", "edit_file", "write", "Write", "write_file", "NotebookEdit":
 		path, _ := e.ToolInput["path"].(string)
 		if path == "" {
 			path, _ = e.ToolInput["file_path"].(string)
+		}
+		if path == "" {
+			path, _ = e.ToolInput["Path"].(string)
 		}
 		if path != "" {
 			return e.ToolName + " " + shortenPath(path)
 		}
-	case "read", "Read":
+	case "read", "Read", "read_file":
 		path, _ := e.ToolInput["path"].(string)
 		if path == "" {
 			path, _ = e.ToolInput["file_path"].(string)
+		}
+		if path == "" {
+			path, _ = e.ToolInput["Path"].(string)
 		}
 		if path != "" {
 			return "read " + shortenPath(path)

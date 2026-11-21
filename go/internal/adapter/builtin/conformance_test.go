@@ -229,6 +229,8 @@ func TestDetectRulesDoNotOverlap(t *testing.T) {
 		{PID: 16, Argv: []string{"opencode", "serve"}},
 		{PID: 17, Argv: []string{"pi"}},
 		{PID: 18, Argv: []string{"/Users/x/.local/bin/pi", "--model", "gpt"}},
+		{PID: 19, Argv: []string{"agy"}},
+		{PID: 191, Argv: []string{"/Users/x/.local/bin/antigravity-cli"}},
 		// Things that must match nothing.
 		{PID: 20, Argv: []string{"vim", "claude.go"}},
 		{PID: 21, Argv: []string{"grep", "codex"}},
@@ -255,6 +257,8 @@ func TestDetectMatchesTheRightAdapter(t *testing.T) {
 		{[]string{"hermes"}, "hermes"},
 		{[]string{"opencode", "serve"}, "opencode"},
 		{[]string{"pi", "--resume"}, "pi"},
+		{[]string{"agy"}, "antigravity"},
+		{[]string{"/Users/x/.local/bin/antigravity-cli", "--continue"}, "antigravity"},
 		{[]string{"vim", "claude.go"}, ""},
 		{[]string{"grep", "-r", "opencode"}, ""},
 		{[]string{"pip", "install", "pi"}, ""},

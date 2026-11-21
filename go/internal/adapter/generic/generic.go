@@ -142,14 +142,6 @@ var (
 		MinVersion: "0.1.0",
 	}
 
-	// Antigravity CLI (Google, `agy`), Gemini CLI's successor. It shares
-	// ~/.gemini and has hooks, but its session format is not documented.
-	// Promotion needs one session file from a real install.
-	Antigravity = Spec{
-		ID: "antigravity", DisplayName: "Antigravity CLI",
-		Binaries: []string{"agy", "antigravity-cli"}, MinVersion: "0.1.0",
-	}
-
 	// Grok Build (xAI, `grok`). Sessions live under ~/.grok/sessions (or
 	// $GROK_HOME); their format is not documented. Promotion needs a real
 	// session file.
@@ -177,4 +169,4 @@ var (
 )
 
 // All returns every detection-only spec.
-func All() []Spec { return []Spec{Amp, CursorAgent, Antigravity, GrokBuild, Aider, Goose} }
+func All() []Spec { return []Spec{Amp, CursorAgent, GrokBuild, Aider, Goose} }

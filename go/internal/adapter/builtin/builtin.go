@@ -9,6 +9,7 @@ package builtin
 
 import (
 	"github.com/muxscale/muxscale/go/internal/adapter"
+	"github.com/muxscale/muxscale/go/internal/adapter/antigravity"
 	"github.com/muxscale/muxscale/go/internal/adapter/bob"
 	"github.com/muxscale/muxscale/go/internal/adapter/claudecode"
 	"github.com/muxscale/muxscale/go/internal/adapter/codex"
@@ -54,6 +55,7 @@ func Registry(opt Options) *adapter.Registry {
 		kimi.New(),
 		kiro.New(),
 		bob.New(),
+		antigravity.New(),
 	)
 	// Detection-only agents. They are registered rather than left to the
 	// binary-name table so that everything muxscale knows how to recognise is
