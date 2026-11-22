@@ -25,15 +25,19 @@ const askUserQuestion = "AskUserQuestion"
 // seen in the transcript, and answered at omp's keyboard.
 const ompAsk = "ask"
 
+// agyAsk is Antigravity CLI's question tool. It pauses the conversation in a
+// waiting step and takes its answer at the keyboard.
+const agyAsk = "ask_question"
+
 // isQuestionTool reports a tool whose call is a question for the person.
 func isQuestionTool(name string) bool {
-	return name == askUserQuestion || name == ompAsk
+	return name == askUserQuestion || name == ompAsk || name == agyAsk
 }
 
-// parseQuestions reads a question tool's input: AskUserQuestion's, or omp's
-// ask, which has the same shape but says "multi" for "multiSelect". Nil when
-// it is not one, or has nothing a person could answer -- it is then shown as
-// an approval, the safe old behaviour.
+// parseQuestions reads a question tool's input: AskUserQuestion's, omp's ask
+// ("multi"), or Antigravity's ask_question ("is_multi_select" and string
+// options). Nil when it is not one, or has nothing a person could answer -- it
+// is then shown as an approval, the safe old behaviour.
 func parseQuestions(toolName string, in map[string]any) []protocol.Question {
 	if !isQuestionTool(toolName) {
 		return nil
@@ -52,8 +56,17 @@ func parseQuestions(toolName string, in map[string]any) []protocol.Question {
 		if multi, ok := m["multi"].(bool); ok {
 			q.MultiSelect = multi
 		}
+		if multi, ok := m["is_multi_select"].(bool); ok {
+			q.MultiSelect = multi
+		}
 		opts, _ := m["options"].([]any)
 		for _, o := range opts {
+			if s, ok := o.(string); ok {
+				if strings.TrimSpace(s) != "" {
+					q.Options = append(q.Options, protocol.QuestionOption{Label: s})
+				}
+				continue
+			}
 			om, _ := o.(map[string]any)
 			label, _ := om["label"].(string)
 			if label == "" {

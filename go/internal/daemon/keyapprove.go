@@ -119,30 +119,29 @@ func (m *Manager) AnswerByKeys(id string, d protocol.ApprovalDecision, actor str
 			return fmt.Errorf("could not type the answer into the session: %w", err)
 		}
 	}
-	if req.Kind == "question" && req.ToolUseID != "" {
-		// Until the agent writes the answer down, its transcript still ends
-		// in the question; without this, the next quiet poll asks it again.
+	if req.ToolUseID != "" {
+		// Until the agent writes the answer down (or clears its waiting step),
+		// the next poll still sees the same request; suppress re-posting it.
 		m.questionMu.Lock()
 		m.typedQuestions[req.ToolUseID] = true
 		m.questionMu.Unlock()
 	}
 	d.DecidedBy = actor
 	m.reg.ResolveApproval(id, d)
-	if req.Kind == "question" {
-		m.resumed(req.SessionID, "answered from the phone")
-	}
+	m.resumed(req.SessionID, "answered from the phone")
 	_ = m.store.Audit(actor, "approval_typed", req.SessionID,
 		fmt.Sprintf("behavior=%s subject=%q", d.Behavior, req.Subject))
 	return nil
 }
 
-// resumed puts a session back to working once the question that had it
-// waiting is answered -- only if that question is what said it was waiting,
-// so a turn that ended meanwhile is not undone. The agent's next hook, or its
+// resumed puts a session back to working once the prompt that had it waiting
+// is answered -- only if that prompt is what said it was waiting, so a turn
+// that ended meanwhile is not undone. The agent's next hook, or its
 // transcript, takes it from there.
 func (m *Manager) resumed(sessionID, reason string) {
 	s, ok := m.reg.Get(sessionID)
-	if !ok || !strings.HasPrefix(s.Guess.Evidence, "transcript:trailing ") {
+	if !ok || (!strings.HasPrefix(s.Guess.Evidence, "transcript:trailing ") &&
+		!strings.HasPrefix(s.Guess.Evidence, "prompt:")) {
 		return
 	}
 	m.reg.SetState(sessionID, protocol.StateGuess{
@@ -248,4 +247,98 @@ func (m *Manager) syncKeyboardQuestion(sessionID string, last []protocol.Transcr
 		})
 	}
 	m.log.Info("question waiting at the keyboard", "session", sessionID, "subject", req.Subject)
+}
+
+// syncPendingPrompt keeps a blocking keyboard approval or question reported by
+// a stream's PendingPromptSource on the phone while it is open, and withdraws
+// it as soon as the agent moves on.
+func (m *Manager) syncPendingPrompt(sessionID string, src adapter.PendingPromptSource) {
+	p := src.PendingPrompt()
+
+	m.questionMu.Lock()
+	defer m.questionMu.Unlock()
+
+	held := false
+	for _, a := range m.reg.SessionApprovals(sessionID) {
+		if a.Source != protocol.ApprovalHook {
+			held = true
+			continue
+		}
+		if p == nil || (a.ToolUseID != "" && a.ToolUseID != p.ToolUseID) {
+			m.reg.ResolveApproval(a.ID, protocol.ApprovalDecision{Reason: "answered at the keyboard"})
+			m.resumed(sessionID, "answered at the keyboard")
+			continue
+		}
+		held = true
+	}
+	if p == nil || held || (p.ToolUseID != "" && m.typedQuestions[p.ToolUseID]) {
+		return
+	}
+	s, ok := m.reg.Get(sessionID)
+	if !ok || s.State.Terminal() {
+		return
+	}
+
+	askedAt := p.AskedAt
+	if askedAt.IsZero() {
+		askedAt = time.Now()
+	}
+
+	if qs := parseQuestions(p.ToolName, p.ToolInput); len(qs) > 0 {
+		if _, err := m.answerKeys(s.AgentID, protocol.ApprovalRequest{Kind: "question"}, protocol.ApprovalDecision{Behavior: "deny"}); err != nil {
+			return
+		}
+		req := &protocol.ApprovalRequest{
+			ID:        newID(),
+			SessionID: sessionID,
+			Source:    protocol.ApprovalHook,
+			Kind:      "question",
+			ToolName:  p.ToolName,
+			ToolInput: p.ToolInput,
+			ToolUseID: p.ToolUseID,
+			Subject:   questionSubject(qs),
+			Questions: qs,
+			Options:   []string{},
+			AskedAt:   askedAt,
+		}
+		m.reg.AskApproval(req)
+		if s.State != protocol.StateWaitingInput || s.Guess.Confidence < 1 {
+			m.reg.SetState(sessionID, protocol.StateGuess{
+				State: protocol.StateWaitingInput, Confidence: 1.0,
+				Reason: "asked a question: " + req.Subject, Evidence: "prompt:question",
+				At: time.Now(), Since: askedAt,
+			})
+		}
+		m.log.Info("question waiting at the keyboard", "session", sessionID, "subject", req.Subject)
+		return
+	}
+
+	if _, err := m.answerKeys(s.AgentID, protocol.ApprovalRequest{Kind: "tool_use"}, protocol.ApprovalDecision{Behavior: "deny"}); err != nil {
+		return
+	}
+	subject := (adapter.HookEvent{ToolName: p.ToolName, ToolInput: p.ToolInput, EventName: "approval"}).Subject()
+	if p.Reason != "" {
+		subject += " (" + p.Reason + ")"
+	}
+	req := &protocol.ApprovalRequest{
+		ID:        newID(),
+		SessionID: sessionID,
+		Source:    protocol.ApprovalHook,
+		Kind:      "tool_use",
+		ToolName:  p.ToolName,
+		ToolInput: p.ToolInput,
+		ToolUseID: p.ToolUseID,
+		Subject:   subject,
+		Options:   []string{"allow", "deny"},
+		AskedAt:   askedAt,
+	}
+	m.reg.AskApproval(req)
+	if s.State != protocol.StateWaitingApproval || s.Guess.Confidence < 1 {
+		m.reg.SetState(sessionID, protocol.StateGuess{
+			State: protocol.StateWaitingApproval, Confidence: 1.0,
+			Reason: "approval required: " + req.Subject, Evidence: "prompt:approval",
+			At: time.Now(), Since: askedAt,
+		})
+	}
+	m.log.Info("approval waiting at the keyboard", "session", sessionID, "subject", req.Subject)
 }

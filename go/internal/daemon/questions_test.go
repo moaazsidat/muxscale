@@ -43,6 +43,25 @@ func TestParseQuestions(t *testing.T) {
 	if got := questionSubject(qs); got != "Which framework? (and 1 more)" {
 		t.Errorf("subject = %q", got)
 	}
+
+	// Antigravity's ask_question uses is_multi_select and plain string options.
+	agy := parseQuestions("ask_question", map[string]any{
+		"questions": []any{
+			map[string]any{
+				"question":        "Pick a color?",
+				"is_multi_select": false,
+				"options":         []any{"(Recommended) Red", "Blue"},
+			},
+			map[string]any{
+				"question":        "Pick toppings?",
+				"is_multi_select": true,
+				"options":         []any{"Cheese", "Olives"},
+			},
+		},
+	})
+	if len(agy) != 2 || agy[0].MultiSelect || len(agy[0].Options) != 2 || agy[0].Options[0].Label != "(Recommended) Red" || !agy[1].MultiSelect {
+		t.Fatalf("antigravity ask_question = %+v", agy)
+	}
 }
 
 func TestCheckAnswers(t *testing.T) {

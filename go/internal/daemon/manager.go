@@ -1890,7 +1890,11 @@ func (m *Manager) tailLoop(sessionID string, h *tailHandle) {
 			// went quiet. Without this a session stayed Working forever after
 			// its turn ended, unless a hook happened to correct it.
 			m.reinfer(sessionID, h, last)
-			m.syncKeyboardQuestion(sessionID, last, true)
+			if pps, ok := h.stream.(adapter.PendingPromptSource); ok {
+				m.syncPendingPrompt(sessionID, pps)
+			} else {
+				m.syncKeyboardQuestion(sessionID, last, true)
+			}
 			continue
 		}
 		last = append(last, events...)
@@ -1911,7 +1915,11 @@ func (m *Manager) tailLoop(sessionID string, h *tailHandle) {
 		if !m.ingest(sessionID, h, events) {
 			return // replaced while reading; these belong to a transcript being rebuilt
 		}
-		m.syncKeyboardQuestion(sessionID, last, false)
+		if pps, ok := h.stream.(adapter.PendingPromptSource); ok {
+			m.syncPendingPrompt(sessionID, pps)
+		} else {
+			m.syncKeyboardQuestion(sessionID, last, false)
+		}
 		for i := range events {
 			m.reg.AppendEvent(events[i])
 		}

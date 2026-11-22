@@ -316,6 +316,24 @@ type EventReporter interface {
 	LastEvent() string
 }
 
+// PendingPrompt describes a blocking permission prompt or question an agent is
+// currently showing at its own keyboard, read from the agent's own runtime
+// store (e.g. a waiting step in its conversation database).
+type PendingPrompt struct {
+	ToolName  string
+	ToolUseID string
+	ToolInput map[string]any
+	Reason    string
+	AskedAt   time.Time
+}
+
+// PendingPromptSource is implemented by transcript streams that can report
+// whether the agent is currently blocked on a keyboard approval or question.
+// Returning nil means no prompt is currently open.
+type PendingPromptSource interface {
+	PendingPrompt() *PendingPrompt
+}
+
 // SeekableStream is implemented by streams that can skip to the end of what
 // the store already holds, so a restart does not re-read a large transcript.
 type SeekableStream interface {
