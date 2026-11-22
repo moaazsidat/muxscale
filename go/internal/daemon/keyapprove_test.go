@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/muxscale/muxscale/go/internal/adapter"
+	"github.com/muxscale/muxscale/go/internal/adapter/antigravity"
 	"github.com/muxscale/muxscale/go/internal/adapter/claudecode"
 	"github.com/muxscale/muxscale/go/internal/adapter/omp"
 	"github.com/muxscale/muxscale/go/internal/protocol"
@@ -349,5 +350,90 @@ func TestOmpAskIsAQuestionOnThePhone(t *testing.T) {
 	}
 	if s, _ := reg.Get(sess.ID); s.State != protocol.StateRunning {
 		t.Errorf("state %s after the answer, want running", s.State)
+	}
+}
+
+type stubPromptSource struct{ p *adapter.PendingPrompt }
+
+func (s *stubPromptSource) PendingPrompt() *adapter.PendingPrompt { return s.p }
+
+func TestAntigravityPendingPromptsAndQuestions(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	reg := NewRegistry()
+	adapters := adapter.NewRegistry()
+	adapters.MustRegister(antigravity.New())
+	m := NewManager(reg, adapters, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(m.StopPersisting)
+	var typed []string
+	m.typeKeys = func(_ string, keys []byte) error { typed = append(typed, string(keys)); return nil }
+
+	sess := reg.Upsert("antigravity", "conv-1", nil)
+	reg.SetState(sess.ID, protocol.StateGuess{State: protocol.StateRunning, Confidence: 1, Reason: "working", Evidence: "hook:PreInvocation", At: time.Now()})
+
+	// 1. Tool approval prompt (run_command) becomes WAITING_APPROVAL and answers with Enter.
+	asked := time.Now().Add(-10 * time.Second)
+	src := &stubPromptSource{p: &adapter.PendingPrompt{
+		ToolName:  "run_command",
+		ToolUseID: "call_cmd",
+		ToolInput: map[string]any{"CommandLine": "echo hi"},
+		Reason:    "Runs shell command",
+		AskedAt:   asked,
+	}}
+	m.syncPendingPrompt(sess.ID, src)
+	p := reg.SessionApprovals(sess.ID)
+	if len(p) != 1 || p[0].Kind != "tool_use" || !strings.Contains(p[0].Subject, "echo hi") {
+		t.Fatalf("want tool approval, got %+v", p)
+	}
+	if s, _ := reg.Get(sess.ID); s.State != protocol.StateWaitingApproval {
+		t.Errorf("state = %s, want WAITING_APPROVAL", s.State)
+	}
+	if err := m.AnswerByKeys(p[0].ID, protocol.ApprovalDecision{Behavior: "allow"}, "phone"); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(typed, "|") != "\r" {
+		t.Errorf("typed = %q, want \\r", typed)
+	}
+	if s, _ := reg.Get(sess.ID); s.State != protocol.StateRunning {
+		t.Errorf("state after allow = %s, want RUNNING", s.State)
+	}
+	// Still waiting briefly in DB before agent transitions: must not re-post.
+	m.syncPendingPrompt(sess.ID, src)
+	if got := reg.SessionApprovals(sess.ID); len(got) != 0 {
+		t.Fatalf("re-posted already-typed approval: %+v", got)
+	}
+
+	// 2. ask_question becomes Kind:"question" WAITING_INPUT and withdraws if cleared at keyboard.
+	typed = nil
+	src.p = &adapter.PendingPrompt{
+		ToolName:  "ask_question",
+		ToolUseID: "call_q",
+		ToolInput: map[string]any{
+			"questions": []any{map[string]any{
+				"question":        "Pick one?",
+				"is_multi_select": false,
+				"options":         []any{"Alpha", "Beta"},
+			}},
+		},
+		AskedAt: asked,
+	}
+	m.syncPendingPrompt(sess.ID, src)
+	p = reg.SessionApprovals(sess.ID)
+	if len(p) != 1 || p[0].Kind != "question" || len(p[0].Questions) != 1 || len(p[0].Questions[0].Options) != 2 {
+		t.Fatalf("want question card, got %+v", p)
+	}
+	if s, _ := reg.Get(sess.ID); s.State != protocol.StateWaitingInput {
+		t.Errorf("state = %s, want WAITING_INPUT", s.State)
+	}
+	src.p = nil
+	m.syncPendingPrompt(sess.ID, src)
+	if got := reg.SessionApprovals(sess.ID); len(got) != 0 {
+		t.Errorf("question not withdrawn after prompt cleared: %+v", got)
+	}
+	if s, _ := reg.Get(sess.ID); s.State != protocol.StateRunning {
+		t.Errorf("state after keyboard clear = %s, want RUNNING", s.State)
 	}
 }

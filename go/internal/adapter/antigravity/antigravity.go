@@ -443,11 +443,18 @@ type pendingTool struct {
 
 // Lifecycle names reported via adapter.EventReporter for InferState.
 const (
-	lifeUserInput = "user_input"
-	lifeToolCalls = "planner:tool_calls"
-	lifeToolDone  = "tool_result"
-	lifeDone      = "planner:done"
-	lifeError     = "planner:error"
+	lifeUserInput       = "user_input"
+	lifeToolCalls       = "planner:tool_calls"
+	lifeToolDone        = "tool_result"
+	lifeDone            = "planner:done"
+	lifeError           = "planner:error"
+	lifeWaitingApproval = "waiting:approval"
+	lifeWaitingQuestion = "waiting:question"
+
+	// stepStatusWaiting is Antigravity's CORTEX_STEP_STATUS_WAITING enum value
+	// in conversations/<id>.db `steps.status`, set while a permission prompt or
+	// ask_question dialog is waiting on a human.
+	stepStatusWaiting = 9
 )
 
 // stream follows one Antigravity transcript_full.jsonl incrementally.
@@ -467,6 +474,13 @@ type stream struct {
 	lastTitle string
 	sawTitle  bool
 	meta      adapter.Meta
+
+	convChecked bool
+	convDBMod   time.Time
+	convDBSize  int64
+	convWALMod  time.Time
+	convWALSize int64
+	pending     *adapter.PendingPrompt
 }
 
 func newStream(path string) *stream {
@@ -478,10 +492,11 @@ func newStream(path string) *stream {
 }
 
 var (
-	_ adapter.TranscriptStream = (*stream)(nil)
-	_ adapter.SeekableStream   = (*stream)(nil)
-	_ adapter.MetaSource       = (*stream)(nil)
-	_ adapter.EventReporter    = (*stream)(nil)
+	_ adapter.TranscriptStream    = (*stream)(nil)
+	_ adapter.SeekableStream      = (*stream)(nil)
+	_ adapter.MetaSource          = (*stream)(nil)
+	_ adapter.EventReporter       = (*stream)(nil)
+	_ adapter.PendingPromptSource = (*stream)(nil)
 )
 
 func (s *stream) Close() error { return nil }
@@ -489,7 +504,23 @@ func (s *stream) Close() error { return nil }
 func (s *stream) LastEvent() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.pending != nil {
+		if s.pending.ToolName == "ask_question" {
+			return lifeWaitingQuestion
+		}
+		return lifeWaitingApproval
+	}
 	return s.life
+}
+
+func (s *stream) PendingPrompt() *adapter.PendingPrompt {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pending == nil {
+		return nil
+	}
+	cp := *s.pending
+	return &cp
 }
 
 func (s *stream) Meta() adapter.Meta {
@@ -561,6 +592,7 @@ func (s *stream) Poll(context.Context) ([]protocol.TranscriptEvent, error) {
 
 	if fi.Size() == s.offset {
 		s.refreshDBTitle()
+		s.refreshPendingPrompt()
 		return nil, nil
 	}
 
@@ -589,7 +621,184 @@ func (s *stream) Poll(context.Context) ([]protocol.TranscriptEvent, error) {
 		events = append(events, evs...)
 	}
 	s.refreshDBTitle()
+	s.refreshPendingPrompt()
 	return events, nil
+}
+
+// refreshPendingPrompt inspects conversations/<convID>.db for any step in
+// status=9 (WAITING), skipping the SQLite read when neither the .db nor its
+// -wal file changed since the previous poll.
+func (s *stream) refreshPendingPrompt() {
+	if s.dataDir == "" || s.convID == "" {
+		return
+	}
+	dbPath := filepath.Join(s.dataDir, "conversations", s.convID+".db")
+	dbFI, err := os.Stat(dbPath)
+	if err != nil {
+		s.pending = nil
+		return
+	}
+	var walMod time.Time
+	var walSize int64
+	if walFI, err := os.Stat(dbPath + "-wal"); err == nil {
+		walMod, walSize = walFI.ModTime(), walFI.Size()
+	}
+	if s.convChecked &&
+		dbFI.ModTime().Equal(s.convDBMod) && dbFI.Size() == s.convDBSize &&
+		walMod.Equal(s.convWALMod) && walSize == s.convWALSize {
+		return
+	}
+	p, ok := readWaitingStep(dbPath)
+	if !ok {
+		return
+	}
+	s.convChecked = true
+	s.convDBMod, s.convDBSize = dbFI.ModTime(), dbFI.Size()
+	s.convWALMod, s.convWALSize = walMod, walSize
+	s.pending = p
+}
+
+// readWaitingStep queries conversations/<id>.db read-only for the latest step
+// blocked on user approval or input (status = 9). Returns (prompt, true) when
+// the database was read cleanly (prompt is nil if no step is waiting), or
+// (nil, false) on a transient read error.
+func readWaitingStep(dbPath string) (*adapter.PendingPrompt, bool) {
+	db, err := openSummariesDB(dbPath)
+	if err != nil {
+		return nil, false
+	}
+	defer db.Close()
+
+	var idx int
+	var meta []byte
+	err = db.QueryRow(`SELECT idx, metadata FROM steps WHERE status = ? ORDER BY idx DESC LIMIT 1`, stepStatusWaiting).Scan(&idx, &meta)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, true
+	}
+	if err != nil {
+		return nil, false
+	}
+	p := parseStepMetadata(idx, meta)
+	if p == nil || p.ToolName == "" {
+		return nil, true
+	}
+	return p, true
+}
+
+// parseStepMetadata decodes the minimal protobuf wire fields muxscale needs
+// from a waiting step's metadata blob:
+//   - field 1: Timestamp { field 1: seconds (varint), field 2: nanos (varint) }
+//   - field 4: ToolCall  { field 1: id, field 2: name, field 3: args_json }
+//   - field 34: PermissionInfo { field 5: reason }
+func parseStepMetadata(idx int, data []byte) *adapter.PendingPrompt {
+	var p adapter.PendingPrompt
+	walkProto(data, func(field int, wtype byte, varint uint64, raw []byte) {
+		if wtype != 2 {
+			return
+		}
+		switch field {
+		case 1:
+			var sec, nanos int64
+			walkProto(raw, func(sf int, swt byte, sv uint64, _ []byte) {
+				if swt != 0 {
+					return
+				}
+				if sf == 1 {
+					sec = int64(sv)
+				} else if sf == 2 {
+					nanos = int64(sv)
+				}
+			})
+			if sec > 0 {
+				p.AskedAt = time.Unix(sec, nanos)
+			}
+		case 4:
+			walkProto(raw, func(sf int, swt byte, _ uint64, sraw []byte) {
+				if swt != 2 {
+					return
+				}
+				switch sf {
+				case 1:
+					p.ToolUseID = string(sraw)
+				case 2:
+					p.ToolName = string(sraw)
+				case 3:
+					var args map[string]any
+					if json.Unmarshal(sraw, &args) == nil {
+						p.ToolInput = args
+					}
+				}
+			})
+		case 34:
+			walkProto(raw, func(sf int, swt byte, _ uint64, sraw []byte) {
+				if swt == 2 && sf == 5 {
+					p.Reason = strings.TrimSpace(string(sraw))
+				}
+			})
+		}
+	})
+	if p.ToolName == "" {
+		return nil
+	}
+	if p.ToolUseID == "" {
+		p.ToolUseID = "step-" + strconv.Itoa(idx)
+	}
+	return &p
+}
+
+func walkProto(data []byte, fn func(field int, wtype byte, varint uint64, raw []byte)) {
+	for i := 0; i < len(data); {
+		tag, n := readVarint(data[i:])
+		if n == 0 {
+			return
+		}
+		i += n
+		field := int(tag >> 3)
+		wtype := byte(tag & 7)
+		switch wtype {
+		case 0:
+			v, m := readVarint(data[i:])
+			if m == 0 {
+				return
+			}
+			i += m
+			fn(field, wtype, v, nil)
+		case 1:
+			if i+8 > len(data) {
+				return
+			}
+			fn(field, wtype, 0, data[i:i+8])
+			i += 8
+		case 2:
+			ln, m := readVarint(data[i:])
+			if m == 0 || i+m+int(ln) > len(data) || int(ln) < 0 {
+				return
+			}
+			i += m
+			fn(field, wtype, 0, data[i:i+int(ln)])
+			i += int(ln)
+		case 5:
+			if i+4 > len(data) {
+				return
+			}
+			fn(field, wtype, 0, data[i:i+4])
+			i += 4
+		default:
+			return
+		}
+	}
+}
+
+func readVarint(b []byte) (uint64, int) {
+	var v uint64
+	for i := 0; i < len(b) && i < 10; i++ {
+		c := b[i]
+		v |= uint64(c&0x7f) << (7 * i)
+		if c < 0x80 {
+			return v, i + 1
+		}
+	}
+	return 0, 0
 }
 
 // refreshDBTitle checks conversation_summaries.db for Antigravity's generated
@@ -888,6 +1097,10 @@ func stateFromLifecycle(in adapter.StateInput) (protocol.StateGuess, bool) {
 	}
 
 	switch in.Event {
+	case lifeWaitingApproval:
+		return g(protocol.StateWaitingApproval, 0.9, "waiting for tool approval")
+	case lifeWaitingQuestion:
+		return g(protocol.StateWaitingInput, 0.9, "waiting for an answer to a question")
 	case lifeDone:
 		return g(protocol.StateWaitingInput, 0.85, "the turn finished")
 	case lifeError:

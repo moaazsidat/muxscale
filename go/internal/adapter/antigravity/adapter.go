@@ -26,6 +26,8 @@ var (
 	_ adapter.Liveness      = (*Adapter)(nil)
 	_ adapter.HookCodec     = (*Adapter)(nil)
 	_ adapter.Installer     = (*Adapter)(nil)
+	_ adapter.KeyApprover   = (*Adapter)(nil)
+	_ adapter.KeyStepper    = (*Adapter)(nil)
 )
 
 func (*Adapter) Info() adapter.Info {
@@ -41,10 +43,10 @@ func (*Adapter) Info() adapter.Info {
 			// inferred state.
 			State:      adapter.SupportExact,
 			Transcript: adapter.SupportExact,
-			// Antigravity has no non-intrusive PermissionRequest hook: its
-			// PreToolUse hook denies tools when returning empty `{}` rather
-			// than falling through, so approvals stay at the keyboard.
-			Approvals: adapter.SupportNone,
+			// Blocking permission prompts and ask_question dialogs are read
+			// from the conversation database's waiting step and answered by
+			// typing Antigravity's own keys into the terminal (KeyStepper).
+			Approvals: adapter.SupportDerived,
 		},
 		Attachments: []protocol.Attachment{
 			protocol.AttachWrap, protocol.AttachTmux, protocol.AttachTermctl,

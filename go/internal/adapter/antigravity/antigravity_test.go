@@ -312,3 +312,183 @@ func TestHookDecodeAndInstall(t *testing.T) {
 		t.Errorf("EncodeHookReply = %#v, want empty map", reply)
 	}
 }
+
+func appendProtoVarint(dst []byte, v uint64) []byte {
+	for v >= 0x80 {
+		dst = append(dst, byte(v)|0x80)
+		v >>= 7
+	}
+	return append(dst, byte(v))
+}
+
+func appendProtoBytes(dst []byte, field int, payload []byte) []byte {
+	dst = appendProtoVarint(dst, uint64(field<<3|2))
+	dst = appendProtoVarint(dst, uint64(len(payload)))
+	return append(dst, payload...)
+}
+
+func buildStepMetadata(toolID, toolName, argsJSON, reason string, sec int64) []byte {
+	var ts []byte
+	ts = appendProtoVarint(ts, uint64(1<<3|0))
+	ts = appendProtoVarint(ts, uint64(sec))
+
+	var tc []byte
+	tc = appendProtoBytes(tc, 1, []byte(toolID))
+	tc = appendProtoBytes(tc, 2, []byte(toolName))
+	tc = appendProtoBytes(tc, 3, []byte(argsJSON))
+
+	var perm []byte
+	if reason != "" {
+		perm = appendProtoBytes(perm, 5, []byte(reason))
+	}
+
+	var meta []byte
+	meta = appendProtoBytes(meta, 1, ts)
+	meta = appendProtoBytes(meta, 4, tc)
+	if len(perm) > 0 {
+		meta = appendProtoBytes(meta, 34, perm)
+	}
+	return meta
+}
+
+func TestPendingPromptFromConversationDB(t *testing.T) {
+	dataDir := t.TempDir()
+	ref := writeTranscript(t, dataDir, "conv-wait",
+		`{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-20T22:10:28Z","content":"<USER_REQUEST>\nDeploy\n</USER_REQUEST>"}`,
+	)
+
+	convDir := filepath.Join(dataDir, "conversations")
+	if err := os.MkdirAll(convDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(convDir, "conv-wait.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	_, err = db.Exec(`CREATE TABLE steps (idx integer PRIMARY KEY, status integer NOT NULL, metadata blob);`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	meta := buildStepMetadata(
+		"call_123",
+		"run_command",
+		`{"CommandLine":"echo deploy","toolSummary":"Deploy app"}`,
+		"Mutates host state.",
+		1795309073,
+	)
+	if _, err := db.Exec(`INSERT INTO steps (idx, status, metadata) VALUES (1, 9, ?)`, meta); err != nil {
+		t.Fatal(err)
+	}
+
+	s := newStream(ref)
+	if _, err := s.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	p := s.PendingPrompt()
+	if p == nil {
+		t.Fatal("PendingPrompt = nil, want run_command prompt")
+	}
+	if p.ToolName != "run_command" || p.ToolUseID != "call_123" || p.Reason != "Mutates host state." {
+		t.Errorf("PendingPrompt = %+v", p)
+	}
+	if p.ToolInput["CommandLine"] != "echo deploy" {
+		t.Errorf("ToolInput = %+v", p.ToolInput)
+	}
+	if p.AskedAt.Unix() != 1795309073 {
+		t.Errorf("AskedAt = %v", p.AskedAt)
+	}
+	if got := s.LastEvent(); got != lifeWaitingApproval {
+		t.Errorf("LastEvent = %q, want %q", got, lifeWaitingApproval)
+	}
+
+	// Once step leaves status=9, PendingPrompt clears.
+	if _, err := db.Exec(`UPDATE steps SET status = 3 WHERE idx = 1`); err != nil {
+		t.Fatal(err)
+	}
+	// Ensure mtime/size change is visible on coarse filesystems.
+	future := time.Now().Add(2 * time.Second)
+	_ = os.Chtimes(dbPath, future, future)
+
+	if _, err := s.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if p := s.PendingPrompt(); p != nil {
+		t.Errorf("PendingPrompt after status=3 = %+v, want nil", p)
+	}
+}
+
+func TestApprovalKeySteps(t *testing.T) {
+	a := New()
+
+	// Permission allow -> Enter (option 1), deny -> Esc.
+	allow, err := a.ApprovalKeys(protocol.ApprovalRequest{Kind: "tool_use"}, protocol.ApprovalDecision{Behavior: "allow"})
+	if err != nil || string(allow) != "\r" {
+		t.Errorf("allow keys = (%q, %v), want (\\r, nil)", allow, err)
+	}
+	deny, err := a.ApprovalKeys(protocol.ApprovalRequest{Kind: "tool_use"}, protocol.ApprovalDecision{Behavior: "deny"})
+	if err != nil || string(deny) != "\x1b" {
+		t.Errorf("deny keys = (%q, %v), want (Esc, nil)", deny, err)
+	}
+
+	// Multi-question dialog: Q1 single-select (option 2), Q2 multi-select (both options).
+	req := protocol.ApprovalRequest{
+		Kind: "question",
+		Questions: []protocol.Question{
+			{
+				Question: "Pick a color?",
+				Options:  []protocol.QuestionOption{{Label: "(Recommended) Red"}, {Label: "Blue"}},
+			},
+			{
+				Question:    "Pick toppings?",
+				MultiSelect: true,
+				Options:     []protocol.QuestionOption{{Label: "Cheese"}, {Label: "Olives"}},
+			},
+		},
+	}
+	steps, err := a.ApprovalKeySteps(req, protocol.ApprovalDecision{
+		Behavior: "allow",
+		Answers: map[string]string{
+			"Pick a color?":  "Blue",
+			"Pick toppings?": "Cheese, Olives",
+		},
+	})
+	if err != nil {
+		t.Fatalf("ApprovalKeySteps: %v", err)
+	}
+	want := []string{"\x1b[B", "\r", " ", "\x1b[B", " ", "\r"}
+	if len(steps) != len(want) {
+		t.Fatalf("got %d steps %q, want %d %q", len(steps), steps, len(want), want)
+	}
+	for i := range want {
+		if string(steps[i]) != want[i] {
+			t.Errorf("step[%d] = %q, want %q", i, steps[i], want[i])
+		}
+	}
+
+	// Single-select write-in answer.
+	wiSteps, err := a.ApprovalKeySteps(protocol.ApprovalRequest{
+		Kind: "question",
+		Questions: []protocol.Question{{
+			Question: "Pick a color?",
+			Options:  []protocol.QuestionOption{{Label: "Red"}, {Label: "Blue"}},
+		}},
+	}, protocol.ApprovalDecision{
+		Behavior: "allow",
+		Answers:  map[string]string{"Pick a color?": "Green"},
+	})
+	if err != nil {
+		t.Fatalf("write-in ApprovalKeySteps: %v", err)
+	}
+	wantWI := []string{"\x1b[B\x1b[B", "\r", "Green", "\r"}
+	if len(wiSteps) != len(wantWI) {
+		t.Fatalf("got %d write-in steps %q, want %q", len(wiSteps), wiSteps, wantWI)
+	}
+	for i := range wantWI {
+		if string(wiSteps[i]) != wantWI[i] {
+			t.Errorf("write-in step[%d] = %q, want %q", i, wiSteps[i], wantWI[i])
+		}
+	}
+}
